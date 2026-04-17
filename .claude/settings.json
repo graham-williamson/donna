@@ -1,0 +1,5 @@
+{
+  "enabledPlugins": {
+    "brightdata-plugin@claude-plugins-official": true
+  }
+}
