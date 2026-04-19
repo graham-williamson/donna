@@ -15,7 +15,10 @@ Phase 1 Ralph target — see `broker/ralph-prompts/canonicalize.md`.
 """
 from __future__ import annotations
 
+import hashlib
 from typing import Any
+
+import rfc8785
 
 
 def canonicalize(value: Any) -> bytes:
@@ -29,8 +32,13 @@ def canonicalize(value: Any) -> bytes:
       - encode output as UTF-8 without BOM
 
     Returns raw bytes, not str — downstream consumers hash these bytes.
+
+    Delegates to the `rfc8785` reference library. Hand-rolled
+    canonicalisation is a supply-chain blast zone of its own; the
+    library is pinned and hash-locked via requirements.txt.
     """
-    raise NotImplementedError("canonicalize: Phase 1 Ralph target")
+    result: bytes = rfc8785.dumps(value)
+    return result
 
 
 def params_hash(params: Any) -> str:
@@ -39,4 +47,4 @@ def params_hash(params: Any) -> str:
     Used as `requests.params_hash` and as the HMAC covers this hash,
     not the raw params_json (§7.3).
     """
-    raise NotImplementedError("params_hash: Phase 1 Ralph target")
+    return hashlib.sha256(canonicalize(params)).hexdigest()
