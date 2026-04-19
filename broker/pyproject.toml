@@ -38,6 +38,14 @@ disallow_incomplete_defs = false
 module = ["pytest", "pytest.*", "_pytest.*"]
 ignore_missing_imports = true
 
+# PyYAML and jsonschema don't ship type stubs in the base packages.
+# Adding `types-PyYAML` / `types-jsonschema` to the hash-locked dep set
+# for a handful of imports isn't worth the churn; override at the
+# module boundary instead.
+[[tool.mypy.overrides]]
+module = ["yaml", "jsonschema", "jsonschema.*"]
+ignore_missing_imports = true
+
 [tool.coverage.run]
 branch = true
 source = ["broker"]
