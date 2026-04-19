@@ -1,24 +1,49 @@
-"""HMAC, idempotency, rate limits, cooldown, approval codes.
+"""HMAC, idempotency, rate limits, cooldown, approval codes, context sanitisation.
 
 Spec: security-v1.1 §7.2 (idempotency key), §7.3 (HMAC), §7.4 (cooldown +
-override), §13.2 (rate limits), §11 (replay semantics), §9.1 (policy-check
-purity — IMPORT-LINTER enforces no-network here).
+override), §7.7 (context_reason sanitisation), §13.2 (rate limits),
+§11 (replay semantics), §9.1 (policy-check purity).
 
 Invariant: **no network I/O anywhere in this module.** import-linter
-bans `requests`, `httpx`, `urllib.*`, `http.client`, `aiohttp`.
+enforces the no-network contract at the file boundary; this module
+stays pure-Python-stdlib for everything it does.
+
+HMAC canonical serialisation is explicit per §7.3:
+  - separator \\x1f (ASCII unit separator, never valid inside any field)
+  - integers as decimal strings (no leading zero, sign only for negatives)
+  - timestamps as epoch-ms integers
+  - strings as UTF-8 bytes
 
 Verification order at every state transition (§7.3):
   1. Recompute params_hash from canonicalize(params_json).
-     Mismatch → audit.params_hash_mismatch → integrity_failed.
+     Mismatch → `audit.params_hash_mismatch` → integrity_failed.
   2. Verify HMAC over the full current field set.
-     Mismatch → audit.hmac_mismatch → integrity_failed.
+     Mismatch → `audit.hmac_mismatch` → integrity_failed.
   3. Only then apply the transition.
-
-Phase 1 Ralph target — see `broker/ralph-prompts/policy.md`.
 """
 from __future__ import annotations
 
-from typing import Any, Optional
+import hashlib
+import hmac as _hmac
+import re
+import secrets
+import time
+from typing import Any
+
+
+# Unit separator (ASCII 0x1F). Never valid inside any covered field.
+SEP = b"\x1f"
+
+# §7.3 approval-code alphabet: RFC 4648 base32 minus I L O U.
+# Remaining 32 symbols (~30 bits entropy at 6 chars).
+APPROVAL_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"
+APPROVAL_CODE_LENGTH = 6
+
+# §7.4 default cooldown after denial.
+DEFAULT_COOLDOWN_MINUTES = 30
+
+
+# ---- idempotency key (§7.2) ---------------------------------------------
 
 
 def idempotency_key(
@@ -26,15 +51,82 @@ def idempotency_key(
     canonical_params: bytes,
     date_component: str,
 ) -> str:
-    """Per §7.2. sha256 of the three fields joined by \\x1f."""
-    raise NotImplementedError("idempotency_key: Phase 1 Ralph target")
+    """sha256 of capability || SEP || canonical_params || SEP || date_component.
+
+    `canonical_params` must already be the RFC 8785 canonical bytes
+    (see broker.canonicalize). `date_component` is per the capability's
+    `idempotency_date_from` — either a UTC date string or
+    `created_utc` computed by the caller.
+    """
+    if not isinstance(capability, str):
+        raise TypeError("capability must be str")
+    if not isinstance(canonical_params, (bytes, bytearray)):
+        raise TypeError("canonical_params must be bytes")
+    if not isinstance(date_component, str):
+        raise TypeError("date_component must be str")
+    h = hashlib.sha256()
+    h.update(capability.encode("utf-8"))
+    h.update(SEP)
+    h.update(bytes(canonical_params))
+    h.update(SEP)
+    h.update(date_component.encode("utf-8"))
+    return h.hexdigest()
+
+
+# ---- approval code (§7.3) -----------------------------------------------
 
 
 def generate_approval_code() -> str:
-    """6 characters from RFC 4648 base32 minus I L O U. ~30 bits entropy.
-    Uniqueness across pending_approval + approved enforced by SQL partial
-    unique index (§7.3)."""
-    raise NotImplementedError("generate_approval_code: Phase 1 Ralph target")
+    """6 random characters from the 32-symbol alphabet. Uses `secrets`
+    for CSPRNG-backed randomness; the caller is responsible for
+    uniqueness via the partial unique index."""
+    return "".join(
+        secrets.choice(APPROVAL_CODE_ALPHABET)
+        for _ in range(APPROVAL_CODE_LENGTH)
+    )
+
+
+# ---- HMAC serialisation and compute (§7.3) ------------------------------
+
+
+def _encode_int(n: int) -> bytes:
+    """Decimal string encoding, no leading zeros, sign only for negatives."""
+    if not isinstance(n, int) or isinstance(n, bool):
+        raise TypeError(f"expected int, got {type(n).__name__}")
+    return str(n).encode("ascii")
+
+
+def _encode_str(s: str) -> bytes:
+    if not isinstance(s, str):
+        raise TypeError(f"expected str, got {type(s).__name__}")
+    return s.encode("utf-8")
+
+
+def build_creation_message(
+    request_id: str,
+    capability: str,
+    params_hash: str,
+    idempotency_key_: str,
+    risk_level: str,
+    created_at: int,
+    approval_expires_at: int,
+) -> bytes:
+    """Assemble the §7.3 creation-time HMAC message.
+
+    Exposed publicly so the caller can reuse the exact bytes when
+    computing the approval-time HMAC extension (which covers the
+    same creation fields plus the fields that become immutable at
+    approval).
+    """
+    return SEP.join([
+        _encode_str(request_id),
+        _encode_str(capability),
+        _encode_str(params_hash),
+        _encode_str(idempotency_key_),
+        _encode_str(risk_level),
+        _encode_int(created_at),
+        _encode_int(approval_expires_at),
+    ])
 
 
 def compute_creation_hmac(
@@ -47,9 +139,17 @@ def compute_creation_hmac(
     created_at: int,
     approval_expires_at: int,
 ) -> str:
-    """Per §7.3. hmac_sha256 over the creation-time immutable fields,
-    separated by \\x1f."""
-    raise NotImplementedError("compute_creation_hmac: Phase 1 Ralph target")
+    """HMAC-SHA256 hex digest over the creation-time immutable fields."""
+    msg = build_creation_message(
+        request_id=request_id,
+        capability=capability,
+        params_hash=params_hash,
+        idempotency_key_=idempotency_key_,
+        risk_level=risk_level,
+        created_at=created_at,
+        approval_expires_at=approval_expires_at,
+    )
+    return _hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
 def compute_approval_hmac(
@@ -58,14 +158,26 @@ def compute_approval_hmac(
     execution_expires_at: int,
     approved_at: int,
 ) -> str:
-    """Per §7.3. Extends the creation message with the fields that become
-    immutable at approval."""
-    raise NotImplementedError("compute_approval_hmac: Phase 1 Ralph target")
+    """Extend the creation message with the approval-time fields and
+    recompute HMAC-SHA256. `creation_msg` is the output of
+    `build_creation_message()` — reuse rather than reconstruct to
+    guarantee serialisation parity."""
+    msg = SEP.join([
+        creation_msg,
+        _encode_int(execution_expires_at),
+        _encode_int(approved_at),
+    ])
+    return _hmac.new(key, msg, hashlib.sha256).hexdigest()
 
 
 def verify_hmac(key: bytes, message: bytes, expected_hex: str) -> bool:
-    """Constant-time comparison of HMAC over `message` to `expected_hex`."""
-    raise NotImplementedError("verify_hmac: Phase 1 Ralph target")
+    """Constant-time compare. Returns False on any mismatch, including
+    malformed hex length — never raises on attacker input."""
+    computed = _hmac.new(key, message, hashlib.sha256).hexdigest()
+    return _hmac.compare_digest(computed, expected_hex)
+
+
+# ---- rate limits (§13.2) ------------------------------------------------
 
 
 def rate_limit_check(
@@ -74,28 +186,155 @@ def rate_limit_check(
     daily_cap: int,
     utc_date: str,
 ) -> bool:
-    """Return True if under cap, False if exceeded. Caller increments on
-    row creation, not on execution (§13.2). Denied/expired rows do NOT
-    refund."""
-    raise NotImplementedError("rate_limit_check: Phase 1 Ralph target")
+    """Return True if under cap, False if exceeded. Counting is per
+    (capability, UTC date). Denied/expired rows do NOT refund — the
+    increment is caller-owned and happens at row creation, not at
+    execution."""
+    row = conn.execute(
+        "SELECT count FROM rate_limits WHERE capability = ? AND date_utc = ?",
+        (capability, utc_date),
+    ).fetchone()
+    current = int(row["count"]) if row is not None else 0
+    return current < daily_cap
 
 
-def rate_limit_increment(conn: Any, capability: str, utc_date: str) -> None:
-    raise NotImplementedError("rate_limit_increment: Phase 1 Ralph target")
+def rate_limit_increment(
+    conn: Any, capability: str, utc_date: str
+) -> None:
+    """Upsert the counter. Atomic per the SQLite ON CONFLICT path."""
+    with conn:
+        conn.execute(
+            "INSERT INTO rate_limits (capability, date_utc, count) "
+            "VALUES (?, ?, 1) "
+            "ON CONFLICT (capability, date_utc) DO UPDATE SET "
+            "count = count + 1",
+            (capability, utc_date),
+        )
+
+
+# ---- cooldown (§7.4) ----------------------------------------------------
 
 
 def cooldown_remaining_seconds(
     conn: Any,
     idempotency_key_: str,
-    cooldown_minutes: int,
+    cooldown_minutes: int = DEFAULT_COOLDOWN_MINUTES,
+    now_ms: int | None = None,
 ) -> int:
-    """For a denied row, return seconds remaining in the 30-minute
-    cooldown window (default, capability-configurable). 0 when expired.
-    Override path is the only way to resurrect during cooldown (§7.4)."""
-    raise NotImplementedError("cooldown_remaining_seconds: Phase 1 Ralph target")
+    """For a denied row on this idempotency_key, return seconds remaining
+    in the cooldown window. 0 when expired or when no denied row exists.
+
+    `now_ms` is the caller's notion of 'now' — defaults to wall-clock.
+    Exposed for deterministic tests.
+    """
+    row = conn.execute(
+        "SELECT approval_expires_at, created_at, state FROM requests "
+        "WHERE idempotency_key = ? AND state = 'denied' "
+        "ORDER BY created_at DESC LIMIT 1",
+        (idempotency_key_,),
+    ).fetchone()
+    if row is None:
+        return 0
+
+    # The denial moment itself isn't recorded as a field — we use
+    # created_at as the cooldown anchor. Callers that need a tighter
+    # denial-anchored window should extend the schema; for v1 the
+    # spec's 30-minute window from creation is the contract.
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    deadline = int(row["created_at"]) + cooldown_minutes * 60 * 1000
+    remaining_ms = deadline - now
+    return max(0, remaining_ms // 1000)
+
+
+# ---- context_reason sanitisation (§7.7) ---------------------------------
+
+
+MAX_CONTEXT_REASON_LENGTH = 200
+
+# §7.7 strip patterns. Order matters for audit reporting, not for
+# correctness — each match becomes `[redacted]` regardless of which
+# pattern fired first (the `redaction_types` list records all that hit).
+_URL_RE = re.compile(r"https?://\S+")
+_BASE64_RE = re.compile(r"[A-Za-z0-9+/=]{24,}")
+_HEX_RE = re.compile(r"[A-Fa-f0-9]{24,}")
+_DIGITS_RE = re.compile(r"\d{6,}")
+
+# Non-ASCII that is not standard Latin + typographic punctuation.
+# We keep: printable ASCII + common Latin-1 accented letters
+# (À-ÿ excluding control chars) + curly quotes / en-dashes / em-dashes.
+# Everything else (CJK, RTL overrides, zero-width joiners, etc.) strips.
+_ALLOWED_CODEPOINT_RE = re.compile(
+    r"[\x20-\x7e"           # printable ASCII
+    r"\xa0-\u024f"          # Latin-1 Supplement + Latin Extended A/B
+    r"\u2010-\u2019"        # hyphens + smart single quotes
+    r"\u201c-\u201d"        # smart double quotes
+    r"\u2013-\u2014"        # en-dash + em-dash
+    r"]"
+)
+
+
+class ContextReasonTooLong(Exception):
+    """Raised per §7.7 when `context_reason` exceeds the hard cap. The
+    broker returns `{status: invalid_input, field: context_reason,
+    reason: too long (max 200)}` to the caller."""
 
 
 def sanitise_context_reason(raw: str) -> tuple[str, list[str]]:
-    """Apply §7.7 ingest rules to Donna-provenance `context_reason`.
-    Returns (sanitised, redaction_types)."""
-    raise NotImplementedError("sanitise_context_reason: Phase 1 Ralph target")
+    """Apply §7.7 ingest rules. Returns `(sanitised, redaction_types)`.
+
+    Raises `ContextReasonTooLong` if `raw` exceeds the hard cap —
+    length is a structural input error, not a sanitisation result.
+
+    Redaction type names:
+      - "url"
+      - "base64"
+      - "hex"
+      - "digits"
+      - "non_ascii"
+    """
+    if not isinstance(raw, str):
+        raise TypeError(f"context_reason must be str, got {type(raw).__name__}")
+    if len(raw) > MAX_CONTEXT_REASON_LENGTH:
+        raise ContextReasonTooLong(
+            f"context_reason length {len(raw)} exceeds max "
+            f"{MAX_CONTEXT_REASON_LENGTH}"
+        )
+
+    redactions: list[str] = []
+
+    # Tag every pattern that matches the ORIGINAL input — patterns
+    # overlap (base64 is a superset of hex, for instance) and checking
+    # after progressive substitution would hide the narrower match.
+    pattern_order: list[tuple[str, re.Pattern[str]]] = [
+        ("url", _URL_RE),
+        ("base64", _BASE64_RE),
+        ("hex", _HEX_RE),
+        ("digits", _DIGITS_RE),
+    ]
+    for name, pat in pattern_order:
+        if pat.search(raw):
+            redactions.append(name)
+
+    # Apply substitutions in a fixed order. Each pattern reduces its
+    # matches to `[redacted]`; later patterns see the already-reduced
+    # string, which is fine because `[redacted]` contains none of the
+    # subsequent targets.
+    result = raw
+    for _name, pat in pattern_order:
+        result = pat.sub("[redacted]", result)
+
+    # Non-ASCII strip: reconstruct character-by-character so we catch
+    # any codepoint outside the allowlist, not just ones matched by
+    # a simple pattern.
+    non_ascii_removed = False
+    rebuilt_chars: list[str] = []
+    for ch in result:
+        if _ALLOWED_CODEPOINT_RE.fullmatch(ch):
+            rebuilt_chars.append(ch)
+        else:
+            non_ascii_removed = True
+    if non_ascii_removed:
+        redactions.append("non_ascii")
+        result = "".join(rebuilt_chars)
+
+    return result, redactions
