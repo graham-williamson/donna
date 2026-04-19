@@ -93,10 +93,15 @@ IMMUTABLE_AT_CREATION = (
 
 # These start NULL at creation and may be set exactly once, on the
 # pending_approval → approved transition. Subsequent changes are rejected.
+#
+# Note: approval_hmac is NOT in this tuple. Per §7.3, the HMAC is
+# computed at row creation (covering creation fields) and recomputed at
+# approval (extending coverage to execution_expires_at + approved_at).
+# Exactly one rewrite is expected — the HMAC verification itself is
+# what protects the field at rest.
 SET_ONCE_ON_APPROVAL = (
     "execution_expires_at",
     "approved_at",
-    "approval_hmac",
 )
 
 # Fields that may change freely during the row's lifetime.
@@ -107,6 +112,10 @@ MUTABLE_FIELDS = frozenset({
     "error_code",
     "error_message",
     "prev_audit_hash",
+    # approval_hmac is rewritten exactly once (at approval, §7.3). Kept
+    # mutable here so transition() allows the update; the HMAC verify
+    # path is what enforces integrity.
+    "approval_hmac",
     # resolved_summary and context_reason are derived/display — not HMAC
     # covered (§6) and may be regenerated. Kept mutable to allow resolver
     # refresh without tripping triggers.
