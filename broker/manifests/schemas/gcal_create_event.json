@@ -1,0 +1,73 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "donna://schemas/gcal_create_event.json",
+  "title": "gcal.create_event params",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["calendar_id", "summary", "start", "end"],
+  "properties": {
+    "calendar_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 5000
+    },
+    "start": {
+      "type": "object",
+      "required": ["dateTime", "timeZone"],
+      "additionalProperties": false,
+      "properties": {
+        "dateTime": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([+-][0-9]{2}:[0-9]{2}|Z)$"
+        },
+        "timeZone": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        }
+      }
+    },
+    "end": {
+      "type": "object",
+      "required": ["dateTime", "timeZone"],
+      "additionalProperties": false,
+      "properties": {
+        "dateTime": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([+-][0-9]{2}:[0-9]{2}|Z)$"
+        },
+        "timeZone": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        }
+      }
+    },
+    "attendees": {
+      "type": "array",
+      "maxItems": 50,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["email"],
+        "properties": {
+          "email": {"type": "string", "format": "email", "maxLength": 254},
+          "displayName": {"type": "string", "maxLength": 200}
+        }
+      }
+    },
+    "location": {
+      "type": "string",
+      "maxLength": 500
+    }
+  }
+}

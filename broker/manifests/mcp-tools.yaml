@@ -1,0 +1,114 @@
+# MCP-tool risk classification.
+#
+# Spec: security-v1.1 §8.1, §14.1 (Playwright is always blocked).
+# Consumed by: broker.policy-check (via main.py) and by the rewired
+# Phase 1 capability-guard.sh via `donna-broker policy-check`.
+#
+# Risks: low = allowed without approval. medium = block at hook, require
+# broker request + approval. high = block at hook, require broker
+# request + approval with stricter rate limits. blocked = never permitted.
+
+tools:
+
+  # ---- Gmail ------------------------------------------------------------
+  mcp__claude_ai_Gmail__gmail_search_messages: low
+  mcp__claude_ai_Gmail__get_thread: low
+  mcp__claude_ai_Gmail__list_drafts: low
+  mcp__claude_ai_Gmail__list_labels: low
+  mcp__claude_ai_Gmail__search_threads: low
+  mcp__claude_ai_Gmail__create_draft: medium
+  mcp__claude_ai_Gmail__create_label: medium
+  mcp__claude_ai_Gmail__label_message: medium
+  mcp__claude_ai_Gmail__label_thread: medium
+  mcp__claude_ai_Gmail__unlabel_message: medium
+  mcp__claude_ai_Gmail__unlabel_thread: medium
+
+  # ---- Google Calendar --------------------------------------------------
+  mcp__claude_ai_Google_Calendar__list_calendars: low
+  mcp__claude_ai_Google_Calendar__list_events: low
+  mcp__claude_ai_Google_Calendar__get_event: low
+  mcp__claude_ai_Google_Calendar__suggest_time: low
+  mcp__claude_ai_Google_Calendar__create_event: medium
+  mcp__claude_ai_Google_Calendar__update_event: medium
+  mcp__claude_ai_Google_Calendar__delete_event: medium
+  mcp__claude_ai_Google_Calendar__respond_to_event: medium
+
+  # ---- Notion -----------------------------------------------------------
+  mcp__plugin_Notion_notion__notion-fetch: low
+  mcp__plugin_Notion_notion__notion-search: low
+  mcp__plugin_Notion_notion__notion-get-users: low
+  mcp__plugin_Notion_notion__notion-get-teams: low
+  mcp__plugin_Notion_notion__notion-get-comments: low
+  mcp__plugin_Notion_notion__notion-create-pages: medium
+  mcp__plugin_Notion_notion__notion-create-database: medium
+  mcp__plugin_Notion_notion__notion-create-comment: medium
+  mcp__plugin_Notion_notion__notion-duplicate-page: medium
+  mcp__plugin_Notion_notion__notion-move-pages: medium
+  mcp__plugin_Notion_notion__notion-update-page: medium
+  mcp__plugin_Notion_notion__notion-update-data-source: medium
+  mcp__plugin_Notion_notion__notion-update-view: medium
+  mcp__plugin_Notion_notion__notion-create-view: medium
+
+  # ---- Telegram (low-risk send — Graham↔Donna) --------------------------
+  mcp__plugin_telegram_telegram__reply: low
+  mcp__plugin_telegram_telegram__react: low
+  mcp__plugin_telegram_telegram__edit_message: low
+  mcp__plugin_telegram_telegram__get_history: low
+  mcp__plugin_telegram_telegram__search_messages: low
+
+  # ---- Sentry -----------------------------------------------------------
+  mcp__claude_ai_Sentry__whoami: low
+  mcp__claude_ai_Sentry__analyze_issue_with_seer: low
+  mcp__claude_ai_Sentry__get_doc: low
+  mcp__claude_ai_Sentry__search_docs: low
+  mcp__claude_ai_Sentry__search_events: low
+  mcp__claude_ai_Sentry__search_issues: low
+  mcp__claude_ai_Sentry__search_issue_events: low
+  mcp__claude_ai_Sentry__find_organizations: low
+  mcp__claude_ai_Sentry__find_projects: low
+  mcp__claude_ai_Sentry__find_teams: low
+  mcp__claude_ai_Sentry__find_releases: low
+  mcp__claude_ai_Sentry__find_dsns: low
+  mcp__claude_ai_Sentry__get_event_attachment: low
+  mcp__claude_ai_Sentry__get_issue_tag_values: low
+  mcp__claude_ai_Sentry__get_profile_details: low
+  mcp__claude_ai_Sentry__get_replay_details: low
+  mcp__claude_ai_Sentry__get_sentry_resource: low
+  mcp__claude_ai_Sentry__create_project: medium
+  mcp__claude_ai_Sentry__create_dsn: medium
+  mcp__claude_ai_Sentry__create_team: medium
+  mcp__claude_ai_Sentry__update_issue: medium
+  mcp__claude_ai_Sentry__update_project: medium
+
+  # ---- Gamma ------------------------------------------------------------
+  mcp__claude_ai_Gamma__read_gamma: low
+  mcp__claude_ai_Gamma__get_folders: low
+  mcp__claude_ai_Gamma__get_themes: low
+  mcp__claude_ai_Gamma__get_generation_status: low
+  mcp__claude_ai_Gamma__generate: medium
+
+  # ---- Playwright (§14.1 — permanently blocked) -------------------------
+  # Each Playwright tool must be listed as `blocked` so the manifest
+  # loader's §14.1 check finds it explicitly rather than relying on
+  # default-deny-for-unlisted.
+  mcp__plugin_playwright_playwright__browser_navigate: blocked
+  mcp__plugin_playwright_playwright__browser_click: blocked
+  mcp__plugin_playwright_playwright__browser_close: blocked
+  mcp__plugin_playwright_playwright__browser_console_messages: blocked
+  mcp__plugin_playwright_playwright__browser_drag: blocked
+  mcp__plugin_playwright_playwright__browser_evaluate: blocked
+  mcp__plugin_playwright_playwright__browser_file_upload: blocked
+  mcp__plugin_playwright_playwright__browser_fill_form: blocked
+  mcp__plugin_playwright_playwright__browser_handle_dialog: blocked
+  mcp__plugin_playwright_playwright__browser_hover: blocked
+  mcp__plugin_playwright_playwright__browser_navigate_back: blocked
+  mcp__plugin_playwright_playwright__browser_network_requests: blocked
+  mcp__plugin_playwright_playwright__browser_press_key: blocked
+  mcp__plugin_playwright_playwright__browser_resize: blocked
+  mcp__plugin_playwright_playwright__browser_run_code: blocked
+  mcp__plugin_playwright_playwright__browser_select_option: blocked
+  mcp__plugin_playwright_playwright__browser_snapshot: blocked
+  mcp__plugin_playwright_playwright__browser_tabs: blocked
+  mcp__plugin_playwright_playwright__browser_take_screenshot: blocked
+  mcp__plugin_playwright_playwright__browser_type: blocked
+  mcp__plugin_playwright_playwright__browser_wait_for: blocked

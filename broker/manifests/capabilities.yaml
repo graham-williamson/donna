@@ -1,0 +1,84 @@
+# Donna capability manifest.
+#
+# Spec: security-v1.1 §8. Broker refuses to start if any entry is
+# malformed. Every medium/high capability MUST declare `revalidate`
+# as either {handler, arguments} or {not_applicable: <reason>}.
+#
+# This file is LIVE CONFIG — changes require a broker restart (the
+# broker loads it at startup and does not watch for changes).
+
+capabilities:
+
+  # ---- Gmail ------------------------------------------------------------
+
+  - name: gmail.create_draft
+    executor:
+      type: mcp_tool
+      tool: mcp__claude_ai_Gmail__create_draft
+    param_schema:
+      $ref: ./schemas/gmail_create_draft.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: medium
+    revalidate:
+      not_applicable: stateless_write
+    idempotency_date_from: created_utc
+    approval_window_minutes: 1440
+    execution_window_minutes: 720
+
+  # ---- Google Calendar --------------------------------------------------
+
+  - name: gcal.create_event
+    executor:
+      type: mcp_tool
+      tool: mcp__claude_ai_Google_Calendar__create_event
+    param_schema:
+      $ref: ./schemas/gcal_create_event.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: medium
+    revalidate:
+      not_applicable: idempotent_create
+    idempotency_date_from: created_utc
+    approval_window_minutes: 360
+    execution_window_minutes: 60
+
+  # ---- Notion -----------------------------------------------------------
+
+  - name: notion.create_pages
+    executor:
+      type: mcp_tool
+      tool: mcp__plugin_Notion_notion__notion-create-pages
+    param_schema:
+      $ref: ./schemas/notion_create_pages.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: medium
+    revalidate:
+      not_applicable: idempotent_create
+    idempotency_date_from: created_utc
+    approval_window_minutes: 720
+    execution_window_minutes: 120
+
+  # ---- PureGym (Phase 2 — browser executor, currently schema-only) -----
+  #
+  # Subprocess executor stays here but binary path is a placeholder.
+  # When Phase 2 ships the age-encrypted credential flow and the
+  # PyInstaller-bundled executor, update `binary` below.
+
+  - name: puregym.book_class
+    executor:
+      type: subprocess
+      binary: /Users/donna-broker/broker/executors/puregym_book
+      timeout_seconds: 120
+    param_schema:
+      $ref: ./schemas/puregym_book.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: medium
+    revalidate:
+      handler: puregym.check_class_bookable
+      arguments: [gym_id, class_id, date]
+    idempotency_date_from: params.date
+    approval_window_minutes: 120
+    execution_window_minutes: 60

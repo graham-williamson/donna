@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Launchd job: runs `donna-broker verify-audit` once a day.
+
+  Spec: security-v1.1 §3 (launchd supervision model) / §17 Phase 1
+  "broker health-check plist (runs donna-broker verify-audit daily,
+  alerts on chain break)".
+
+  Installed as a LaunchAgent under grahamwilliamson so it can invoke
+  `sudo -u donna-broker /usr/local/bin/donna-broker` via the sudoers
+  rule the setup script installs. (Running this as a LaunchDaemon
+  under root would bypass sudoers and lose the audit trail of who
+  triggered the check.)
+
+  Output streams are written to the audit directory so that chain-
+  break diagnostics are preserved even if launchd-level logs rotate.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.donna.broker.verify-audit</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>echo '{}' | sudo -u donna-broker /usr/local/bin/donna-broker verify-audit</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>15</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/donna-broker/audit/verify-audit.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/donna-broker/audit/verify-audit.stderr.log</string>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <false/>
+</dict>
+</plist>
