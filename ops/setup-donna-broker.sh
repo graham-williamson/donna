@@ -109,16 +109,25 @@ cp -n "${REPO_ROOT}/broker/manifests/schemas/"*.json "${CONFIG}/schemas/" 2>/dev
 chown -R donna-broker:donna-bridge "${BROKER_HOME}"
 
 # ---- 6. create broker venv as donna-broker ----
-if [[ ! -x "${BROKER_HOME}/broker/.venv/bin/python3" ]]; then
-  echo "==> creating broker venv (this takes ~30s)"
-  sudo -u donna-broker /usr/bin/python3 -m venv "${BROKER_HOME}/broker/.venv"
+# macOS /usr/bin/python3 ships ensurepip that can fail in non-interactive
+# contexts (CLT-stub quirk, or when the user can't write to a cache).
+# Create without pip, then bootstrap via get-pip.py — reliable on every
+# macOS configuration we've seen.
+VENV_PY="${BROKER_HOME}/broker/.venv/bin/python3"
+if [[ ! -x "${VENV_PY}" ]]; then
+  echo "==> creating broker venv (without-pip, ~5s)"
+  sudo -u donna-broker /usr/bin/python3 -m venv --without-pip "${BROKER_HOME}/broker/.venv"
+fi
+
+if ! sudo -u donna-broker "${VENV_PY}" -m pip --version >/dev/null 2>&1; then
+  echo "==> bootstrapping pip via get-pip.py"
+  curl -sS https://bootstrap.pypa.io/get-pip.py \
+    | sudo -u donna-broker "${VENV_PY}"
 fi
 
 echo "==> installing hash-locked broker dependencies"
-sudo -u donna-broker \
-  "${BROKER_HOME}/broker/.venv/bin/python3" -m pip install --upgrade pip --quiet
-sudo -u donna-broker \
-  "${BROKER_HOME}/broker/.venv/bin/python3" -m pip install \
+sudo -u donna-broker "${VENV_PY}" -m pip install --upgrade pip --quiet
+sudo -u donna-broker "${VENV_PY}" -m pip install \
   --require-hashes -r "${BROKER_HOME}/broker/requirements.txt" --quiet
 
 # ---- 7. generate HMAC key (idempotent: only if missing) ----
