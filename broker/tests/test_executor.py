@@ -1,31 +1,489 @@
 """Tests for broker.executor.
 
 Spec: security-v1.1 §8 (binding absolute), §13.4 (revalidation), §11
-(replay), §5 (executing → terminal).
-
-Ralph target scope (see ralph-prompts/executor.md):
-  - Dispatch by capability name only; unknown capability raises.
-  - Capability A's approved row refuses to execute via B's executor
-    (no aliasing).
-  - Revalidation runs at execute time when handler declared; failure →
-    row → failed{reason: stale}.
-  - Durable-start transaction: writes execution_started + state +
-    PID and commits BEFORE spawning the executor. Crash pre-spawn leaves
-    row in a state resolvable via reconciliation on next startup.
-  - Subprocess executor: sanitised env, closed fds, cwd ephemeral,
-    timeout respected.
-  - Executor crash mid-run → failed{reason: executor_crashed, exit_code}.
+(durable start), §5 (executing → terminal), §9.2 (subprocess isolation).
 """
 from __future__ import annotations
+
+import json
+import stat
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import pytest
 
 from broker import executor
+from broker import requests_db as db
+
+
+# ---- fixtures -----------------------------------------------------------
+
+
+@dataclass
+class FakeCapability:
+    name: str
+    executor_type: str
+    executor_target: str
+    revalidate: dict[str, Any]
+
+
+@pytest.fixture
+def conn(tmp_path):
+    c = db.open_db(str(tmp_path / "requests.db"))
+    yield c
+    c.close()
+
+
+def _insert_approved(
+    conn, request_id: str, capability_name: str
+) -> db.Request:
+    r = db.Request(
+        request_id=request_id,
+        capability=capability_name,
+        params_json='{"k":"v"}',
+        params_hash="a" * 64,
+        idempotency_key=f"ik-{request_id}",
+        resolved_summary="test",
+        context_reason=None,
+        risk_level="medium",
+        state="pending_approval",
+        approval_code=f"C{request_id[-5:].upper()}",
+        approval_hmac=None,
+        created_at=1_000_000,
+        approval_expires_at=2_000_000,
+        execution_expires_at=None,
+        approved_at=None,
+        executed_at=None,
+        result_json=None,
+        error_code=None,
+        error_message=None,
+        prev_audit_hash=None,
+    )
+    db.insert_request(conn, r)
+    db.transition(
+        conn, request_id, "pending_approval", "approved",
+        execution_expires_at=5_000_000,
+        approved_at=1_500_000,
+        approval_hmac="c" * 64,
+    )
+    return db.get_request(conn, request_id)  # type: ignore[return-value]
+
+
+def _write_exec_script(tmp_path: Path, body: str, name: str = "exec") -> str:
+    path = tmp_path / name
+    path.write_text("#!/usr/bin/env python3\n" + body, encoding="utf-8")
+    path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    return str(path)
+
+
+# ---- module surface ------------------------------------------------------
 
 
 def test_module_importable():
-    assert hasattr(executor, "execute")
-    assert hasattr(executor, "ExecutionError")
+    for name in (
+        "execute",
+        "ExecutionError",
+        "ExecutionOutcome",
+        "DEFAULT_EXECUTOR_TIMEOUT_SECONDS",
+    ):
+        assert hasattr(executor, name)
 
 
-# TODO(phase-1 ralph): full coverage per spec-ref list above.
+# ---- capability binding --------------------------------------------------
+
+
+def test_capability_mismatch_raises(conn):
+    r = _insert_approved(conn, "r1", "capA")
+    cap = FakeCapability(name="capB", executor_type="subprocess",
+                         executor_target="/bin/true", revalidate={})
+    with pytest.raises(executor.ExecutionError) as exc:
+        executor.execute(cap, r, {}, conn)
+    assert exc.value.error_code == "capability_mismatch"
+
+
+# ---- §13.4 revalidation --------------------------------------------------
+
+
+def test_revalidation_stale_transitions_to_failed(conn, tmp_path):
+    r = _insert_approved(conn, "r2", "cap")
+    script = _write_exec_script(tmp_path, "print('{}')")
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={"handler": "stale_check", "arguments": []},
+    )
+    events: list[dict[str, Any]] = []
+    handlers = {"stale_check": lambda name, p, a: (False, "class full")}
+    outcome = executor.execute(
+        cap, r, {}, conn, audit_writer=events.append,
+        revalidate_handlers=handlers,
+    )
+    assert outcome.state == "failed"
+    assert outcome.error_code == "stale"
+    fetched = db.get_request(conn, "r2")
+    assert fetched is not None and fetched.state == "failed"
+
+
+def test_revalidation_missing_handler_fails(conn):
+    r = _insert_approved(conn, "r-mh", "cap")
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target="/bin/true",
+        revalidate={"handler": "nonexistent", "arguments": []},
+    )
+    events: list[dict[str, Any]] = []
+    outcome = executor.execute(
+        cap, r, {}, conn, audit_writer=events.append,
+        revalidate_handlers={},
+    )
+    assert outcome.state == "failed"
+    assert outcome.error_code == "revalidation_handler_missing"
+
+
+def test_revalidation_not_applicable_skipped(conn, tmp_path):
+    r = _insert_approved(conn, "r-na", "cap")
+    script = _write_exec_script(tmp_path, 'print("{}")')
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={"not_applicable": "stateless_write"},
+    )
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.state == "succeeded"
+
+
+def test_revalidation_no_handler_and_no_na_skipped(conn, tmp_path):
+    """Low-risk capabilities may omit revalidate entirely."""
+    r = _insert_approved(conn, "r-lr", "cap")
+    script = _write_exec_script(tmp_path, 'print("{}")')
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.state == "succeeded"
+
+
+def test_revalidation_handler_success(conn, tmp_path):
+    r = _insert_approved(conn, "r-rh", "cap")
+    script = _write_exec_script(
+        tmp_path, 'import json; print(json.dumps({"ok": True}))',
+    )
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={"handler": "check", "arguments": ["class_id", "date"]},
+    )
+    seen: list[tuple[str, dict[str, Any], list[str]]] = []
+
+    def check(name, p, args):
+        seen.append((name, p, args))
+        return True, "ok"
+
+    outcome = executor.execute(
+        cap, r, {"class_id": "hiit", "date": "2026-04-21"}, conn,
+        revalidate_handlers={"check": check},
+    )
+    assert outcome.state == "succeeded"
+    assert seen == [("cap", {"class_id": "hiit", "date": "2026-04-21"},
+                     ["class_id", "date"])]
+
+
+def test_revalidation_arguments_must_be_list(conn, tmp_path):
+    r = _insert_approved(conn, "r-bad-args", "cap")
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target="/bin/true",
+        revalidate={"handler": "x", "arguments": "not a list"},
+    )
+    outcome = executor.execute(
+        cap, r, {}, conn,
+        revalidate_handlers={"x": lambda *a, **kw: (True, "")},
+    )
+    assert outcome.state == "failed"
+    assert outcome.error_code == "revalidation_handler_bad_arguments"
+
+
+# ---- §11 durable start ---------------------------------------------------
+
+
+def test_durable_start_transitions_before_spawn(conn, tmp_path, monkeypatch):
+    """Row must be in 'executing' state before the executor runs."""
+    r = _insert_approved(conn, "r-ds", "cap")
+    observed_state: list[str] = []
+
+    # Wrap Popen so that AT SPAWN TIME we can read the DB state.
+    orig_popen = subprocess.Popen
+
+    def observing_popen(*args, **kwargs):
+        row = db.get_request(conn, "r-ds")
+        observed_state.append(row.state if row else "missing")
+        return orig_popen(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", observing_popen)
+
+    script = _write_exec_script(tmp_path, 'print("{}")')
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    executor.execute(cap, r, {}, conn)
+    assert observed_state == ["executing"]
+
+
+def test_durable_start_emits_started_audit_event(conn, tmp_path):
+    r = _insert_approved(conn, "r-aud", "cap")
+    script = _write_exec_script(tmp_path, 'print("{}")')
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    events: list[dict[str, Any]] = []
+    executor.execute(cap, r, {}, conn, audit_writer=events.append)
+    started = [e for e in events if e["event"] == "request_execution_started"]
+    assert len(started) == 1
+    assert started[0]["request_id"] == "r-aud"
+    assert started[0]["capability"] == "cap"
+
+
+# ---- subprocess executor -------------------------------------------------
+
+
+def test_subprocess_happy_path(conn, tmp_path):
+    r = _insert_approved(conn, "r-ok", "cap")
+    script = _write_exec_script(
+        tmp_path,
+        'import json, sys; '
+        'data = json.load(sys.stdin); '
+        'print(json.dumps({"confirmation": "PG-12345"}))',
+    )
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    events: list[dict[str, Any]] = []
+    outcome = executor.execute(
+        cap, r, {"class_id": "hiit"}, conn, audit_writer=events.append,
+    )
+    assert outcome.state == "succeeded"
+    assert outcome.result == {"confirmation": "PG-12345"}
+    fetched = db.get_request(conn, "r-ok")
+    assert fetched is not None
+    assert fetched.state == "succeeded"
+    assert fetched.result_json is not None
+    assert json.loads(fetched.result_json) == {"confirmation": "PG-12345"}
+    assert any(
+        e["event"] == "request_execution_succeeded" for e in events
+    )
+
+
+def test_subprocess_non_zero_exit(conn, tmp_path):
+    r = _insert_approved(conn, "r-xc", "cap")
+    script = _write_exec_script(tmp_path, 'import sys; sys.exit(3)')
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    events: list[dict[str, Any]] = []
+    outcome = executor.execute(
+        cap, r, {}, conn, audit_writer=events.append,
+    )
+    assert outcome.state == "failed"
+    assert outcome.error_code == "executor_crashed"
+    fetched = db.get_request(conn, "r-xc")
+    assert fetched is not None
+    assert fetched.state == "failed"
+    assert fetched.error_code == "executor_crashed"
+    failed_events = [e for e in events if e.get("reason") == "executor_crashed"]
+    assert failed_events and failed_events[0]["exit_code"] == 3
+
+
+def test_subprocess_timeout(conn, tmp_path):
+    r = _insert_approved(conn, "r-to", "cap")
+    script = _write_exec_script(tmp_path, "import time; time.sleep(5)")
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    outcome = executor.execute(
+        cap, r, {}, conn, subprocess_timeout_seconds=0.3,
+    )
+    assert outcome.state == "failed"
+    assert outcome.error_code == "executor_timeout"
+
+
+def test_subprocess_missing_binary(conn, tmp_path):
+    r = _insert_approved(conn, "r-mb", "cap")
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess",
+        executor_target=str(tmp_path / "nope"),
+        revalidate={},
+    )
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.state == "failed"
+    assert outcome.error_code == "executor_missing"
+
+
+def test_subprocess_invalid_json_output(conn, tmp_path):
+    r = _insert_approved(conn, "r-ij", "cap")
+    script = _write_exec_script(tmp_path, 'print("not json at all")')
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.state == "failed"
+    assert outcome.error_code == "executor_output_invalid_json"
+
+
+def test_subprocess_non_object_json_output(conn, tmp_path):
+    r = _insert_approved(conn, "r-nj", "cap")
+    script = _write_exec_script(tmp_path, 'print("[1,2,3]")')
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.state == "failed"
+    assert outcome.error_code == "executor_output_not_object"
+
+
+def test_subprocess_empty_output_ok(conn, tmp_path):
+    """Executor prints nothing → treated as empty-result success."""
+    r = _insert_approved(conn, "r-empty", "cap")
+    script = _write_exec_script(tmp_path, 'pass')
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.state == "succeeded"
+    assert outcome.result == {}
+
+
+def test_subprocess_output_too_large(conn, tmp_path):
+    r = _insert_approved(conn, "r-big", "cap")
+    script = _write_exec_script(
+        tmp_path,
+        'import sys; sys.stdout.write("x" * (300 * 1024))',
+    )
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.state == "failed"
+    assert outcome.error_code == "executor_output_too_large"
+
+
+def test_subprocess_stderr_captured(conn, tmp_path):
+    r = _insert_approved(conn, "r-se", "cap")
+    script = _write_exec_script(
+        tmp_path,
+        'import sys; sys.stderr.write("diagnostic info\\n"); print("{}")',
+    )
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    events: list[dict[str, Any]] = []
+    executor.execute(cap, r, {}, conn, audit_writer=events.append)
+    assert any(e["event"] == "executor_stderr" for e in events)
+
+
+def test_subprocess_stderr_over_cap_truncated(conn, tmp_path):
+    r = _insert_approved(conn, "r-st", "cap")
+    script = _write_exec_script(
+        tmp_path,
+        'import sys; sys.stderr.write("X" * (20 * 1024)); print("{}")',
+    )
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    events: list[dict[str, Any]] = []
+    executor.execute(cap, r, {}, conn, audit_writer=events.append)
+    stderr_event = next(e for e in events if e["event"] == "executor_stderr")
+    assert "[truncated]" in stderr_event["stderr"]
+
+
+# ---- §9.2 env sanitisation ----------------------------------------------
+
+
+def test_subprocess_env_is_sanitised(conn, tmp_path, monkeypatch):
+    monkeypatch.setenv("HMAC_KEY", "super-secret")
+    monkeypatch.setenv("BROKER_DB_PATH", "/var/private")
+    r = _insert_approved(conn, "r-env", "cap")
+    script = _write_exec_script(
+        tmp_path,
+        'import json, os; '
+        'print(json.dumps({"env": sorted(os.environ.keys())}))',
+    )
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.state == "succeeded"
+    assert outcome.result is not None
+    env_keys = outcome.result["env"]
+    assert "HMAC_KEY" not in env_keys
+    assert "BROKER_DB_PATH" not in env_keys
+
+
+# ---- mcp_tool dispatch ---------------------------------------------------
+
+
+def test_mcp_tool_returns_metadata_without_terminating(conn):
+    r = _insert_approved(conn, "r-mcp", "gmail.create_draft")
+    cap = FakeCapability(
+        name="gmail.create_draft",
+        executor_type="mcp_tool",
+        executor_target="mcp__claude_ai_Gmail__create_draft",
+        revalidate={"not_applicable": "stateless_write"},
+    )
+    events: list[dict[str, Any]] = []
+    outcome = executor.execute(
+        cap, r, {"to": ["x@y"]}, conn, audit_writer=events.append,
+    )
+    # Row remains executing — the PostToolUse audit-result path will
+    # close it out when the MCP tool actually runs.
+    assert outcome.state == "executing"
+    assert outcome.result is not None
+    assert outcome.result["tool"] == "mcp__claude_ai_Gmail__create_draft"
+    fetched = db.get_request(conn, "r-mcp")
+    assert fetched is not None and fetched.state == "executing"
+    assert any(
+        e["event"] == "request_execution_mcp_tool_handoff" for e in events
+    )
+
+
+# ---- unknown executor_type ----------------------------------------------
+
+
+def test_unknown_executor_type_fails_closed(conn):
+    r = _insert_approved(conn, "r-ue", "cap")
+    cap = FakeCapability(
+        name="cap", executor_type="quantum", executor_target="???",
+        revalidate={},
+    )
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.state == "failed"
+    assert outcome.error_code == "unknown_executor_type"
+
+
+# ---- audit_writer resilience --------------------------------------------
+
+
+def test_audit_writer_exception_non_blocking(conn, tmp_path):
+    r = _insert_approved(conn, "r-ax", "cap")
+    script = _write_exec_script(tmp_path, 'print("{}")')
+    cap = FakeCapability(
+        name="cap", executor_type="subprocess", executor_target=script,
+        revalidate={},
+    )
+
+    def raising_writer(event):
+        raise RuntimeError("audit is on fire")
+
+    outcome = executor.execute(
+        cap, r, {}, conn, audit_writer=raising_writer,
+    )
+    assert outcome.state == "succeeded"
