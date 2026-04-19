@@ -1,0 +1,61 @@
+[project]
+name = "donna-broker"
+version = "0.0.1-pre"
+description = "Donna assistant broker — capability-gated request lifecycle (security-v1.1)"
+requires-python = ">=3.11"
+readme = "CLAUDE.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--tb=short",
+]
+pythonpath = [".."]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+mypy_path = [".."]
+explicit_package_bases = true
+namespace_packages = true
+
+# tests/ may hold fixtures that dynamically introspect — allow Any in tests only.
+# Module paths are broker.tests.* because tests/ is a sub-package of broker/.
+[[tool.mypy.overrides]]
+module = "broker.tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+# pytest ships type information but mypy --strict sometimes fails to find it
+# through the venv's site-packages. Safety net.
+[[tool.mypy.overrides]]
+module = ["pytest", "pytest.*", "_pytest.*"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+branch = true
+source = ["broker"]
+omit = [
+    "broker/main.py",      # integration surface; covered by end-to-end tests, not unit
+    "broker/__init__.py",
+]
+
+[tool.coverage.report]
+# Ralph completion promise requires >=95% per module; the suite-wide
+# fail_under here is 90 so individual Wave A merges don't get blocked
+# by unrelated module coverage dips. Per-module enforcement happens
+# via each ralph-prompt's --completion-promise.
+fail_under = 90
+show_missing = true
+skip_empty = true
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]

@@ -1,0 +1,10 @@
+# Production dependencies for the Donna broker.
+# Compile with:
+#   pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+# and commit the resulting requirements.txt. Security-v1.1 §7.1 requires
+# hash-locked installs for rfc8785 specifically; generate-hashes locks
+# every transitive dep the same way.
+
+rfc8785>=0.1.4,<1.0       # RFC 8785 JCS canonicalisation (§7.1)
+PyYAML>=6.0,<7.0          # capabilities.yaml + mcp-tools.yaml parsing (§8)
+jsonschema>=4.20,<5.0     # param_schema validation (§8)

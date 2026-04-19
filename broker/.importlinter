@@ -1,0 +1,65 @@
+; Import-linter contracts. Enforce policy.py purity (§9.1) and the
+; broader no-network invariant for modules that must stay local.
+;
+; Run:  PYTHONPATH=.. lint-imports   (from broker/)
+;
+; Forbidden list uses top-level packages only — import-linter rejects
+; submodule names like `http.client` for external/stdlib packages.
+; `http` covers http.client, http.server, http.cookies, etc.
+; `urllib` covers urllib.request, urllib.parse, urllib.error, etc.
+
+[importlinter]
+root_package = broker
+include_external_packages = True
+
+[importlinter:contract:policy-no-network]
+name = policy.py must not import any network client module
+type = forbidden
+source_modules =
+    broker.policy
+forbidden_modules =
+    requests
+    httpx
+    aiohttp
+    urllib3
+    urllib
+    http
+
+[importlinter:contract:canonicalize-no-network]
+name = canonicalize.py must not import any network client module
+type = forbidden
+source_modules =
+    broker.canonicalize
+forbidden_modules =
+    requests
+    httpx
+    aiohttp
+    urllib3
+    urllib
+    http
+
+[importlinter:contract:requests-db-no-network]
+name = requests_db.py must not import any network client module
+type = forbidden
+source_modules =
+    broker.requests_db
+forbidden_modules =
+    requests
+    httpx
+    aiohttp
+    urllib3
+    urllib
+    http
+
+[importlinter:contract:audit-no-network]
+name = audit.py must not import any network client module
+type = forbidden
+source_modules =
+    broker.audit
+forbidden_modules =
+    requests
+    httpx
+    aiohttp
+    urllib3
+    urllib
+    http

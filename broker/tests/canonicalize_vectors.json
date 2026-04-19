@@ -1,0 +1,146 @@
+[
+  {
+    "name": "empty_object",
+    "description": "Empty object canonicalises to {}",
+    "input": {},
+    "canonical": "{}"
+  },
+  {
+    "name": "empty_array",
+    "description": "Empty array canonicalises to []",
+    "input": [],
+    "canonical": "[]"
+  },
+  {
+    "name": "single_key_value",
+    "description": "Single key preserved with no whitespace",
+    "input": {"a": 1},
+    "canonical": "{\"a\":1}"
+  },
+  {
+    "name": "two_keys_reordered",
+    "description": "Keys sorted ascending by UTF-16 code unit sequence",
+    "input": {"b": 2, "a": 1},
+    "canonical": "{\"a\":1,\"b\":2}"
+  },
+  {
+    "name": "three_keys_reordered",
+    "description": "Stable sort across three keys",
+    "input": {"c": 3, "a": 1, "b": 2},
+    "canonical": "{\"a\":1,\"b\":2,\"c\":3}"
+  },
+  {
+    "name": "nested_object_sorted",
+    "description": "Nested object keys sorted independently from outer keys",
+    "input": {"b": {"d": 4, "c": 3}, "a": 1},
+    "canonical": "{\"a\":1,\"b\":{\"c\":3,\"d\":4}}"
+  },
+  {
+    "name": "array_order_preserved",
+    "description": "Array order is data; never reordered",
+    "input": [3, 1, 2],
+    "canonical": "[3,1,2]"
+  },
+  {
+    "name": "array_of_objects",
+    "description": "Inner object keys sorted; array order preserved",
+    "input": [{"b": 2, "a": 1}, {"d": 4, "c": 3}],
+    "canonical": "[{\"a\":1,\"b\":2},{\"c\":3,\"d\":4}]"
+  },
+  {
+    "name": "boolean_true",
+    "description": "Boolean literals unchanged",
+    "input": {"b": true},
+    "canonical": "{\"b\":true}"
+  },
+  {
+    "name": "boolean_false",
+    "description": "Boolean literals unchanged",
+    "input": {"b": false},
+    "canonical": "{\"b\":false}"
+  },
+  {
+    "name": "null_value",
+    "description": "null literal unchanged",
+    "input": {"n": null},
+    "canonical": "{\"n\":null}"
+  },
+  {
+    "name": "integer_zero",
+    "description": "Zero emits as '0', no sign",
+    "input": {"n": 0},
+    "canonical": "{\"n\":0}"
+  },
+  {
+    "name": "negative_integer",
+    "description": "Negative integers with single leading minus",
+    "input": {"n": -42},
+    "canonical": "{\"n\":-42}"
+  },
+  {
+    "name": "positive_large_integer",
+    "description": "Large integers emitted without separators or notation",
+    "input": {"n": 1000000000000},
+    "canonical": "{\"n\":1000000000000}"
+  },
+  {
+    "name": "float_trailing_zero_dropped",
+    "description": "1.0 → 1 per ECMAScript Number-to-String",
+    "input": {"n": 1.0},
+    "canonical": "{\"n\":1}"
+  },
+  {
+    "name": "float_non_trivial_decimal",
+    "description": "1.5 round-trips as 1.5",
+    "input": {"n": 1.5},
+    "canonical": "{\"n\":1.5}"
+  },
+  {
+    "name": "string_with_double_quote",
+    "description": "Embedded double-quote gets \\\" escape",
+    "input": {"s": "a\"b"},
+    "canonical": "{\"s\":\"a\\\"b\"}"
+  },
+  {
+    "name": "string_with_backslash",
+    "description": "Embedded backslash gets \\\\ escape",
+    "input": {"s": "a\\b"},
+    "canonical": "{\"s\":\"a\\\\b\"}"
+  },
+  {
+    "name": "string_with_newline",
+    "description": "Control char newline escaped as \\n",
+    "input": {"s": "a\nb"},
+    "canonical": "{\"s\":\"a\\nb\"}"
+  },
+  {
+    "name": "string_slash_not_escaped",
+    "description": "Solidus left unescaped per RFC 8259 §7",
+    "input": {"s": "a/b"},
+    "canonical": "{\"s\":\"a/b\"}"
+  },
+  {
+    "name": "unicode_bmp_direct",
+    "description": "Printable Unicode (U+00E9) emitted as UTF-8, not \\u escape",
+    "input": {"s": "café"},
+    "canonical": "{\"s\":\"café\"}"
+  },
+  {
+    "name": "unicode_key_sort",
+    "description": "Latin + extended Latin key sort: 'a' (U+0061) precedes 'é' (U+00E9)",
+    "input": {"é": 2, "a": 1},
+    "canonical": "{\"a\":1,\"é\":2}"
+  },
+  {
+    "name": "deeply_nested",
+    "description": "Three levels of nesting, mixed object/array",
+    "input": {"a": {"b": {"c": [1, 2, 3]}}},
+    "canonical": "{\"a\":{\"b\":{\"c\":[1,2,3]}}}"
+  },
+  {
+    "name": "booking_shaped_params",
+    "description": "Representative capability params: key sort across real field names",
+    "input": {"date": "2026-04-21", "class_id": "hiit-evening", "gym": "fulham"},
+    "canonical": "{\"class_id\":\"hiit-evening\",\"date\":\"2026-04-21\",\"gym\":\"fulham\"}"
+  }
+]
