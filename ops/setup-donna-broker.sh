@@ -242,10 +242,11 @@ xattr -w com.apple.metadata:com_apple_backup_excludeItem \
 # ---- 11. smoke test ----
 echo ""
 echo "==> smoke test: donna-broker verify-audit"
-# cd ${SAFE_CWD} avoids the cwd leak — the wrapper itself sanitises env
-# but the outer sudo -u graham invocation can carry graham's cwd which
-# the broker may not need but warns noisily about.
-( cd "${SAFE_CWD}" && sudo -u "${GRAHAM_USER}" /usr/local/bin/donna-broker verify-audit < /dev/null ) || {
+# Wrapper runs as whatever user invokes it; the production path is
+# `sudo -u donna-broker /usr/local/bin/donna-broker ...` (as defined
+# by the sudoers rule). The smoke test mirrors that, so the broker
+# python opens the DB / audit log with the right uid.
+( cd "${SAFE_CWD}" && sudo -u donna-broker /usr/local/bin/donna-broker verify-audit < /dev/null ) || {
   echo "SMOKE TEST FAILED" >&2
   exit 1
 }
