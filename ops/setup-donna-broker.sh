@@ -199,16 +199,23 @@ echo "==> installing ${WRAPPER}"
 install -m 0755 -o root -g wheel "${REPO_ROOT}/ops/donna-broker.sh" "${WRAPPER}"
 
 # ---- 9. install sudoers fragment ----
+# Spec §17 wrote the sudoers line as
+#   grahamwilliamson ALL=(donna-broker) NOPASSWD: CLOSEFROM=3: /usr/local/bin/donna-broker
+# but CLOSEFROM is a sudo Defaults setting, not a per-command tag —
+# visudo rejects that exact form. The standard sudoers way is:
+#   - Defaults!<command> closefrom=3       (per-command default)
+#   - <user> <host>=(<runas>) NOPASSWD: <command>
+# sudo's default closefrom is already 3, so the Defaults line is
+# documentation/explicit-intent rather than a behaviour change.
+# fd inheritance is also blocked by the wrapper's `env -i` + `exec`.
 SUDOERS_FILE="/etc/sudoers.d/donna-broker"
 if [[ ! -f "${SUDOERS_FILE}" ]]; then
   echo "==> installing sudoers rule at ${SUDOERS_FILE}"
-  # Spec §17 sudoers line. CLOSEFROM=3 prevents file-descriptor
-  # inheritance. NOEXEC intentionally omitted per §17 (Phase 2
-  # executors need execve for age / chromium).
   cat > "${SUDOERS_FILE}" <<SUDOERS
 # Managed by ops/setup-donna-broker.sh — do not edit by hand.
-Defaults!/usr/local/bin/donna-broker closefrom_override
-${GRAHAM_USER} ALL=(donna-broker) NOPASSWD: CLOSEFROM=3: /usr/local/bin/donna-broker
+# Spec: security-v1.1 §17 Phase 1 sudoers rule.
+Defaults!/usr/local/bin/donna-broker closefrom=3
+${GRAHAM_USER} ALL=(donna-broker) NOPASSWD: /usr/local/bin/donna-broker
 SUDOERS
   chmod 0440 "${SUDOERS_FILE}"
   visudo -cf "${SUDOERS_FILE}" || { echo "sudoers validation failed!" >&2; rm "${SUDOERS_FILE}"; exit 1; }
