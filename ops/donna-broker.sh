@@ -39,6 +39,13 @@ if [[ "$FOUND" -eq 0 ]]; then
   exit 1
 fi
 
+# cd to a world-readable dir first — the invoking user (e.g. graham
+# via sudo -u donna-broker) often has cwd in a 0700 home directory
+# that donna-broker can't read, which sudo reports as a benign but
+# noisy `shell-init: error retrieving current directory`. /tmp is
+# always readable.
+cd /tmp
+
 # ---- sanitised env ----
 # Mirror §9.2 approach: PATH only, no inherited secrets. Config paths
 # are passed explicitly so the broker never reads unset defaults.
