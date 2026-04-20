@@ -178,12 +178,17 @@ echo "==> installing hash-locked broker dependencies"
     --require-hashes -r "${BROKER_HOME}/broker/requirements.txt" --quiet )
 
 # ---- 7. generate HMAC key (idempotent: only if missing) ----
+# cd /tmp before the donna-broker subshell — same cwd-leak trap that
+# the Python invocations dodged. New file inherits donna-bridge group
+# automatically because that's donna-broker's primary group; no chown
+# needed (the previous version of this section had `chown donna-broker:
+# donna-broker` which fails because there is no donna-broker group).
 HMAC_KEY="${CONFIG}/hmac.key"
 if [[ ! -f "${HMAC_KEY}" ]]; then
   echo "==> generating HMAC key"
-  sudo -u donna-broker sh -c "openssl rand 32 > '${HMAC_KEY}'"
+  ( cd "${SAFE_CWD}" && sudo -u donna-broker sh -c "openssl rand 32 > '${HMAC_KEY}'" )
   chmod 0400 "${HMAC_KEY}"
-  chown donna-broker:donna-broker "${HMAC_KEY}"
+  chown donna-broker:donna-bridge "${HMAC_KEY}"
 else
   echo "==> HMAC key already exists (keeping it)"
 fi
@@ -230,7 +235,10 @@ xattr -w com.apple.metadata:com_apple_backup_excludeItem \
 # ---- 11. smoke test ----
 echo ""
 echo "==> smoke test: donna-broker verify-audit"
-sudo -u "${GRAHAM_USER}" /usr/local/bin/donna-broker verify-audit < /dev/null || {
+# cd ${SAFE_CWD} avoids the cwd leak — the wrapper itself sanitises env
+# but the outer sudo -u graham invocation can carry graham's cwd which
+# the broker may not need but warns noisily about.
+( cd "${SAFE_CWD}" && sudo -u "${GRAHAM_USER}" /usr/local/bin/donna-broker verify-audit < /dev/null ) || {
   echo "SMOKE TEST FAILED" >&2
   exit 1
 }
