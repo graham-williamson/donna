@@ -32,10 +32,18 @@
     <key>Minute</key>
     <integer>15</integer>
   </dict>
+  <!--
+    Logs go to graham's ~/Library/Logs/ rather than the broker's audit
+    directory. The job runs as the user who loaded the LaunchAgent
+    (graham), and graham cannot write to /Users/donna-broker/audit/
+    (mode 0755 donna-broker:donna-bridge — group-readable, not
+    group-writable). Putting logs in ~/Library/Logs/ matches macOS
+    convention and keeps them where Graham can read them without sudo.
+  -->
   <key>StandardOutPath</key>
-  <string>/Users/donna-broker/audit/verify-audit.stdout.log</string>
+  <string>/Users/grahamwilliamson/Library/Logs/com.donna.broker.verify-audit.stdout.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/donna-broker/audit/verify-audit.stderr.log</string>
+  <string>/Users/grahamwilliamson/Library/Logs/com.donna.broker.verify-audit.stderr.log</string>
   <key>RunAtLoad</key>
   <false/>
   <key>KeepAlive</key>
