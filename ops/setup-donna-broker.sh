@@ -27,6 +27,41 @@ fi
 REPO_ROOT="$(pwd)"
 GRAHAM_USER="grahamwilliamson"  # change if your macOS user differs
 
+# Python interpreter for the broker venv. Override on the command line:
+#   sudo PYTHON=/opt/homebrew/bin/python3.12 bash ops/setup-donna-broker.sh
+# macOS /usr/bin/python3 is typically 3.9 — too old for our pinned deps
+# (jsonschema 4.26+ requires 3.10, broker spec requires 3.11).
+PYTHON="${PYTHON:-/usr/bin/python3}"
+
+if [[ ! -x "${PYTHON}" ]]; then
+  echo "ERROR: PYTHON=${PYTHON} not found or not executable." >&2
+  exit 1
+fi
+
+# Python must be ≥ 3.11. Check before doing any irreversible work.
+PYTHON_VER=$("${PYTHON}" -c "import sys;print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+PYTHON_MAJOR=${PYTHON_VER%.*}
+PYTHON_MINOR=${PYTHON_VER#*.}
+if [[ "${PYTHON_MAJOR}" -lt 3 ]] || { [[ "${PYTHON_MAJOR}" -eq 3 ]] && [[ "${PYTHON_MINOR}" -lt 11 ]]; }; then
+  echo "ERROR: Python ${PYTHON_VER} is too old. Need 3.11+." >&2
+  echo "  Try one of:" >&2
+  echo "    sudo PYTHON=/opt/homebrew/bin/python3.12 bash ops/setup-donna-broker.sh" >&2
+  echo "    sudo PYTHON=/opt/miniconda3/bin/python3   bash ops/setup-donna-broker.sh" >&2
+  echo "  Or install Homebrew Python: brew install python@3.12" >&2
+  exit 1
+fi
+
+echo "==> using Python ${PYTHON_VER} from ${PYTHON}"
+
+# donna-broker also needs to be able to READ this Python. /opt/homebrew/
+# and /opt/miniconda3/ are typically world-readable; if you've changed
+# defaults, the venv will fail later with a confusing PermissionError.
+if ! sudo -u donna-broker test -r "${PYTHON}" 2>/dev/null; then
+  echo "WARNING: donna-broker may not be able to read ${PYTHON}." >&2
+  echo "  Continuing anyway — if venv creation fails with permission" >&2
+  echo "  errors, chmod the Python directory tree to be readable by all." >&2
+fi
+
 # ---- 1. create donna-bridge group ----
 if ! dscl . -read /Groups/donna-bridge >/dev/null 2>&1; then
   echo "==> creating group donna-bridge"
@@ -128,7 +163,7 @@ SAFE_CWD=/tmp
 if [[ ! -x "${VENV_PY}" ]]; then
   echo "==> creating broker venv (without-pip, ~5s)"
   ( cd "${SAFE_CWD}" && sudo -u donna-broker "${CLEAN_ENV[@]}" \
-      /usr/bin/python3 -m venv --without-pip "${BROKER_HOME}/broker/.venv" )
+      "${PYTHON}" -m venv --without-pip "${BROKER_HOME}/broker/.venv" )
 fi
 
 if ! ( cd "${SAFE_CWD}" && sudo -u donna-broker "${CLEAN_ENV[@]}" "${VENV_PY}" -m pip --version >/dev/null 2>&1 ); then
