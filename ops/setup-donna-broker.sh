@@ -109,34 +109,38 @@ cp -n "${REPO_ROOT}/broker/manifests/schemas/"*.json "${CONFIG}/schemas/" 2>/dev
 chown -R donna-broker:donna-bridge "${BROKER_HOME}"
 
 # ---- 6. create broker venv as donna-broker ----
-# macOS /usr/bin/python3 ships ensurepip that can fail in non-interactive
-# contexts (CLT-stub quirk). We do two things:
-#   1. Create the venv with --without-pip so ensurepip is never invoked.
-#   2. Bootstrap pip via get-pip.py under a HARD-CLEANED env. If the
-#      invoking user has conda's `(base)` active, PYTHONPATH / PYTHONHOME
-#      can leak through sudo and point Python at paths that donna-broker
-#      cannot read, which surfaces as a confusing `PermissionError:
-#      [Errno 13]` during early import. `env -i` eliminates the class
-#      of problem.
+# Three quirks combine to make this the gnarliest step on a fresh box:
+#   1. macOS /usr/bin/python3 ships ensurepip that can fail in
+#      non-interactive contexts (CLT-stub quirk). We use --without-pip
+#      and bootstrap pip via get-pip.py to sidestep ensurepip entirely.
+#   2. If the invoking user has conda's (base) active, PYTHONPATH /
+#      PYTHONHOME can leak through sudo and point at /opt/miniconda3/...
+#      that donna-broker can't read. `env -i` strips the env clean.
+#   3. Python prepends cwd to sys.path on stdin scripts. If this script
+#      ran from /Users/grahamwilliamson/donna (700), donna-broker hits
+#      PermissionError during early import. We `cd /tmp` for the
+#      donna-broker invocations so cwd is world-readable.
+# All three failure modes surfaced on the same Mac Mini install.
 VENV_PY="${BROKER_HOME}/broker/.venv/bin/python3"
 CLEAN_ENV=(env -i HOME=/Users/donna-broker PATH=/usr/bin:/bin)
+SAFE_CWD=/tmp
 
 if [[ ! -x "${VENV_PY}" ]]; then
   echo "==> creating broker venv (without-pip, ~5s)"
-  sudo -u donna-broker "${CLEAN_ENV[@]}" \
-    /usr/bin/python3 -m venv --without-pip "${BROKER_HOME}/broker/.venv"
+  ( cd "${SAFE_CWD}" && sudo -u donna-broker "${CLEAN_ENV[@]}" \
+      /usr/bin/python3 -m venv --without-pip "${BROKER_HOME}/broker/.venv" )
 fi
 
-if ! sudo -u donna-broker "${CLEAN_ENV[@]}" "${VENV_PY}" -m pip --version >/dev/null 2>&1; then
+if ! ( cd "${SAFE_CWD}" && sudo -u donna-broker "${CLEAN_ENV[@]}" "${VENV_PY}" -m pip --version >/dev/null 2>&1 ); then
   echo "==> bootstrapping pip via get-pip.py"
   curl -sS https://bootstrap.pypa.io/get-pip.py \
-    | sudo -u donna-broker "${CLEAN_ENV[@]}" "${VENV_PY}"
+    | ( cd "${SAFE_CWD}" && sudo -u donna-broker "${CLEAN_ENV[@]}" "${VENV_PY}" )
 fi
 
 echo "==> installing hash-locked broker dependencies"
-sudo -u donna-broker "${CLEAN_ENV[@]}" "${VENV_PY}" -m pip install --upgrade pip --quiet
-sudo -u donna-broker "${CLEAN_ENV[@]}" "${VENV_PY}" -m pip install \
-  --require-hashes -r "${BROKER_HOME}/broker/requirements.txt" --quiet
+( cd "${SAFE_CWD}" && sudo -u donna-broker "${CLEAN_ENV[@]}" "${VENV_PY}" -m pip install --upgrade pip --quiet )
+( cd "${SAFE_CWD}" && sudo -u donna-broker "${CLEAN_ENV[@]}" "${VENV_PY}" -m pip install \
+    --require-hashes -r "${BROKER_HOME}/broker/requirements.txt" --quiet )
 
 # ---- 7. generate HMAC key (idempotent: only if missing) ----
 HMAC_KEY="${CONFIG}/hmac.key"
