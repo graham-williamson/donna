@@ -103,6 +103,12 @@ mkdir -p "${CONFIG}/secrets"
 mkdir -p "${CONFIG}/approval-queue"
 mkdir -p "${CONFIG}/approval-responses"
 mkdir -p "${CONFIG}/backups"
+# Heartbeat dir: writable by donna-bridge so the Telegram server
+# (running as graham, who is in donna-bridge) can write the
+# heartbeat file. The bridge's startup mkdir fails on the parent if
+# we don't pre-create with the right perms — surfaced on real
+# deploy as "EACCES: permission denied, mkdir '.../heartbeat'".
+mkdir -p "${CONFIG}/heartbeat"
 
 echo "==> chown'ing ${BROKER_HOME} to donna-broker:donna-bridge"
 chown -R donna-broker:donna-bridge "${BROKER_HOME}"
@@ -113,6 +119,7 @@ chown -R donna-broker:donna-bridge "${BROKER_HOME}"
 echo "==> setting 2770 on shared directories"
 chmod 2770 "${CONFIG}/approval-queue"
 chmod 2770 "${CONFIG}/approval-responses"
+chmod 2770 "${CONFIG}/heartbeat"
 
 # Restrict the secrets dir to donna-broker only.
 echo "==> setting 0700 on secrets dir"
