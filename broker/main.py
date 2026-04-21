@@ -36,12 +36,14 @@ from broker import policy
 from broker import requests_db as db
 from broker import resolver
 from broker import validator
+from broker import vault_health
 
 
 MODES = frozenset({
     "request", "policy-check", "execute", "cancel", "reconcile",
     "status", "status-by-code", "list-pending", "list-recent",
     "audit-result", "rotate-hmac", "verify-audit", "verify-manifests",
+    "verify-vault",
 })
 
 
@@ -70,6 +72,15 @@ def _config_from_env(env: dict[str, str] | None = None) -> dict[str, str]:
         "responses_dir": e.get(
             "DONNA_BROKER_RESPONSES_DIR", f"{home}/approval-responses"
         ),
+        "creds_dir": e.get(
+            "DONNA_CREDS_DIR",
+            "/Users/donna-broker/.config/donna/creds",
+        ),
+        "identity_path": e.get(
+            "DONNA_IDENTITY_PATH",
+            "/Users/donna-broker/.config/donna/creds/identity.age",
+        ),
+        "age_binary": e.get("DONNA_AGE_BINARY", "age"),
     }
 
 
@@ -891,6 +902,89 @@ def _handle_verify_manifests(
     }
 
 
+def _handle_verify_vault(
+    payload: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """§6.3 verify-vault subcommand. Runs the same structural checks
+    as the startup sweep. One line per check, OK or WARN prefix, plus
+    a summary. Exit code 1 if any WARN fired.
+
+        OK   vault_dir_exists       /path/to/creds
+        WARN identity_mode_loose    /path/to/identity.age mode=0644
+        --
+        N warnings, M checks passed.
+    """
+    caps = ctx["capabilities"]
+    declared = [c.creds.entry for c in caps.values() if c.creds is not None]
+
+    creds_dir = Path(ctx["config"]["creds_dir"])
+    identity_path = Path(ctx["config"]["identity_path"])
+    age_binary = ctx["config"]["age_binary"]
+
+    warnings = vault_health.sweep(
+        creds_dir=creds_dir,
+        identity_path=identity_path,
+        age_binary=age_binary,
+        declared_entries=declared,
+        audit_writer=None,   # CLI path does not audit
+    )
+
+    # The full set of checks that sweep() performs, in order. Each
+    # tuple: (check_label, artefact, set of reason codes that would
+    # fire for this check). Used to emit OK lines for passes.
+    expected: list[tuple[str, str, set[str]]] = [
+        ("vault_dir_exists", str(creds_dir), {"vault_dir_missing"}),
+        ("vault_dir_mode", str(creds_dir), {"vault_dir_mode_loose"}),
+        ("vault_dir_owner", str(creds_dir), {"vault_dir_owner_wrong"}),
+        ("identity_exists", str(identity_path), {"identity_missing"}),
+        ("identity_mode", str(identity_path), {"identity_mode_loose"}),
+        ("identity_owner", str(identity_path), {"identity_owner_wrong"}),
+        ("age_binary", age_binary, {"age_binary_missing"}),
+    ]
+    for entry in declared:
+        entry_artefact = str(creds_dir / f"{entry}.age")
+        expected.append((f"entry_exists[{entry}]", entry_artefact, {"entry_missing"}))
+        expected.append((f"entry_mode[{entry}]", entry_artefact, {"entry_mode_loose"}))
+        expected.append((f"entry_owner[{entry}]", entry_artefact, {"entry_owner_wrong"}))
+
+    # Key each warning by (reason, primary_artefact) for O(1) lookup.
+    warning_keys: dict[tuple[str, str], dict[str, Any]] = {}
+    for w in warnings:
+        artefact = w.get("path") or w.get("binary") or ""
+        warning_keys[(w["reason"], artefact)] = w
+
+    lines: list[str] = []
+    warn_count = 0
+    ok_count = 0
+    for check_label, artefact, reasons in expected:
+        fired = [(r, warning_keys[(r, artefact)])
+                 for r in reasons if (r, artefact) in warning_keys]
+        if fired:
+            for reason, w in fired:
+                detail_parts = [
+                    f"{k}={v}" for k, v in w.items()
+                    if k not in {"reason", "path", "entry", "binary"}
+                ]
+                detail = " ".join(detail_parts)
+                lines.append(
+                    f"WARN {reason:22s} {artefact} {detail}".rstrip()
+                )
+                warn_count += 1
+        else:
+            lines.append(f"OK   {check_label:22s} {artefact}")
+            ok_count += 1
+
+    lines.append("--")
+    lines.append(f"{warn_count} warnings, {ok_count} checks passed.")
+
+    return {
+        "status": "ok" if warn_count == 0 else "warnings",
+        "warnings": warnings,
+        "stdout_lines": lines,
+        "exit_code": 0 if warn_count == 0 else 1,
+    }
+
+
 MODE_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]] = {
     "policy-check": _handle_policy_check,
     "request": _handle_request,
@@ -903,11 +997,20 @@ MODE_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, An
     "cancel": _handle_cancel,
     "verify-audit": _handle_verify_audit,
     "verify-manifests": _handle_verify_manifests,
+    "verify-vault": _handle_verify_vault,
 }
 
 # Modes left as explicit not-implemented so the CLI doesn't silently
 # accept garbage when these are invoked before their implementations land.
 NOT_YET_IMPLEMENTED = frozenset({"reconcile", "rotate-hmac"})
+
+# Startup vault health sweep (§6) runs only on operator-initiated modes.
+# Hook-driven modes (policy-check, audit-result) fire many times per
+# session; running the sweep in those paths would produce duplicate
+# audit noise and unnecessary filesystem I/O on the hot path.
+MODES_WITH_STARTUP_SWEEP = frozenset({
+    "execute", "request", "verify-manifests", "verify-vault",
+})
 
 
 # ---- main() -------------------------------------------------------------
@@ -920,6 +1023,7 @@ def _build_ctx(config: dict[str, str], need_manifests: bool) -> dict[str, Any]:
         "audit_dir": config["audit_dir"],
         "queue_dir": config["queue_dir"],
         "responses_dir": config["responses_dir"],
+        "config": config,
     }
     if need_manifests:
         try:
@@ -942,7 +1046,7 @@ def _build_ctx(config: dict[str, str], need_manifests: bool) -> dict[str, Any]:
 
 MODES_NEEDING_MANIFESTS = frozenset({
     "request", "execute", "policy-check", "audit-result",
-    "verify-manifests",
+    "verify-manifests", "verify-vault",
 })
 
 
@@ -988,6 +1092,26 @@ def main(
     except BrokerError as e:
         stdout.write(json.dumps(_error_response(e)) + "\n")
         return 1
+
+    # §6 startup health sweep: operator-initiated modes only (see
+    # MODES_WITH_STARTUP_SWEEP), and only when any capability declares
+    # creds. Warnings are emitted via audit; they never block startup (§10).
+    if mode in MODES_WITH_STARTUP_SWEEP and ctx.get("capabilities"):
+        declared = [
+            c.creds.entry for c in ctx["capabilities"].values()
+            if c.creds is not None
+        ]
+        if declared:
+            def _audit_writer(evt: dict[str, Any]) -> None:
+                audit_mod.write_event(ctx["audit_dir"], evt)
+
+            vault_health.sweep(
+                creds_dir=Path(config["creds_dir"]),
+                identity_path=Path(config["identity_path"]),
+                age_binary=config["age_binary"],
+                declared_entries=declared,
+                audit_writer=_audit_writer,
+            )
 
     handler = MODE_HANDLERS[mode]
     try:

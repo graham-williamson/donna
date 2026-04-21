@@ -668,3 +668,125 @@ def test_verify_manifests_in_modes_frozen_set(broker_env):
     assert "verify-manifests" in main.MODES
     assert "verify-manifests" in main.MODE_HANDLERS
     assert "verify-manifests" in main.MODES_NEEDING_MANIFESTS
+
+
+# ---- verify-vault -------------------------------------------------------
+
+
+@pytest.fixture
+def vault_env(tmp_path, broker_env):
+    """Extend broker_env with a capability that declares creds, a real
+    creds directory, and env vars pointing at it."""
+    home = Path(broker_env["DONNA_BROKER_HOME"])
+
+    # Schema for the new capability (reuse a minimal one).
+    creds_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "required": ["class_id", "date"],
+        "additionalProperties": False,
+        "properties": {
+            "class_id": {"type": "string"},
+            "date": {"type": "string", "pattern": r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+        },
+    }
+    schema_path = home / "everyone_active_book.json"
+    schema_path.write_text(json.dumps(creds_schema), encoding="utf-8")
+
+    exec_script = home / "fake_ea.sh"
+    exec_script.write_text(
+        '#!/bin/sh\necho \'{"confirmation": "EA-99999"}\'\n',
+        encoding="utf-8",
+    )
+    exec_script.chmod(0o755)
+
+    # Replace capabilities.yaml with one that has a creds block.
+    capabilities_yaml = home / "capabilities.yaml"
+    capabilities_yaml.write_text(f"""
+capabilities:
+  - name: everyone_active.book_class
+    executor:
+      type: subprocess
+      binary: {exec_script}
+      timeout_seconds: 30
+    param_schema:
+      $ref: ./everyone_active_book.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: medium
+    revalidate:
+      not_applicable: stateless_write
+    idempotency_date_from: params.date
+    approval_window_minutes: 60
+    execution_window_minutes: 30
+    creds:
+      delivery: fd3
+      entry: everyone_active
+""", encoding="utf-8")
+
+    # Build the creds dir under tmp_path.
+    creds_dir = tmp_path / "creds"
+    creds_dir.mkdir(mode=0o750)
+    identity = creds_dir / "identity.age"
+    identity.write_text("AGE-SECRET-KEY-FAKE", encoding="utf-8")
+    identity.chmod(0o400)
+    entry_file = creds_dir / "everyone_active.age"
+    entry_file.write_text("age-ciphertext-fake", encoding="utf-8")
+    entry_file.chmod(0o440)
+
+    env = dict(broker_env)
+    env["DONNA_CREDS_DIR"] = str(creds_dir)
+    env["DONNA_IDENTITY_PATH"] = str(identity)
+    env["DONNA_AGE_BINARY"] = "age"
+    return env, creds_dir, identity, entry_file
+
+
+def test_verify_vault_clean_exits_zero(vault_env, monkeypatch):
+    """When all checks pass (via monkeypatched owner + age resolver),
+    verify-vault exits 0 with no WARN lines."""
+    from broker import vault_health
+
+    env, creds_dir, identity, entry_file = vault_env
+    monkeypatch.setattr(vault_health, "_check_owner_matches",
+                        lambda p, u: True)
+    monkeypatch.setattr(vault_health, "_resolve_age_binary",
+                        lambda b: "/usr/local/bin/age")
+
+    code, resp = _run("verify-vault", {}, env)
+    assert code == 0, resp
+    assert resp["status"] == "ok"
+    assert resp["warnings"] == []
+    lines = resp["stdout_lines"]
+    assert any("0 warnings" in line for line in lines)
+    assert not any(line.startswith("WARN") for line in lines)
+
+
+def test_verify_vault_with_warning_reports_nonzero_exit_code(vault_env, monkeypatch):
+    """When identity.age is missing, verify-vault outputs an
+    identity_missing WARN line and resp["exit_code"] is 1 (main()
+    itself always returns 0 — the non-zero signal is inside the
+    response payload for the CLI wrapper to propagate)."""
+    from broker import vault_health
+
+    env, creds_dir, identity, entry_file = vault_env
+    identity.unlink()  # Force identity_missing
+    monkeypatch.setattr(vault_health, "_check_owner_matches",
+                        lambda p, u: True)
+    monkeypatch.setattr(vault_health, "_resolve_age_binary",
+                        lambda b: "/usr/local/bin/age")
+
+    code, resp = _run("verify-vault", {}, env)
+    assert code == 0, resp  # main() exit code is always 0 for verify-vault
+    assert resp["status"] == "warnings"
+    assert resp["exit_code"] == 1
+    reasons = [w["reason"] for w in resp["warnings"]]
+    assert "identity_missing" in reasons
+    lines = resp["stdout_lines"]
+    assert any("WARN" in line and "identity_missing" in line for line in lines)
+
+
+def test_verify_vault_in_modes_frozen_set():
+    """Regression guard: verify-vault must be in all three relevant sets."""
+    assert "verify-vault" in main.MODES
+    assert "verify-vault" in main.MODE_HANDLERS
+    assert "verify-vault" in main.MODES_NEEDING_MANIFESTS
