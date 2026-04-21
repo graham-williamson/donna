@@ -20,6 +20,14 @@ Contract:
     PostToolUse audit-result hook transitions executing → succeeded.
   - Every failure path transitions to a terminal state and emits a
     structured audit event.
+
+Fd invariant (Piece C design §3):
+  Dispatch may pass an inherited pipe fd to creds-declared capabilities
+  via pass_fds. The child discovers that fd number via the
+  DONNA_CREDS_FD env var and reads decrypted credential bytes from it.
+  Non-creds-declared capabilities never see pass_fds != (). Any other
+  passed fd is a broker bug — see
+  test_executor.py::test_fd_invariant_across_dispatches.
 """
 from __future__ import annotations
 

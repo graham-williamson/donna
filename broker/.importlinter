@@ -63,3 +63,16 @@ forbidden_modules =
     urllib3
     urllib
     http
+
+[importlinter:contract:subprocess-boundary]
+name = Only resolver, executor, and creds may import subprocess
+type = forbidden
+source_modules =
+    broker
+forbidden_modules =
+    subprocess
+ignore_imports =
+    broker.resolver -> subprocess
+    broker.executor -> subprocess
+    broker.creds -> subprocess
+    broker.tests.* -> subprocess

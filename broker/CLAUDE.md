@@ -27,11 +27,13 @@ HMAC serialisation details — the spec and the test vectors in
   local logic (§9.1).
 - `canonicalize.py`, `requests_db.py`, `audit.py` same rule — local,
   deterministic, no outside I/O beyond the DB / audit file.
-- `resolver.py` is the **only** module permitted to spawn subprocesses
-  or touch the network, and even then only via the subprocess boundary
-  described in §9.2.
+- `resolver.py` spawns subprocesses per §9.2.
 - `executor.py` spawns subprocesses for capability-bound executors (§8).
-  No generic launcher.
+- `creds.py` spawns a single subprocess (`age --decrypt`) per §17
+  (Phase 2 age vault). Pure function boundary: inputs → plaintext
+  bytes → audit event. No other module imports `subprocess` —
+  `.importlinter`'s `subprocess-boundary` contract enforces this
+  automatically.
 
 ## HMAC serialisation
 
