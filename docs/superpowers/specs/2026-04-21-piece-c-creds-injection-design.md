@@ -21,15 +21,17 @@ Wire `broker/creds.py::unlock_creds()` into `broker/executor.py::_execute_subpro
 - Browser automation / Playwright plumbing. Out of scope indefinitely pending §14.1 review.
 - Keychain / KMS / cloud-secret-manager backends. `unlock_creds` stays file-based.
 
-## 3. Delivery mechanism: fd 3 pipe
+## 3. Delivery mechanism: inherited pipe fd (number via `DONNA_CREDS_FD`)
 
-### 3.1 Why fd 3, not env or stdin JSON
+> **Amended 2026-04-21** (Task 5 integration): the original design pinned the child-side fd to **fd 3** via a `preexec_fn` that ran `os.dup2(r_fd, 3)` in the forked child. In practice, Python's `subprocess` module has internal fd usage (its exec-error-reporting pipe, stdio remap ordering) that conflicted with `preexec_fn` + low-numbered `dup2` targets on macOS — the child's fd 3 was intermittently not our pipe's read end, producing `BrokenPipe` in the parent and `EBADF` in the child. Amendment: drop the `preexec_fn` remap. Keep the pipe and `pass_fds=(r_fd,)` unchanged, but tell the child its fd number via a `DONNA_CREDS_FD` env var. Security posture is unchanged — env carries only a small integer, never creds; pipe bytes remain inaccessible to any process without the inherited fd. The "env stays PATH-only" invariant is preserved *in spirit* (no secrets in env); implementation now reads: "env carries PATH plus, for creds-declared capabilities only, `DONNA_CREDS_FD=<n>`."
+
+### 3.1 Why a pipe (not env or stdin JSON)
 
 | Channel | Attack surface | Encoding cost | Notes |
 |---|---|---|---|
-| **fd 3 pipe (chosen)** | Pipe dies with `communicate()`; not introspectable via `ps`; not inherited by grandchildren. | None — raw bytes. | Invariant shift: `pass_fds=()` becomes `pass_fds=(r_fd,)` for creds-declared capabilities only. |
-| `env` (`DONNA_CREDS=<b64>`) | `ps -E` same-UID readable on macOS; inherited by default; auto-captured by error-reporting libraries. | base64 (env is NUL-terminated). | Breaks the `_sanitised_env()` PATH-only invariant. Rejected. |
-| `stdin_field` | Mixed channel with params JSON; slightly larger log surface than fd 3. | base64 (JSON can't carry raw bytes). | Second-best. Retained as a possible future enum value if a third-party binary forces it. |
+| **Inherited pipe fd (chosen)** | Pipe dies with `communicate()`; bytes not introspectable via `ps`; pipe not inherited by grandchildren. Fd *number* in env is not sensitive — the pipe's contents still require the inherited fd to read. | None — raw bytes. | Invariant shift: `pass_fds=()` becomes `pass_fds=(r_fd,)` for creds-declared capabilities only; env also gains `DONNA_CREDS_FD=<n>` on those capabilities. |
+| `env` with creds bytes (`DONNA_CREDS=<b64>`) | `ps -E` same-UID readable on macOS; inherited by default; auto-captured by error-reporting libraries. | base64 (env is NUL-terminated). | Puts the creds themselves in env. Rejected. |
+| `stdin_field` | Mixed channel with params JSON; slightly larger log surface than a pipe. | base64 (JSON can't carry raw bytes). | Third-best. Retained as a possible future enum value if a third-party binary forces it. |
 
 Full reviewer analysis of these trade-offs is captured in the living doc's decision log.
 
@@ -50,17 +52,20 @@ Full reviewer analysis of these trade-offs is captured in the living doc's decis
        proc = subprocess.Popen(
            [binary],
            stdin=PIPE, stdout=PIPE, stderr=PIPE,
-           env=_sanitised_env(),        # unchanged: PATH-only
-           cwd=<ephemeral workdir>,     # unchanged
+           env=_sanitised_env({"DONNA_CREDS_FD": str(r_fd)}),
+           cwd=<ephemeral workdir>,
            pass_fds=(r_fd,),            # invariant shift, creds-only
-           preexec_fn=_dup_rfd_to_fd3,  # remaps r_fd -> 3 in child
            close_fds=True,
        )
-   finally:
-       os.close(r_fd)   # parent no longer needs the read end
+   except BaseException:
+       close r_fd, w_fd, drop cred_bytes, _finalise_failure
 
 5. try:
-       os.write(w_fd, cred_bytes)
+       os.close(r_fd)   # parent no longer needs the read end
+       try:
+           os.write(w_fd, cred_bytes)
+       except BrokenPipeError:
+           pass   # §3.3 — delivery attempt only
    finally:
        os.close(w_fd)
        del cred_bytes   # intent signal; Python can't zero
@@ -68,18 +73,16 @@ Full reviewer analysis of these trade-offs is captured in the living doc's decis
 6. proc.communicate(...)   # existing path
 ```
 
-`_dup_rfd_to_fd3` is a two-call preexec helper: `os.dup2(r_fd, 3)` then `os.close(r_fd)` if `r_fd != 3`. No imports, no branching beyond that, no logging. Runs in the forked child before `exec`.
-
 ### 3.3 Capability subprocess contract
 
 A subprocess invoked under a `creds:`-declared capability:
 
-- **Must** read fd 3 to EOF, then close it.
-- **Must** treat missing or unreadable fd 3 as a fatal error (exit non-zero).
+- **Must** read `os.environ["DONNA_CREDS_FD"]` (as `int`), then read that fd to EOF, then close it.
+- **Must** treat missing `DONNA_CREDS_FD` or unreadable fd as a fatal error (exit non-zero).
 - Receives raw decrypted bytes: no framing, no JSON envelope, no newline. Interpretation is the executor's responsibility.
-- Is guaranteed that no other fd beyond stdin/stdout/stderr/3 is inherited.
+- Is guaranteed that no other fd beyond stdin/stdout/stderr and the one named by `DONNA_CREDS_FD` is inherited.
 
-The broker guarantees *delivery attempt* to fd 3. It does not guarantee the child consumed the bytes — exit status is authoritative. A child that exits 0 without reading fd 3 is a capability-author bug, not a broker bug.
+The broker guarantees *delivery attempt* to the pipe. It does not guarantee the child consumed the bytes — exit status is authoritative. A child that exits 0 without reading the creds fd is a capability-author bug, not a broker bug. `BrokenPipeError` on the parent's write (child exited before reading) is caught and discarded — the write has already failed, and the exit status will reflect whether the child cared.
 
 ### 3.4 Size cap
 

@@ -40,6 +40,21 @@ from typing import Any, Callable, Optional, Protocol
 DEFAULT_EXECUTOR_TIMEOUT_SECONDS = 120.0
 MAX_EXECUTOR_STDOUT_BYTES = 256 * 1024
 
+# §3.4 creds payload hard cap — fits within macOS default pipe buffer
+# so one os.write() never blocks. Larger creds indicate either a
+# format change or a bug.
+CREDS_MAX_BYTES = 16 * 1024
+# Env var name carrying the inherited pipe fd number for creds-declared
+# capabilities. Amended 2026-04-21: the original design pinned this to
+# fd 3 via preexec_fn dup2, but Python subprocess's internal error-pipe
+# and stdio-setup interactions with preexec_fn + pass_fds produced
+# timing-sensitive failures on macOS (child's fd 3 was occasionally
+# not our pipe read end). Passing the fd number via env keeps the
+# "binary-clean pipe, ps-invisible bytes" security posture while
+# avoiding the preexec_fn race. The env var carries a small integer,
+# never creds.
+CREDS_FD_ENV_VAR = "DONNA_CREDS_FD"
+
 
 # Type protocols so executor doesn't depend on concrete validator /
 # requests_db classes. Read-only @property form so frozen dataclasses
@@ -112,10 +127,19 @@ class CredsConfig:
 # ---- helpers ------------------------------------------------------------
 
 
-def _sanitised_env() -> dict[str, str]:
-    """PATH only. Capability-specific credentials are injected separately
-    in Phase 2+ via the age vault — not covered here."""
-    return {"PATH": "/usr/bin:/bin"}
+def _sanitised_env(extras: dict[str, str] | None = None) -> dict[str, str]:
+    """PATH-only baseline plus optional capability-bound extras.
+
+    Extras are narrowly scoped: today only `DONNA_CREDS_FD` when a
+    creds-declared capability is being dispatched (§3). The fd number
+    is not sensitive — the pipe contents are only accessible to the fd
+    holder, and the fd itself dies when the subprocess exits. Credentials
+    never enter env.
+    """
+    env = {"PATH": "/usr/bin:/bin"}
+    if extras:
+        env.update(extras)
+    return env
 
 
 def _emit(audit_writer: AuditWriter | None, event: dict[str, Any]) -> None:
@@ -126,41 +150,6 @@ def _emit(audit_writer: AuditWriter | None, event: dict[str, Any]) -> None:
     except Exception:
         # Never let audit failure block execution. Spec §10 applies.
         pass
-
-
-def _run_executor_subprocess(
-    binary: str,
-    stdin_payload: bytes,
-    timeout_seconds: float,
-) -> tuple[int, bytes, bytes]:
-    workdir = Path(tempfile.mkdtemp(
-        prefix=f"donna-exec-{uuid.uuid4().hex}-"
-    ))
-    try:
-        proc = subprocess.Popen(
-            [binary],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=_sanitised_env(),
-            cwd=str(workdir),
-            pass_fds=(),
-            close_fds=True,
-        )
-        try:
-            stdout, stderr = proc.communicate(
-                input=stdin_payload, timeout=timeout_seconds
-            )
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            try:
-                stdout, stderr = proc.communicate(timeout=1.0)
-            except Exception:
-                stdout, stderr = b"", b""
-            raise
-        return proc.returncode, stdout, stderr
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
 
 
 # ---- revalidation (§13.4) ------------------------------------------------
@@ -301,34 +290,171 @@ def _execute_subprocess(
         ensure_ascii=False,
     ).encode("utf-8")
 
+    # §3 creds wiring — only when capability opts in.
+    cred_bytes: bytes | None = None
+    r_fd: int | None = None
+    w_fd: int | None = None
+    pass_fds: tuple[int, ...] = ()
+    env_extras: dict[str, str] | None = None
+
+    if capability.creds is not None:
+        # execute() guards creds_config presence, but defence-in-depth:
+        assert creds_config is not None
+        from broker import creds as _creds
+        try:
+            cred_bytes = _creds.unlock_creds(
+                capability.creds.entry,
+                creds_dir=str(creds_config.creds_dir),
+                identity_path=str(creds_config.identity_path),
+                age_binary=creds_config.age_binary,
+                timeout_seconds=creds_config.timeout_seconds,
+                audit_writer=audit_writer,
+            )
+        except _creds.CredsError as ce:
+            return _finalise_failure(
+                state_conn, request, audit_writer,
+                ce.error_code, ce.message,
+            )
+
+        if len(cred_bytes) > CREDS_MAX_BYTES:
+            del cred_bytes
+            return _finalise_failure(
+                state_conn, request, audit_writer,
+                "creds_too_large",
+                f"creds exceed {CREDS_MAX_BYTES} bytes",
+            )
+
+        try:
+            r_fd, w_fd = os.pipe()
+            os.set_inheritable(r_fd, True)
+            os.set_inheritable(w_fd, False)
+        except OSError as oe:
+            if r_fd is not None:
+                os.close(r_fd)
+            if w_fd is not None:
+                os.close(w_fd)
+            del cred_bytes
+            return _finalise_failure(
+                state_conn, request, audit_writer,
+                "creds_pipe_error",
+                f"os.pipe failed: {type(oe).__name__}",
+            )
+
+        pass_fds = (r_fd,)
+        env_extras = {CREDS_FD_ENV_VAR: str(r_fd)}
+
+    # Spawn + communicate block. Ephemeral workdir per §9.2.
+    workdir = Path(tempfile.mkdtemp(prefix=f"donna-exec-{uuid.uuid4().hex}-"))
+    proc: subprocess.Popen | None = None  # type: ignore[type-arg]
     try:
-        exit_code, stdout, stderr = _run_executor_subprocess(
-            capability.executor_target, stdin_payload, timeout_seconds,
-        )
-    except subprocess.TimeoutExpired:
-        return _finalise_failure(
-            state_conn, request, audit_writer,
-            "executor_timeout",
-            f"timed out after {timeout_seconds}s",
-            extra={"timeout_seconds": timeout_seconds},
-        )
-    except FileNotFoundError:
-        return _finalise_failure(
-            state_conn, request, audit_writer,
-            "executor_missing",
-            f"binary {capability.executor_target!r} not found",
-        )
-    except Exception as e:
-        # §7.2 — detail carries type name only. str(e) is not included
-        # anywhere in the audit event: a future exception __str__ may
-        # include cred-adjacent data. exception_type is also surfaced in
-        # `extra` for audit-schema consistency with other failure paths.
-        return _finalise_failure(
-            state_conn, request, audit_writer,
-            "executor_spawn_error",
-            type(e).__name__,
-            extra={"exception_type": type(e).__name__},
-        )
+        try:
+            proc = subprocess.Popen(
+                [capability.executor_target],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_sanitised_env(env_extras),
+                cwd=str(workdir),
+                pass_fds=pass_fds,
+                close_fds=True,
+            )
+        except FileNotFoundError:
+            # Clean up pipe fds before returning.
+            if r_fd is not None:
+                try:
+                    os.close(r_fd)
+                except OSError:
+                    pass
+            if w_fd is not None:
+                try:
+                    os.close(w_fd)
+                except OSError:
+                    pass
+            if cred_bytes is not None:
+                del cred_bytes
+            return _finalise_failure(
+                state_conn, request, audit_writer,
+                "executor_missing",
+                f"binary {capability.executor_target!r} not found",
+            )
+        except Exception as e:
+            if r_fd is not None:
+                try:
+                    os.close(r_fd)
+                except OSError:
+                    pass
+            if w_fd is not None:
+                try:
+                    os.close(w_fd)
+                except OSError:
+                    pass
+            if cred_bytes is not None:
+                del cred_bytes
+            # §7.2 — type-only detail.
+            return _finalise_failure(
+                state_conn, request, audit_writer,
+                "executor_spawn_error",
+                type(e).__name__,
+                extra={"exception_type": type(e).__name__},
+            )
+
+        # Popen succeeded. Parent no longer needs read end.
+        if r_fd is not None:
+            os.close(r_fd)
+            r_fd = None
+
+        # Write creds and close write end, so child sees EOF.
+        # §3.3 — broker guarantees delivery attempt, not consumption.
+        # If the child exited before reading (EPIPE), that's their
+        # exit status to answer for; we don't treat the BrokenPipe as
+        # a broker failure here.
+        if cred_bytes is not None and w_fd is not None:
+            try:
+                try:
+                    os.write(w_fd, cred_bytes)
+                except BrokenPipeError:
+                    pass
+            finally:
+                os.close(w_fd)
+                w_fd = None
+                del cred_bytes
+                cred_bytes = None
+
+        try:
+            stdout, stderr = proc.communicate(
+                input=stdin_payload, timeout=timeout_seconds
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.communicate(timeout=1.0)
+            except Exception:
+                pass
+            return _finalise_failure(
+                state_conn, request, audit_writer,
+                "executor_timeout",
+                f"timed out after {timeout_seconds}s",
+                extra={"timeout_seconds": timeout_seconds},
+            )
+        exit_code = proc.returncode
+    finally:
+        # Defensive: if we reach here with any fds still open (shouldn't
+        # happen in the happy path but belt-and-braces for the control
+        # flow), close them.
+        if r_fd is not None:
+            try:
+                os.close(r_fd)
+            except OSError:
+                pass
+        if w_fd is not None:
+            try:
+                os.close(w_fd)
+            except OSError:
+                pass
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    # ---- From here down: existing logic (stderr audit, exit check,
+    # stdout parsing, terminal transition) unchanged from Task 4.
 
     if stderr:
         # §7.1 — stderr body is NEVER included in the audit event.
@@ -352,7 +478,6 @@ def _execute_subprocess(
             extra={"exit_code": exit_code},
         )
 
-    # Parse stdout as JSON result; truncate oversized payloads.
     if len(stdout) > MAX_EXECUTOR_STDOUT_BYTES:
         return _finalise_failure(
             state_conn, request, audit_writer,
@@ -378,7 +503,6 @@ def _execute_subprocess(
         )
     result: dict[str, Any] = parsed
 
-    # Success path.
     _transition_executing_to_succeeded(
         state_conn, request, result_json=json.dumps(result),
         executed_at=int(time.time() * 1000),

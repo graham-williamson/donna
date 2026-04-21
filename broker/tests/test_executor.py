@@ -6,6 +6,7 @@ Spec: security-v1.1 §8 (binding absolute), §13.4 (revalidation), §11
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
 from dataclasses import dataclass
@@ -660,3 +661,222 @@ def test_spawn_error_audit_carries_no_exception_message(conn, tmp_path, monkeypa
     assert "sensitive-looking-message-XYZ" not in serialised
     assert failed[0].get("detail") == "ExplodingError"
     assert failed[0].get("exception_type") == "ExplodingError"
+
+
+# ---- §3 fd-3 creds injection --------------------------------------------
+
+
+def _fake_creds_block(entry: str = "entry", delivery: str = "fd3"):
+    class _FakeCredsBlock:
+        def __init__(self, d: str, e: str) -> None:
+            self.delivery = d
+            self.entry = e
+    return _FakeCredsBlock(delivery, entry)
+
+
+def _creds_config(tmp_path):
+    return executor.CredsConfig(
+        creds_dir=tmp_path, identity_path=tmp_path / "identity.age"
+    )
+
+
+def test_creds_happy_path_child_reads_bytes_from_fd3(conn, tmp_path, monkeypatch):
+    r = _insert_approved(conn, "r-creds-ok", "capA")
+    # Child script reads fd 3 to EOF and prints the SHA-256 of those bytes.
+    body = (
+        "import os, sys, json, hashlib\n"
+        "fd = int(os.environ['DONNA_CREDS_FD'])\n"
+        "data = b''\n"
+        "while True:\n"
+        "    chunk = os.read(fd, 65536)\n"
+        "    if not chunk: break\n"
+        "    data += chunk\n"
+        "sys.stdout.write(json.dumps({'sha256': hashlib.sha256(data).hexdigest()}))\n"
+    )
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target=_write_exec_script(tmp_path, body),
+        revalidate={"not_applicable": "no_external_state"},
+        creds=_fake_creds_block(entry="token_entry"),
+    )
+    expected = b"token-payload-xyz"
+    monkeypatch.setattr(
+        "broker.creds.unlock_creds",
+        lambda *a, **kw: expected,
+    )
+    import hashlib
+    outcome = executor.execute(
+        cap, r, {}, conn, creds_config=_creds_config(tmp_path),
+    )
+    assert outcome.state == "succeeded", outcome.error_message
+    assert outcome.result["sha256"] == hashlib.sha256(expected).hexdigest()
+
+
+def test_creds_unlock_failure_blocks_spawn(conn, tmp_path, monkeypatch):
+    from broker import creds as creds_module
+    r = _insert_approved(conn, "r-creds-fail", "capA")
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target="/usr/bin/true",
+        revalidate={"not_applicable": "no_external_state"},
+        creds=_fake_creds_block(entry="missing_entry"),
+    )
+
+    def raiser(*a, **kw):
+        raise creds_module.CredsError("creds_missing", "no such entry")
+
+    monkeypatch.setattr("broker.creds.unlock_creds", raiser)
+
+    popen_calls: list = []
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        popen_calls.append((a, kw))
+        return orig_popen(*a, **kw)
+
+    monkeypatch.setattr(executor.subprocess, "Popen", spy)
+
+    outcome = executor.execute(
+        cap, r, {}, conn, creds_config=_creds_config(tmp_path),
+    )
+    assert outcome.state == "failed"
+    assert outcome.error_code == "creds_missing"
+    assert popen_calls == []
+
+
+def test_creds_oversize_fails_with_creds_too_large(conn, tmp_path, monkeypatch):
+    r = _insert_approved(conn, "r-creds-big", "capA")
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target="/usr/bin/true",
+        revalidate={"not_applicable": "no_external_state"},
+        creds=_fake_creds_block(entry="big_entry"),
+    )
+    monkeypatch.setattr(
+        "broker.creds.unlock_creds",
+        lambda *a, **kw: b"X" * (16 * 1024 + 1),
+    )
+
+    popen_calls: list = []
+    orig_popen = subprocess.Popen
+
+    def spy(*a, **kw):
+        popen_calls.append(None)
+        return orig_popen(*a, **kw)
+
+    monkeypatch.setattr(executor.subprocess, "Popen", spy)
+
+    outcome = executor.execute(
+        cap, r, {}, conn, creds_config=_creds_config(tmp_path),
+    )
+    assert outcome.state == "failed"
+    assert outcome.error_code == "creds_too_large"
+    assert popen_calls == []
+
+
+def test_spawn_failure_cleans_up_pipe(conn, tmp_path, monkeypatch):
+    """os.pipe() succeeds; Popen raises. Both fds must be closed."""
+    import errno
+    r = _insert_approved(conn, "r-creds-popenfail", "capA")
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target="/usr/bin/true",
+        revalidate={"not_applicable": "no_external_state"},
+        creds=_fake_creds_block(entry="entry"),
+    )
+    monkeypatch.setattr("broker.creds.unlock_creds",
+                        lambda *a, **kw: b"short")
+
+    opened_pipes: list[tuple[int, int]] = []
+    orig_pipe = os.pipe
+
+    def spy_pipe():
+        r_fd, w_fd = orig_pipe()
+        opened_pipes.append((r_fd, w_fd))
+        return r_fd, w_fd
+
+    monkeypatch.setattr(executor.os, "pipe", spy_pipe)
+
+    def blowup(*a, **kw):
+        raise OSError("simulated spawn failure")
+
+    monkeypatch.setattr(executor.subprocess, "Popen", blowup)
+
+    outcome = executor.execute(
+        cap, r, {}, conn, creds_config=_creds_config(tmp_path),
+    )
+    assert outcome.state == "failed"
+    assert outcome.error_code == "executor_spawn_error"
+    assert len(opened_pipes) == 1
+
+    # Both fds must be closed. os.fstat on a closed fd raises EBADF.
+    for fd in opened_pipes[0]:
+        with pytest.raises(OSError) as exc:
+            os.fstat(fd)
+        assert exc.value.errno == errno.EBADF
+
+
+def test_child_exits_without_reading_fd3_still_handled(conn, tmp_path, monkeypatch):
+    """Child exits 0 without consuming fd 3. Exit-status is
+    authoritative — row goes to succeeded. Broker does not hang on
+    the pipe write."""
+    r = _insert_approved(conn, "r-creds-noread", "capA")
+    body = 'import sys; sys.stdout.write("{}"); sys.exit(0)'
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target=_write_exec_script(tmp_path, body),
+        revalidate={"not_applicable": "no_external_state"},
+        creds=_fake_creds_block(entry="entry"),
+    )
+    monkeypatch.setattr("broker.creds.unlock_creds",
+                        lambda *a, **kw: b"never-read")
+    outcome = executor.execute(
+        cap, r, {}, conn, creds_config=_creds_config(tmp_path),
+    )
+    assert outcome.state == "succeeded"
+
+
+def test_fd_invariant_across_dispatches(conn, tmp_path, monkeypatch):
+    """pass_fds is () for creds-less capabilities and a single-fd tuple
+    for creds-declared. Never any other shape."""
+    popen_kwargs: list[dict] = []
+    orig_popen = subprocess.Popen
+
+    def capture(*a, **kw):
+        popen_kwargs.append(kw)
+        return orig_popen(*a, **kw)
+
+    monkeypatch.setattr(executor.subprocess, "Popen", capture)
+
+    # No-creds dispatch.
+    r1 = _insert_approved(conn, "r-inv-1", "capA")
+    cap1 = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target=_write_exec_script(tmp_path, 'import sys; sys.stdout.write("{}")'),
+        revalidate={"not_applicable": "no_external_state"}, creds=None,
+    )
+    executor.execute(cap1, r1, {}, conn)
+
+    # Creds dispatch. Child must read fd 3 to unblock the write — loop
+    # until EOF.
+    monkeypatch.setattr("broker.creds.unlock_creds", lambda *a, **kw: b"ok")
+    r2 = _insert_approved(conn, "r-inv-2", "capA")
+    body = (
+        "import os, sys\n"
+        "fd = int(os.environ['DONNA_CREDS_FD'])\n"
+        "while os.read(fd, 65536):\n"
+        "    pass\n"
+        'sys.stdout.write("{}")\n'
+    )
+    cap2 = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target=_write_exec_script(tmp_path, body),
+        revalidate={"not_applicable": "no_external_state"},
+        creds=_fake_creds_block(entry="entry"),
+    )
+    executor.execute(cap2, r2, {}, conn, creds_config=_creds_config(tmp_path))
+
+    pass_fds_seen = [kw.get("pass_fds", ()) for kw in popen_kwargs]
+    assert pass_fds_seen[0] == ()
+    assert len(pass_fds_seen[1]) == 1
+    assert isinstance(pass_fds_seen[1][0], int)

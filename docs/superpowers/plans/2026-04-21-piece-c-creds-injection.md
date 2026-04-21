@@ -1157,6 +1157,8 @@ git commit -m "broker: harden executor_stderr + executor_spawn_error audit shape
 
 ## Task 5: fd-3 integration in `_execute_subprocess`
 
+**Spec amendment note (landed during implementation):** the original plan used a `preexec_fn` to `os.dup2(r_fd, 3)` in the forked child so the child-side fd would be a known constant (`3`). In practice Python's `subprocess` module has internal fd usage that conflicts with `preexec_fn` + low-numbered `dup2` targets on macOS, producing `BrokenPipe` in the parent and `EBADF` in the child. Final shape: no `preexec_fn`; child reads from `int(os.environ["DONNA_CREDS_FD"])`. See spec §3 (amended) and the commit message for Task 5 for the full rationale. The code blocks below reference the old `fd 3` contract — read them for structure but use the env-var form for the actual child-side API.
+
 **Files:**
 - Modify: `broker/executor.py`
 - Modify: `broker/tests/test_executor.py`
