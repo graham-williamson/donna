@@ -205,9 +205,11 @@ Two fixes flagged during design review. They're not creds-delivery, but they're 
 
 ### 7.1 `executor_stderr` — no more verbatim bodies
 
+> **Amended 2026-04-21** (Task 4 review cycle): `stderr_head_redacted` dropped. The `sanitise_context_reason` helper (§15) is a redactor for URL / long-hex / long-digit / non-Latin patterns and raises `ContextReasonTooLong` on inputs > 200 chars. It does not strip arbitrary literal secrets like `"secret-token-ABC123"` — those pass through unchanged. Hash-only is the safer posture: two failures with identical stderr correlate by hash, and the audit log carries no exfil surface. If triage ever needs the body, a mode-0600 stash file is the right mechanism (still deferred).
+
 Today: up to 16 KiB of verbatim stderr is decoded and written into the hash-chained audit log. A buggy capability that prints a credential to stderr exfils it.
 
-New shape:
+New shape (as landed):
 
 ```python
 {
@@ -215,14 +217,12 @@ New shape:
     "request_id": request.request_id,
     "stderr_bytes": len(stderr),
     "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
-    "stderr_head_redacted": _redact_audit_text(stderr[:256].decode("utf-8", errors="replace")),
 }
 ```
 
 - `stderr_bytes`: length. Keeps the noise signal.
 - `stderr_sha256`: content-addressable. Two failures with identical stderr match up; attacker-chosen tokens do not.
-- `stderr_head_redacted`: first 256 bytes, run through the existing §15 sanitiser (strips URLs, long hex, long digits, non-Latin). Enough to eyeball failure class without carrying a payload.
-- **No raw stderr body anywhere in the audit event.**
+- **No raw stderr body, no head, no decoded content anywhere in the audit event.**
 
 Not in this PR: a mode-0600 stash file for post-hoc debugging. Deferred. If a real incident needs it, we'll add it then with retention policy considered.
 

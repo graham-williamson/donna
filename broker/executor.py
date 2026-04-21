@@ -39,8 +39,6 @@ from typing import Any, Callable, Optional, Protocol
 # §9.2-style sandbox reused here for subprocess executors.
 DEFAULT_EXECUTOR_TIMEOUT_SECONDS = 120.0
 MAX_EXECUTOR_STDOUT_BYTES = 256 * 1024
-MAX_EXECUTOR_STDERR_BYTES = 16 * 1024
-STDERR_TRUNCATION_MARKER = b"\n...[truncated]"
 
 
 # Type protocols so executor doesn't depend on concrete validator /
@@ -118,13 +116,6 @@ def _sanitised_env() -> dict[str, str]:
     """PATH only. Capability-specific credentials are injected separately
     in Phase 2+ via the age vault — not covered here."""
     return {"PATH": "/usr/bin:/bin"}
-
-
-def _truncate(buf: bytes, cap: int) -> bytes:
-    if len(buf) <= cap:
-        return buf
-    keep = cap - len(STDERR_TRUNCATION_MARKER)
-    return buf[:keep] + STDERR_TRUNCATION_MARKER
 
 
 def _emit(audit_writer: AuditWriter | None, event: dict[str, Any]) -> None:
@@ -328,19 +319,29 @@ def _execute_subprocess(
             f"binary {capability.executor_target!r} not found",
         )
     except Exception as e:
+        # §7.2 — detail carries type name only. str(e) is not included
+        # anywhere in the audit event: a future exception __str__ may
+        # include cred-adjacent data. exception_type is also surfaced in
+        # `extra` for audit-schema consistency with other failure paths.
         return _finalise_failure(
             state_conn, request, audit_writer,
             "executor_spawn_error",
-            f"{type(e).__name__}: {e}",
+            type(e).__name__,
+            extra={"exception_type": type(e).__name__},
         )
 
     if stderr:
-        truncated = _truncate(stderr, MAX_EXECUTOR_STDERR_BYTES)
+        # §7.1 — stderr body is NEVER included in the audit event.
+        # Any capability subprocess that accidentally prints a
+        # credential or other secret to stderr must not leak it into
+        # the hash-chained audit log. Length + SHA-256 only. Matching
+        # failures can be correlated by hash; actual stderr content
+        # is out of reach of Donna and deliberately so.
         _emit(audit_writer, {
             "event": "executor_stderr",
             "request_id": request.request_id,
             "stderr_bytes": len(stderr),
-            "stderr": truncated.decode("utf-8", errors="replace"),
+            "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
         })
 
     if exit_code != 0:

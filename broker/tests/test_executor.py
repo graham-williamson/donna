@@ -388,10 +388,23 @@ def test_subprocess_stderr_captured(conn, tmp_path):
     )
     events: list[dict[str, Any]] = []
     executor.execute(cap, r, {}, conn, audit_writer=events.append)
-    assert any(e["event"] == "executor_stderr" for e in events)
+    stderr_events = [e for e in events if e["event"] == "executor_stderr"]
+    assert len(stderr_events) == 1
+    ev = stderr_events[0]
+    assert ev["stderr_bytes"] == len("diagnostic info\n")
+    assert len(ev["stderr_sha256"]) == 64
+    # Closed key-set — proves by construction that no body-carrying
+    # field (regardless of name or encoding) can appear.
+    assert set(ev.keys()) == {"event", "request_id", "stderr_bytes",
+                              "stderr_sha256"}
+    # Defence in depth: the literal stderr content must not survive
+    # serialisation, even if a new field ever sneaks in.
+    assert "diagnostic info" not in json.dumps(ev)
 
 
-def test_subprocess_stderr_over_cap_truncated(conn, tmp_path):
+def test_subprocess_stderr_over_cap_recorded_by_length_and_hash(conn, tmp_path):
+    """Oversized stderr is acknowledged via length + full-body sha256
+    only. No head field, no verbatim body, no leak surface."""
     r = _insert_approved(conn, "r-st", "cap")
     script = _write_exec_script(
         tmp_path,
@@ -404,7 +417,15 @@ def test_subprocess_stderr_over_cap_truncated(conn, tmp_path):
     events: list[dict[str, Any]] = []
     executor.execute(cap, r, {}, conn, audit_writer=events.append)
     stderr_event = next(e for e in events if e["event"] == "executor_stderr")
-    assert "[truncated]" in stderr_event["stderr"]
+    assert stderr_event["stderr_bytes"] == 20 * 1024
+    assert len(stderr_event["stderr_sha256"]) == 64
+    # Closed key-set — proves by construction that no body-carrying
+    # field (regardless of name or encoding) can appear.
+    assert set(stderr_event.keys()) == {"event", "request_id",
+                                        "stderr_bytes", "stderr_sha256"}
+    # Defence in depth: a chunk of the oversized payload must not
+    # survive serialisation.
+    assert "XXXXXXXXXX" not in json.dumps(stderr_event)
 
 
 # ---- §9.2 env sanitisation ----------------------------------------------
@@ -572,3 +593,70 @@ def test_creds_config_threads_to_execute_subprocess(conn, tmp_path, monkeypatch)
     )
     executor.execute(cap, r, {}, conn, creds_config=cfg)
     assert captured["creds_config"] is cfg
+
+
+# ---- §7 audit hardening -------------------------------------------------
+
+
+def test_stderr_audit_carries_no_verbatim_body(conn, tmp_path):
+    """A capability that prints token-like data to stderr must not
+    leak it into the executor_stderr audit event. Only length + hash
+    are recorded. The original spec draft included a redacted head,
+    but the §15 sanitiser was designed for URL/hex/digit patterns,
+    not for arbitrary text that might contain literal secrets — so
+    any head-based approach carries exfil risk. Hash-only is the
+    correct posture; if triage ever needs the body, that's a
+    mode-0600 stash file, not an audit field."""
+    r = _insert_approved(conn, "r-stderrbody", "capA")
+    body = (
+        'import sys; sys.stderr.write("secret-token-ABC123\\n"); sys.exit(0)'
+    )
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target=_write_exec_script(tmp_path, body),
+        revalidate={"not_applicable": "no_external_state"},
+        creds=None,
+    )
+    events: list[dict] = []
+    executor.execute(cap, r, {}, conn, audit_writer=events.append)
+
+    stderr_events = [e for e in events if e.get("event") == "executor_stderr"]
+    assert len(stderr_events) == 1
+    ev = stderr_events[0]
+    serialised = json.dumps(ev)
+    assert "secret-token-ABC123" not in serialised
+    assert len(ev["stderr_sha256"]) == 64
+    # Closed key-set — proves by construction that no body-carrying
+    # field (under any name or encoding) can appear.
+    assert set(ev.keys()) == {"event", "request_id", "stderr_bytes",
+                              "stderr_sha256"}
+
+
+def test_spawn_error_audit_carries_no_exception_message(conn, tmp_path, monkeypatch):
+    r = _insert_approved(conn, "r-spawnerr", "capA")
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target="/usr/bin/true",
+        revalidate={"not_applicable": "no_external_state"},
+        creds=None,
+    )
+
+    class ExplodingError(Exception):
+        pass
+
+    def boom(*a, **kw):
+        raise ExplodingError("sensitive-looking-message-XYZ")
+
+    monkeypatch.setattr(executor.subprocess, "Popen", boom)
+
+    events: list[dict] = []
+    outcome = executor.execute(cap, r, {}, conn, audit_writer=events.append)
+    assert outcome.state == "failed"
+    assert outcome.error_code == "executor_spawn_error"
+
+    failed = [e for e in events if e.get("event") == "request_execution_failed"]
+    assert len(failed) == 1
+    serialised = json.dumps(failed[0])
+    assert "sensitive-looking-message-XYZ" not in serialised
+    assert failed[0].get("detail") == "ExplodingError"
+    assert failed[0].get("exception_type") == "ExplodingError"
