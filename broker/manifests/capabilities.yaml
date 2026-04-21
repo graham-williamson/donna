@@ -60,25 +60,44 @@ capabilities:
     approval_window_minutes: 720
     execution_window_minutes: 120
 
-  # ---- PureGym (Phase 2 — browser executor, currently schema-only) -----
-  #
-  # Subprocess executor stays here but binary path is a placeholder.
-  # When Phase 2 ships the age-encrypted credential flow and the
-  # PyInstaller-bundled executor, update `binary` below.
-
-  - name: puregym.book_class
+  - name: notion.update_page
     executor:
-      type: subprocess
-      binary: /Users/donna-broker/broker/executors/puregym_book
-      timeout_seconds: 120
+      type: mcp_tool
+      tool: mcp__plugin_Notion_notion__notion-update-page
     param_schema:
-      $ref: ./schemas/puregym_book.json
+      $ref: ./schemas/notion_update_page.json
     params_exact_match_required: true
     derived_fields_allowed: []
     risk_level: medium
     revalidate:
-      handler: puregym.check_class_bookable
-      arguments: [gym_id, class_id, date]
+      # Graham is the sole Notion editor in practice, so there is no
+      # concurrent-writer race to re-check against. If collaborative
+      # editing starts, upgrade this to a real revalidate handler.
+      not_applicable: stateless_write
+    idempotency_date_from: created_utc
+    approval_window_minutes: 720
+    execution_window_minutes: 120
+
+  # ---- Everyone Active (Phase 2 — browser executor, currently schema-only) -----
+  #
+  # Graham's gym is Everyone Active. Subprocess executor stays here but
+  # binary path is a placeholder. When Phase 2 ships the age-encrypted
+  # credential flow and the PyInstaller-bundled executor, update
+  # `binary` below.
+
+  - name: everyone_active.book_class
+    executor:
+      type: subprocess
+      binary: /Users/donna-broker/broker/executors/everyone_active_book
+      timeout_seconds: 120
+    param_schema:
+      $ref: ./schemas/everyone_active_book.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: medium
+    revalidate:
+      handler: everyone_active.check_class_bookable
+      arguments: [centre_id, class_id, date]
     idempotency_date_from: params.date
     approval_window_minutes: 120
     execution_window_minutes: 60

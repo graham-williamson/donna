@@ -1,0 +1,61 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "donna://schemas/notion_update_page.json",
+  "title": "notion.update_page params",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["page_id", "command"],
+  "properties": {
+    "page_id": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 64
+    },
+    "command": {
+      "enum": ["update_properties", "update_content", "replace_content", "apply_template"]
+    },
+    "properties": {
+      "type": "object",
+      "additionalProperties": {
+        "anyOf": [
+          {"type": "string"},
+          {"type": "number"},
+          {"type": "null"}
+        ]
+      }
+    },
+    "content_updates": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["old_str", "new_str"],
+        "properties": {
+          "old_str": {"type": "string", "maxLength": 10000},
+          "new_str": {"type": "string", "maxLength": 10000},
+          "replace_all_matches": {"type": "boolean"}
+        }
+      }
+    },
+    "new_str": {
+      "type": "string",
+      "maxLength": 100000
+    },
+    "template_id": {
+      "type": "string",
+      "maxLength": 64
+    },
+    "icon": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "cover": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "allow_deleting_content": {
+      "type": "boolean"
+    }
+  }
+}
