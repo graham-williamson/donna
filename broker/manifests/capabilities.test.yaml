@@ -1,0 +1,17 @@
+capabilities:
+  - name: synthetic.echo_creds
+    executor:
+      type: subprocess
+      binary: tools/synthetic_echo_creds
+      timeout_seconds: 10
+    param_schema:
+      $ref: ./schemas/synthetic_echo_creds.json
+    risk_level: medium
+    revalidate:
+      not_applicable: no_external_state
+    idempotency_date_from: created_at
+    approval_window_minutes: 5
+    execution_window_minutes: 5
+    creds:
+      delivery: fd3
+      entry: synthetic

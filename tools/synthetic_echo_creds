@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""Synthetic creds-consuming executor.
+
+Reads the pipe fd identified by DONNA_CREDS_FD to EOF, prints
+{"sha256": "<hex>"} to stdout, exits 0. Used by
+broker/tests/test_synthetic_e2e.py to prove the full real-age +
+real-pipe delivery path works end-to-end. Never invoked in
+production — lives under a test-only manifest.
+"""
+from __future__ import annotations
+import hashlib
+import json
+import os
+import sys
+
+
+def main() -> int:
+    fd_str = os.environ.get("DONNA_CREDS_FD")
+    if fd_str is None:
+        sys.stderr.write("DONNA_CREDS_FD env var not set\n")
+        return 2
+    try:
+        fd = int(fd_str)
+    except ValueError:
+        sys.stderr.write(f"DONNA_CREDS_FD not an int: {fd_str!r}\n")
+        return 2
+    buf = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        buf += chunk
+    sys.stdout.write(json.dumps({"sha256": hashlib.sha256(buf).hexdigest()}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
