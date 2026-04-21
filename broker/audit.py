@@ -26,6 +26,7 @@ audit-chain problem.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import os
@@ -179,6 +180,37 @@ def _first_entry_ts(segment: Path) -> Optional[int]:
     return None
 
 
+def _acquire_segment_lock(audit_dir: str) -> int:
+    """Open (creating if needed) the audit lock file and take an
+    exclusive fcntl lock. Returns the fd. Caller must `_release_segment_lock`
+    in a `finally` to release the lock and close the fd.
+
+    The lock serialises every operation that does read-modify-write on
+    the active segment — append (`write_event`) and seal (`rotate_if_needed`).
+    Without it, two writers can compute the same prev_hash from the same
+    tail and produce a broken chain.
+    """
+    lock_path = Path(audit_dir) / "audit.lock"
+    lock_fd = os.open(
+        str(lock_path),
+        os.O_WRONLY | os.O_CREAT,
+        0o600,
+    )
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    except Exception:
+        os.close(lock_fd)
+        raise
+    return lock_fd
+
+
+def _release_segment_lock(lock_fd: int) -> None:
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    finally:
+        os.close(lock_fd)
+
+
 def write_event(audit_dir: str, event: dict[str, Any]) -> str:
     """Append `event` to the active segment. Returns the sha256 hex of
     the canonical entry — callers store this in `requests.prev_audit_hash`
@@ -186,6 +218,9 @@ def write_event(audit_dir: str, event: dict[str, Any]) -> str:
 
     Raises AuditViolation for §15-forbidden fields, AuditIntegrityError
     for corruption at the append point.
+
+    Concurrency: held under the shared audit segment lock across the
+    full read-compute-write sequence. See `_acquire_segment_lock`.
     """
     if not isinstance(event, dict):
         raise AuditViolation("event must be a dict")
@@ -193,33 +228,45 @@ def write_event(audit_dir: str, event: dict[str, Any]) -> str:
 
     Path(audit_dir).mkdir(parents=True, exist_ok=True)
     segment = _segment_path(audit_dir)
-    prev_hash = _next_prev_hash(audit_dir)
 
-    # Caller may pre-set `ts` (useful for deterministic tests); otherwise
-    # we set it. `prev_hash` is always writer-owned.
-    entry: dict[str, Any] = dict(event)
-    entry.setdefault("ts", _now_ms())
-    entry["prev_hash"] = prev_hash
-
-    canonical = _canonical(entry)
-
-    # O_APPEND is the atomicity primitive. Mode 0600 when creating.
-    fd = os.open(
-        str(segment),
-        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
-        0o600,
-    )
+    lock_fd = _acquire_segment_lock(audit_dir)
     try:
-        os.write(fd, canonical + b"\n")
+        prev_hash = _next_prev_hash(audit_dir)
+
+        # Caller may pre-set `ts` (useful for deterministic tests);
+        # otherwise we set it. `prev_hash` is always writer-owned.
+        entry: dict[str, Any] = dict(event)
+        entry.setdefault("ts", _now_ms())
+        entry["prev_hash"] = prev_hash
+
+        canonical = _canonical(entry)
+
+        # O_APPEND is the atomicity primitive for the write itself.
+        # Mode 0600 when creating.
+        fd = os.open(
+            str(segment),
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+            0o600,
+        )
+        try:
+            os.write(fd, canonical + b"\n")
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        _release_segment_lock(lock_fd)
 
     return _sha256_hex(canonical)
 
 
 def rotate_if_needed(audit_dir: str) -> Optional[str]:
     """Seal and rotate the active segment if size > 100MB or age > 30
-    days. Returns the sealed segment path or None."""
+    days. Returns the sealed segment path or None.
+
+    Held under the shared audit segment lock — without it, a concurrent
+    `write_event` can append after we've computed the tail hash but
+    before we've written the seal entry, leaving the sealed segment
+    missing entries or leaving the seal pointing at a stale tail.
+    """
     segment = _segment_path(audit_dir)
     if not segment.exists():
         return None
@@ -234,34 +281,46 @@ def rotate_if_needed(audit_dir: str) -> Optional[str]:
     if size <= ROTATION_SIZE_BYTES and age_ms <= ROTATION_AGE_SECONDS * 1000:
         return None
 
-    # Seal entry: chain-anchored same as any other entry, plus a
-    # `segment_end_hash` field that mirrors prev_hash so the marker is
-    # self-describing when humans eyeball the tail of a sealed segment.
-    tail_hash = _last_entry_hash(segment)
-    seal_entry: dict[str, Any] = {
-        "event": SEGMENT_SEAL_EVENT,
-        "ts": now_ms,
-        "segment_end_hash": tail_hash,
-        "prev_hash": tail_hash,
-    }
-    seal_canonical = _canonical(seal_entry)
-
-    fd = os.open(str(segment), os.O_WRONLY | os.O_APPEND)
+    lock_fd = _acquire_segment_lock(audit_dir)
     try:
-        os.write(fd, seal_canonical + b"\n")
-    finally:
-        os.close(fd)
+        # Re-check under lock — another caller may have sealed while we
+        # were waiting. If the segment no longer exists (renamed) or is
+        # empty (freshly opened), bail.
+        if not segment.exists() or segment.stat().st_size == 0:
+            return None
 
-    # Rename to audit-YYYY-MM-DD-NNN.log.sealed, NNN monotonic per UTC day.
-    date_str = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
-    nnn = 1
-    while True:
-        sealed_path = Path(audit_dir) / f"audit-{date_str}-{nnn:03d}.log.sealed"
-        if not sealed_path.exists():
-            break
-        nnn += 1
-    segment.rename(sealed_path)
-    return str(sealed_path)
+        # Seal entry: chain-anchored same as any other entry, plus a
+        # `segment_end_hash` field that mirrors prev_hash so the marker
+        # is self-describing when humans eyeball the tail of a sealed
+        # segment.
+        tail_hash = _last_entry_hash(segment)
+        seal_entry: dict[str, Any] = {
+            "event": SEGMENT_SEAL_EVENT,
+            "ts": now_ms,
+            "segment_end_hash": tail_hash,
+            "prev_hash": tail_hash,
+        }
+        seal_canonical = _canonical(seal_entry)
+
+        fd = os.open(str(segment), os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(fd, seal_canonical + b"\n")
+        finally:
+            os.close(fd)
+
+        # Rename to audit-YYYY-MM-DD-NNN.log.sealed, NNN monotonic per
+        # UTC day.
+        date_str = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
+        nnn = 1
+        while True:
+            sealed_path = Path(audit_dir) / f"audit-{date_str}-{nnn:03d}.log.sealed"
+            if not sealed_path.exists():
+                break
+            nnn += 1
+        segment.rename(sealed_path)
+        return str(sealed_path)
+    finally:
+        _release_segment_lock(lock_fd)
 
 
 def verify_chain(audit_dir: str) -> Optional[dict[str, Any]]:

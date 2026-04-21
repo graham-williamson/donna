@@ -27,7 +27,7 @@ import time
 import traceback
 import uuid
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from broker import audit as audit_mod
 from broker import canonicalize
@@ -41,7 +41,7 @@ from broker import validator
 MODES = frozenset({
     "request", "policy-check", "execute", "cancel", "reconcile",
     "status", "status-by-code", "list-pending", "list-recent",
-    "audit-result", "rotate-hmac", "verify-audit",
+    "audit-result", "rotate-hmac", "verify-audit", "verify-manifests",
 })
 
 
@@ -202,7 +202,17 @@ def _derive_date_component(capability: validator.Capability, params: dict[str, A
 def _handle_policy_check(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     """Fast hook path (§9.1). No network, no subprocess, no broker state
     changes. For MCP tools, consults mcp-tools.yaml risk tier; for
-    capabilities, returns a summary the hook can show on a block."""
+    capabilities, returns a summary the hook can show on a block.
+
+    Executing-row bypass (§8 binding): if a matching row is already in
+    `executing` state for a capability whose `executor.type == mcp_tool`
+    and `executor.tool == tool_name`, and the canonical params hash
+    matches, the hook is allowed. This is the only path by which an
+    approved medium/high-risk MCP tool actually fires — without it the
+    broker accepts the `execute` call and transitions state but the
+    subsequent MCP tool call is still blocked at the PreToolUse hook,
+    stranding the draft.
+    """
     tool_name = payload.get("tool_name")
     if not isinstance(tool_name, str):
         raise BrokerError("invalid_input", "tool_name required")
@@ -224,20 +234,178 @@ def _handle_policy_check(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[s
                 "tool_name": tool_name,
                 "reason": f"{tool_name} blocked by §8.1 / §14.1",
             }
-        # medium / high fall through to block-with-summary pattern below.
+        # medium / high fall through to the executing-row bypass first,
+        # then the block-with-summary pattern below.
 
     params = payload.get("params") or {}
     if not isinstance(params, dict):
         raise BrokerError("invalid_input", "params must be an object")
 
+    # Executing-row bypass. Find the capability whose mcp_tool executor
+    # targets this tool_name. Since capability names are unique and the
+    # executor mapping is one-to-one for mcp_tool type, a single loop
+    # over capabilities is adequate and runs sub-ms at manifest sizes
+    # we care about (≪ 100 capabilities). Errors are swallowed to
+    # `None` so a malformed capability never fails the hot path —
+    # worst case we fall through to the normal block behaviour.
+    capabilities: dict[str, Any] = ctx.get("capabilities") or {}
+    matching_capability: Optional[str] = None
+    for cap_name, cap in capabilities.items():
+        if getattr(cap, "executor_type", None) != "mcp_tool":
+            continue
+        if getattr(cap, "executor_target", None) != tool_name:
+            continue
+        matching_capability = cap_name
+        break
+
+    if matching_capability is not None:
+        cap_schema = getattr(
+            capabilities[matching_capability], "param_schema", None
+        )
+        normalised = _normalise_hook_params(params, cap_schema)
+        try:
+            params_hash_val = canonicalize.params_hash(normalised)
+        except Exception:
+            params_hash_val = None
+        if params_hash_val is not None:
+            row = ctx["conn"].execute(
+                "SELECT request_id FROM requests "
+                "WHERE state = 'executing' "
+                "AND capability = ? "
+                "AND params_hash = ? "
+                "LIMIT 1",
+                (matching_capability, params_hash_val),
+            ).fetchone()
+            if row is not None:
+                return {
+                    "status": "ok",
+                    "decision": "allow",
+                    "tool_name": tool_name,
+                    "risk_level": mcp_tools.get(tool_name, "medium"),
+                    "reason": (
+                        f"executing row {row[0]} authorises this call"
+                    ),
+                    "request_id": row[0],
+                }
+
     summary = resolver.policy_check_mode(tool_name, params)
-    return {
+    response: dict[str, Any] = {
         "status": "ok",
         "decision": "block",
         "tool_name": tool_name,
         "reason": "medium/high-risk tool requires approval via broker request",
         "summary": summary,
     }
+
+    # Diagnostic: if an executing row for this capability exists but
+    # the params_hash didn't match, return the diff so Donna sees
+    # exactly which keys/values differ from the approved row. Without
+    # this the hook just says "requires approval" and the mismatch is
+    # invisible — she re-requests, re-approves, still blocks, loop.
+    if matching_capability is not None:
+        try:
+            diag_row = ctx["conn"].execute(
+                "SELECT request_id, params_json FROM requests "
+                "WHERE state = 'executing' AND capability = ? "
+                "ORDER BY created_at DESC LIMIT 1",
+                (matching_capability,),
+            ).fetchone()
+        except Exception:
+            diag_row = None
+        if diag_row is not None:
+            try:
+                approved_params = json.loads(diag_row[1])
+            except Exception:
+                approved_params = None
+            if isinstance(approved_params, dict):
+                cap_schema = getattr(
+                    capabilities[matching_capability], "param_schema", None
+                )
+                normalised_recv = _normalise_hook_params(params, cap_schema)
+                diff = _params_diff(approved_params, normalised_recv)
+                if diff:
+                    response["params_mismatch"] = {
+                        "request_id": diag_row[0],
+                        "diff": diff,
+                    }
+    return response
+
+
+def _normalise_hook_params(
+    params: dict[str, Any], cap_schema: Optional[dict[str, Any]]
+) -> dict[str, Any]:
+    """Un-stringify fields that the capability's JSON Schema declares as
+    `array` or `object` but which arrived as JSON-encoded strings.
+
+    Observed behaviour (Claude Code MCP hook envelope, 2.1.81): when a
+    tool-use argument is a structured value like `{"to": ["x@y"]}`, the
+    hook's `tool_input.to` is sometimes delivered as the *string*
+    `'["x@y"]'` rather than a native list. Because `params_hash` is an
+    exact canonical-JSON comparison, a stringified array will never
+    match an approved native-array row and the executing-row bypass
+    always misses.
+
+    The normalisation is narrow and schema-gated: only fields the
+    capability explicitly declares as `array` or `object` are
+    considered, and the parsed value must match that declared type.
+    Anything else is passed through untouched so we never silently
+    coerce an attacker-controlled string into something the capability
+    did not expect.
+    """
+    if not isinstance(cap_schema, dict):
+        return params
+    props = cap_schema.get("properties")
+    if not isinstance(props, dict):
+        return params
+    out: dict[str, Any] = {}
+    for key, value in params.items():
+        prop = props.get(key)
+        expected_type = (
+            prop.get("type") if isinstance(prop, dict) else None
+        )
+        if expected_type in {"array", "object"} and isinstance(value, str):
+            stripped = value.strip()
+            if (expected_type == "array" and stripped.startswith("[")) or (
+                expected_type == "object" and stripped.startswith("{")
+            ):
+                try:
+                    parsed = json.loads(stripped)
+                except Exception:
+                    parsed = None
+                if expected_type == "array" and isinstance(parsed, list):
+                    out[key] = parsed
+                    continue
+                if expected_type == "object" and isinstance(parsed, dict):
+                    out[key] = parsed
+                    continue
+        out[key] = value
+    return out
+
+
+def _params_diff(
+    approved: dict[str, Any], received: dict[str, Any]
+) -> dict[str, Any]:
+    """Shallow diff of the two param objects. Reports added, removed,
+    and changed keys without dumping full values of large strings."""
+    def summarise(v: Any) -> Any:
+        if isinstance(v, str) and len(v) > 80:
+            return f"{v[:77]!r}…(len={len(v)})"
+        if isinstance(v, list):
+            return f"list(len={len(v)}): {v[:3]}{'…' if len(v) > 3 else ''}"
+        return v
+
+    diff: dict[str, Any] = {}
+    for key in sorted(set(approved) | set(received)):
+        if key not in received:
+            diff[key] = {"removed": summarise(approved[key])}
+        elif key not in approved:
+            diff[key] = {"added": summarise(received[key])}
+        elif approved[key] != received[key]:
+            diff[key] = {
+                "approved": summarise(approved[key]),
+                "received": summarise(received[key]),
+            }
+    return diff
 
 
 def _handle_status(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
@@ -695,6 +863,34 @@ def _handle_verify_audit(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[s
     return {"status": "integrity_break", "verified": False, "break": result}
 
 
+def _handle_verify_manifests(
+    payload: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """Preflight-check capabilities.yaml + referenced JSON schemas +
+    mcp-tools.yaml. Intended for supervisor startup: runs before we
+    spawn Claude, so a missing schema fails loudly *before* Donna comes
+    up silently broken.
+
+    Spec: security-v1.1 §8 (manifest format), §8.1 (mcp-tools risk
+    tiers), §13.1 (broker modes).
+
+    Success returns a deterministic summary of what loaded, so the
+    supervisor (and ops tooling) can log exactly which capabilities
+    were picked up by this deploy. Failure is already surfaced by
+    _build_ctx raising BrokerError("manifest_error", ...) with the
+    precise line that broke — exit code 1.
+    """
+    capabilities: dict[str, validator.Capability] = ctx["capabilities"]
+    mcp_tools: dict[str, str] = ctx["mcp_tools"]
+    return {
+        "status": "ok",
+        "verified": True,
+        "capabilities_count": len(capabilities),
+        "capabilities": sorted(capabilities.keys()),
+        "mcp_tools_count": len(mcp_tools),
+    }
+
+
 MODE_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]] = {
     "policy-check": _handle_policy_check,
     "request": _handle_request,
@@ -706,6 +902,7 @@ MODE_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, An
     "audit-result": _handle_audit_result,
     "cancel": _handle_cancel,
     "verify-audit": _handle_verify_audit,
+    "verify-manifests": _handle_verify_manifests,
 }
 
 # Modes left as explicit not-implemented so the CLI doesn't silently
@@ -745,6 +942,7 @@ def _build_ctx(config: dict[str, str], need_manifests: bool) -> dict[str, Any]:
 
 MODES_NEEDING_MANIFESTS = frozenset({
     "request", "execute", "policy-check", "audit-result",
+    "verify-manifests",
 })
 
 

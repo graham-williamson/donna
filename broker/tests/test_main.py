@@ -588,3 +588,83 @@ def test_internal_error_structured_to_stdout(broker_env, monkeypatch):
     assert code == 2
     assert resp["status"] == "internal"
     assert resp["error_code"] == "internal_error"
+
+
+# ---- verify-manifests ---------------------------------------------------
+
+
+def test_verify_manifests_ok(broker_env):
+    """Happy path: both manifests parse, schema $ref resolves, returns
+    a summary the supervisor can log."""
+    code, resp = _run("verify-manifests", {}, broker_env)
+    assert code == 0, resp
+    assert resp["status"] == "ok"
+    assert resp["verified"] is True
+    assert resp["capabilities_count"] == 1
+    assert resp["capabilities"] == ["puregym.book_class"]
+    assert resp["mcp_tools_count"] == 3
+
+
+def test_verify_manifests_missing_schema_file(broker_env):
+    """A $ref pointing at a nonexistent schema file must fail exit 1
+    with manifest_error and a message naming the broken capability."""
+    schema_path = Path(broker_env["DONNA_BROKER_HOME"]) / "puregym_book.json"
+    schema_path.unlink()
+    code, resp = _run("verify-manifests", {}, broker_env)
+    assert code == 1
+    assert resp["error_code"] == "manifest_error"
+    assert "puregym.book_class" in resp["message"]
+    assert "does not exist" in resp["message"]
+
+
+def test_verify_manifests_unparseable_schema_file(broker_env):
+    """A $ref pointing at a file that isn't JSON must fail cleanly."""
+    schema_path = Path(broker_env["DONNA_BROKER_HOME"]) / "puregym_book.json"
+    schema_path.write_text("{ not valid json", encoding="utf-8")
+    code, resp = _run("verify-manifests", {}, broker_env)
+    assert code == 1
+    assert resp["error_code"] == "manifest_error"
+    assert "not valid JSON" in resp["message"]
+
+
+def test_verify_manifests_missing_capabilities_file(broker_env, tmp_path):
+    """Pointed at a nonexistent capabilities.yaml → manifest_error."""
+    env = dict(broker_env)
+    env["DONNA_BROKER_CAPABILITIES"] = str(tmp_path / "nope.yaml")
+    code, resp = _run("verify-manifests", {}, env)
+    assert code == 1
+    assert resp["error_code"] == "manifest_error"
+    assert "not found" in resp["message"]
+
+
+def test_verify_manifests_bad_mcp_tools_risk(broker_env):
+    """mcp-tools.yaml with an invalid risk level → manifest_error."""
+    mcp_path = Path(broker_env["DONNA_BROKER_MCP_TOOLS"])
+    mcp_path.write_text(
+        "tools:\n  mcp__whatever: not-a-real-risk\n", encoding="utf-8",
+    )
+    code, resp = _run("verify-manifests", {}, broker_env)
+    assert code == 1
+    assert resp["error_code"] == "manifest_error"
+
+
+def test_verify_manifests_unblocked_playwright_refused(broker_env):
+    """Playwright must be blocked (§14.1). A non-blocked entry fails."""
+    mcp_path = Path(broker_env["DONNA_BROKER_MCP_TOOLS"])
+    mcp_path.write_text(
+        "tools:\n  mcp__plugin_playwright_playwright__browser_navigate: low\n",
+        encoding="utf-8",
+    )
+    code, resp = _run("verify-manifests", {}, broker_env)
+    assert code == 1
+    assert resp["error_code"] == "manifest_error"
+    assert "Playwright" in resp["message"] or "playwright" in resp["message"]
+
+
+def test_verify_manifests_in_modes_frozen_set(broker_env):
+    """Regression guard: if MODES drops verify-manifests, the wrapper
+    and hook allowlists go out of sync silently. Keep this trivial
+    check so the CI suite alerts us first."""
+    assert "verify-manifests" in main.MODES
+    assert "verify-manifests" in main.MODE_HANDLERS
+    assert "verify-manifests" in main.MODES_NEEDING_MANIFESTS

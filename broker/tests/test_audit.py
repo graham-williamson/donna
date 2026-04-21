@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -517,3 +518,131 @@ def test_rotate_handles_segment_without_parseable_ts(monkeypatch, broker_home):
     seg.write_bytes(b'{"event":"no_ts_here","prev_hash":"' + b"0" * 64 + b'"}\n')
     monkeypatch.setattr(audit, "ROTATION_SIZE_BYTES", 10)
     assert audit.rotate_if_needed(audit_dir) is not None
+
+
+# ---- concurrency --------------------------------------------------------
+
+
+def test_parallel_writers_produce_intact_chain(broker_home):
+    """Regression guard for the shared audit.lock flock.
+
+    Eight threads each append 25 entries. Without the segment lock,
+    two writers could read the same tail hash, each compute the same
+    prev_hash, and append two rows chained from the same predecessor —
+    breaking the chain. With the lock in place, every write is
+    serialised through the `_acquire_segment_lock` fd and verify_chain
+    stays clean at the end.
+
+    Using threads (not multiprocessing) because the audit module opens
+    a fresh fd per lock acquisition, and BSD flock on macOS is a
+    per-open-file-description primitive — so distinct fds from the
+    same process contend correctly.
+    """
+    audit_dir = str(broker_home / "audit")
+    n_threads = 8
+    writes_per_thread = 25
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def worker(thread_index: int) -> None:
+        try:
+            for i in range(writes_per_thread):
+                audit.write_event(
+                    audit_dir,
+                    {
+                        "event": "parallel_write",
+                        "thread": thread_index,
+                        "seq": i,
+                    },
+                )
+        except BaseException as e:  # noqa: BLE001 — we re-raise below
+            with errors_lock:
+                errors.append(e)
+
+    threads = [
+        threading.Thread(target=worker, args=(tid,), daemon=True)
+        for tid in range(n_threads)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+        assert not t.is_alive(), "writer thread did not finish in time"
+
+    assert not errors, f"worker(s) raised: {errors!r}"
+
+    segment = Path(audit_dir) / audit.ACTIVE_SEGMENT_NAME
+    entries = _read_entries(segment)
+    assert len(entries) == n_threads * writes_per_thread, (
+        f"expected {n_threads * writes_per_thread} rows, got {len(entries)}"
+    )
+
+    # Chain integrity is the real contract. If any write raced, the
+    # prev_hash chain would break here.
+    assert audit.verify_chain(audit_dir) is None
+
+
+def test_parallel_write_and_rotate_stay_consistent(monkeypatch, broker_home):
+    """Mixed workload: writers keep appending while rotation fires.
+
+    Four writer threads + one rotator thread. The rotator trips the
+    size threshold every tick by monkeypatching ROTATION_SIZE_BYTES
+    to a tiny value. Because write_event and rotate_if_needed both
+    take the shared lock, we never see a seal entry written after a
+    writer has already appended a newer tail, and verify_chain is
+    clean across every sealed segment + the live one.
+    """
+    audit_dir = str(broker_home / "audit")
+
+    # Force rotation to be triggered by size on almost every call.
+    monkeypatch.setattr(audit, "ROTATION_SIZE_BYTES", 256)
+
+    stop = threading.Event()
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def writer(thread_index: int) -> None:
+        seq = 0
+        try:
+            while not stop.is_set():
+                audit.write_event(
+                    audit_dir,
+                    {
+                        "event": "mixed_write",
+                        "thread": thread_index,
+                        "seq": seq,
+                    },
+                )
+                seq += 1
+                if seq >= 30:
+                    return
+        except BaseException as e:  # noqa: BLE001
+            with errors_lock:
+                errors.append(e)
+
+    def rotator() -> None:
+        try:
+            for _ in range(60):
+                if stop.is_set():
+                    return
+                audit.rotate_if_needed(audit_dir)
+        except BaseException as e:  # noqa: BLE001
+            with errors_lock:
+                errors.append(e)
+
+    threads = [
+        threading.Thread(target=writer, args=(i,), daemon=True)
+        for i in range(4)
+    ]
+    threads.append(threading.Thread(target=rotator, daemon=True))
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+        assert not t.is_alive(), "thread stuck — possible deadlock"
+    stop.set()
+
+    assert not errors, f"worker(s) raised: {errors!r}"
+
+    # Chain must be intact across every sealed segment and the live one.
+    assert audit.verify_chain(audit_dir) is None

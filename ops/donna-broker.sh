@@ -28,7 +28,7 @@ shift
 VALID_MODES=(
   request policy-check execute cancel reconcile
   status status-by-code list-pending list-recent
-  audit-result rotate-hmac verify-audit
+  audit-result rotate-hmac verify-audit verify-manifests
 )
 FOUND=0
 for m in "${VALID_MODES[@]}"; do
@@ -49,16 +49,40 @@ cd /tmp
 # ---- sanitised env ----
 # Mirror §9.2 approach: PATH only, no inherited secrets. Config paths
 # are passed explicitly so the broker never reads unset defaults.
-exec env -i \
-  PATH="/usr/bin:/bin:/usr/local/bin" \
-  HOME="/Users/donna-broker" \
-  DONNA_BROKER_HOME="${BROKER_CONFIG_HOME}" \
-  DONNA_BROKER_DB="${BROKER_CONFIG_HOME}/requests.db" \
-  DONNA_BROKER_AUDIT_DIR="/Users/donna-broker/audit" \
-  DONNA_BROKER_HMAC_KEY="${BROKER_CONFIG_HOME}/hmac.key" \
-  DONNA_BROKER_CAPABILITIES="${BROKER_CONFIG_HOME}/capabilities.yaml" \
-  DONNA_BROKER_MCP_TOOLS="${BROKER_CONFIG_HOME}/mcp-tools.yaml" \
-  DONNA_BROKER_QUEUE_DIR="${BROKER_CONFIG_HOME}/approval-queue" \
-  DONNA_BROKER_RESPONSES_DIR="${BROKER_CONFIG_HOME}/approval-responses" \
-  PYTHONPATH="${BROKER_ROOT}/.." \
-  "${VENV_PYTHON}" -m broker.main "${MODE}" "$@"
+#
+# JSON payload routing (v1.1 §13.1): the broker contract reads JSON
+# from stdin. The §14.1 hook allowlist, however, expects the payload
+# as argv[5] so it can validate the JSON before permitting the shell
+# call. This wrapper bridges the two: if a payload is supplied as $1
+# (post-shift), pipe it into stdin via a here-string; otherwise leave
+# stdin wired to the caller for legacy `echo ... | donna-broker <mode>`
+# usage.
+if [[ $# -gt 0 ]]; then
+  exec env -i \
+    PATH="/usr/bin:/bin:/usr/local/bin" \
+    HOME="/Users/donna-broker" \
+    DONNA_BROKER_HOME="${BROKER_CONFIG_HOME}" \
+    DONNA_BROKER_DB="${BROKER_CONFIG_HOME}/requests.db" \
+    DONNA_BROKER_AUDIT_DIR="/Users/donna-broker/audit" \
+    DONNA_BROKER_HMAC_KEY="${BROKER_CONFIG_HOME}/hmac.key" \
+    DONNA_BROKER_CAPABILITIES="${BROKER_CONFIG_HOME}/capabilities.yaml" \
+    DONNA_BROKER_MCP_TOOLS="${BROKER_CONFIG_HOME}/mcp-tools.yaml" \
+    DONNA_BROKER_QUEUE_DIR="${BROKER_CONFIG_HOME}/approval-queue" \
+    DONNA_BROKER_RESPONSES_DIR="${BROKER_CONFIG_HOME}/approval-responses" \
+    PYTHONPATH="${BROKER_ROOT}/.." \
+    "${VENV_PYTHON}" -m broker.main "${MODE}" <<<"$1"
+else
+  exec env -i \
+    PATH="/usr/bin:/bin:/usr/local/bin" \
+    HOME="/Users/donna-broker" \
+    DONNA_BROKER_HOME="${BROKER_CONFIG_HOME}" \
+    DONNA_BROKER_DB="${BROKER_CONFIG_HOME}/requests.db" \
+    DONNA_BROKER_AUDIT_DIR="/Users/donna-broker/audit" \
+    DONNA_BROKER_HMAC_KEY="${BROKER_CONFIG_HOME}/hmac.key" \
+    DONNA_BROKER_CAPABILITIES="${BROKER_CONFIG_HOME}/capabilities.yaml" \
+    DONNA_BROKER_MCP_TOOLS="${BROKER_CONFIG_HOME}/mcp-tools.yaml" \
+    DONNA_BROKER_QUEUE_DIR="${BROKER_CONFIG_HOME}/approval-queue" \
+    DONNA_BROKER_RESPONSES_DIR="${BROKER_CONFIG_HOME}/approval-responses" \
+    PYTHONPATH="${BROKER_ROOT}/.." \
+    "${VENV_PYTHON}" -m broker.main "${MODE}"
+fi

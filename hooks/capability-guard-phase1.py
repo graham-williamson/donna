@@ -56,7 +56,7 @@ DONNA_ROOT_RE = re.compile(r"^/Users/grahamwilliamson/donna($|/)")
 BROKER_MODES = {
     "request", "policy-check", "execute", "cancel", "reconcile",
     "status", "status-by-code", "list-pending", "list-recent",
-    "audit-result", "rotate-hmac", "verify-audit",
+    "audit-result", "rotate-hmac", "verify-audit", "verify-manifests",
 }
 
 
@@ -124,6 +124,30 @@ def _check_bash_allowlist(t: list[str]) -> None:
         if ".." in path:
             deny(f"ls path {path!r} contains '..' (directory-escape reject)")
         allow("ls under donna root")
+
+    # Local cost tally — read-only aggregate over session JSONLs. Narrow
+    # argv whitelist: only the documented flags are accepted. Any extra
+    # token fails closed so injection via unexpected options doesn't work.
+    DONNA_COST_SCRIPT = "/Users/grahamwilliamson/donna/tools/donna-cost.py"
+    if len(t) >= 2 and t[0] == "python3" and t[1] == DONNA_COST_SCRIPT:
+        valid_since = {"today", "week", "month", "all"}
+        rest = t[2:]
+        i = 0
+        while i < len(rest):
+            tok = rest[i]
+            if tok == "--since":
+                if i + 1 >= len(rest) or rest[i + 1] not in valid_since:
+                    deny(
+                        f"donna-cost.py: --since requires one of "
+                        f"{sorted(valid_since)}"
+                    )
+                i += 2
+                continue
+            if tok == "--json":
+                i += 1
+                continue
+            deny(f"donna-cost.py: unexpected arg {tok!r}")
+        allow("donna-cost.py")
 
     if len(t) == 2 and t[0] == "git" and t[1] == "status":
         allow("git status")
@@ -213,7 +237,17 @@ def check_mcp(tool_name: str, tool_input: dict[str, Any]) -> None:
     if decision == "block":
         # Medium/high tools require a broker request flow. The hook
         # blocks the direct MCP call; Donna must call `donna-broker
-        # request` to start the approval flow.
+        # request` to start the approval flow. If the broker surfaced
+        # a `params_mismatch` diagnostic (an executing row exists for
+        # this capability but params don't canonically match), include
+        # it so Donna can fix the shape instead of re-requesting.
+        mismatch = response.get("params_mismatch")
+        if isinstance(mismatch, dict):
+            deny(
+                f"{tool_name} blocked: params don't match approved row "
+                f"{mismatch.get('request_id')} — diff: "
+                f"{json.dumps(mismatch.get('diff'), sort_keys=True)[:400]}"
+            )
         deny(
             f"{tool_name} requires approval; call "
             f"`donna-broker request` to start the approval flow"
