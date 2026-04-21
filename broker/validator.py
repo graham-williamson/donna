@@ -24,6 +24,7 @@ mcp-tools.yaml (§8.1):
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,8 @@ VALID_NOT_APPLICABLE_REASONS = frozenset({
     "idempotent_create",
     "no_external_state",
 })
+VALID_CREDS_DELIVERY = frozenset({"fd3"})
+CREDS_ENTRY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # Required top-level capability fields (§8 format).
 REQUIRED_CAPABILITY_FIELDS = (
@@ -66,6 +69,16 @@ class ParamValidationError(ManifestError):
 
 
 @dataclass(frozen=True)
+class CredsBlock:
+    """§4 creds-injection opt-in. Presence of a CredsBlock on a
+    Capability is the declaration that the capability requires
+    credentials at spawn time. See security-v1.1 §17 Phase 2 age vault
+    and Piece C design doc §3 for delivery semantics."""
+    delivery: str
+    entry: str
+
+
+@dataclass(frozen=True)
 class Capability:
     name: str
     executor_type: str
@@ -78,6 +91,7 @@ class Capability:
     idempotency_date_from: str
     approval_window_minutes: int
     execution_window_minutes: int
+    creds: CredsBlock | None = None
 
 
 # ---- capabilities.yaml --------------------------------------------------
@@ -89,6 +103,45 @@ def _require(mapping: dict[str, Any], key: str, capability_name: str) -> Any:
             f"capability {capability_name!r}: missing required field {key!r}"
         )
     return mapping[key]
+
+
+def _validate_creds(creds_raw: Any, capability_name: str) -> CredsBlock | None:
+    """§4.2 creds-block validation. Returns None if absent; raises
+    ManifestError on any structural issue."""
+    if creds_raw is None:
+        return None
+    if not isinstance(creds_raw, dict):
+        raise ManifestError(
+            f"capability {capability_name!r}: creds must be a mapping, "
+            f"got {type(creds_raw).__name__}"
+        )
+    if "delivery" not in creds_raw:
+        raise ManifestError(
+            f"capability {capability_name!r}: creds.delivery is required"
+        )
+    if "entry" not in creds_raw:
+        raise ManifestError(
+            f"capability {capability_name!r}: creds.entry is required"
+        )
+    delivery = creds_raw["delivery"]
+    if not isinstance(delivery, str) or delivery not in VALID_CREDS_DELIVERY:
+        raise ManifestError(
+            f"capability {capability_name!r}: creds.delivery must be one "
+            f"of {sorted(VALID_CREDS_DELIVERY)}, got {delivery!r}"
+        )
+    entry = creds_raw["entry"]
+    if not isinstance(entry, str) or not CREDS_ENTRY_RE.fullmatch(entry):
+        raise ManifestError(
+            f"capability {capability_name!r}: creds.entry must match "
+            f"{CREDS_ENTRY_RE.pattern!r}, got {entry!r}"
+        )
+    unknown = set(creds_raw.keys()) - {"delivery", "entry"}
+    if unknown:
+        raise ManifestError(
+            f"capability {capability_name!r}: unknown creds keys: "
+            f"{sorted(unknown)}"
+        )
+    return CredsBlock(delivery=delivery, entry=entry)
 
 
 def _validate_revalidate(reval: Any, capability_name: str, risk_level: str) -> None:
@@ -269,6 +322,16 @@ def _parse_one_capability(
             f"capability {name!r}: derived_fields_allowed entries must be strings"
         )
 
+    if "creds" in raw:
+        creds_raw = raw["creds"]
+        if creds_raw is None:
+            raise ManifestError(
+                f"capability {name!r}: creds key present but value is null"
+            )
+        creds_block = _validate_creds(creds_raw, name)
+    else:
+        creds_block = None
+
     return Capability(
         name=name,
         executor_type=exec_type,
@@ -281,6 +344,7 @@ def _parse_one_capability(
         idempotency_date_from=idempotency_date_from,
         approval_window_minutes=raw["approval_window_minutes"],
         execution_window_minutes=raw["execution_window_minutes"],
+        creds=creds_block,
     )
 
 

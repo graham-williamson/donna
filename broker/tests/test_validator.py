@@ -653,3 +653,92 @@ def test_validate_params_error_on_nested_path(manifest_dir):
     with pytest.raises(validator.ParamValidationError) as exc:
         validator.validate_params(cap, {"outer": {"inner": "not an int"}})
     assert "outer/inner" in str(exc.value)
+
+
+# ---- §4.2 creds block validation ----------------------------------------
+
+
+def _good_subprocess_capability_yaml(extra: str = "") -> str:
+    """Helper to generate a good subprocess capability YAML with optional
+    extra fields appended to the capability entry."""
+    return f"""capabilities:
+  - name: gmail.create_draft
+    executor:
+      type: subprocess
+      binary: /usr/local/bin/donna-exec-gmail
+      timeout_seconds: 30
+    param_schema:
+      type: object
+    risk_level: medium
+    idempotency_date_from: created_at
+    approval_window_minutes: 15
+    execution_window_minutes: 5
+    revalidate:
+      not_applicable: stateless_write{extra}
+"""
+
+
+def _write_caps(manifest_dir: Path, capability_yaml: str) -> str:
+    """Write a capability YAML to the manifest directory and return its path."""
+    manifest = manifest_dir / "capabilities.yaml"
+    manifest.write_text(capability_yaml, encoding="utf-8")
+    return str(manifest)
+
+
+def test_capability_without_creds_block_parses_with_none(manifest_dir):
+    caps_path = _write_caps(manifest_dir, _good_subprocess_capability_yaml())
+    caps = validator.load_capabilities(caps_path)
+    cap = next(iter(caps.values()))
+    assert cap.creds is None
+
+
+def test_capability_with_valid_creds_block_parses(manifest_dir):
+    caps_path = _write_caps(manifest_dir, _good_subprocess_capability_yaml(
+        extra="\n    creds:\n      delivery: fd3\n      entry: everyone_active"
+    ))
+    caps = validator.load_capabilities(caps_path)
+    cap = next(iter(caps.values()))
+    assert cap.creds is not None
+    assert cap.creds.delivery == "fd3"
+    assert cap.creds.entry == "everyone_active"
+
+
+def test_creds_missing_entry_raises(manifest_dir):
+    caps_path = _write_caps(manifest_dir, _good_subprocess_capability_yaml(
+        extra="\n    creds:\n      delivery: fd3"
+    ))
+    with pytest.raises(validator.ManifestError, match="entry"):
+        validator.load_capabilities(caps_path)
+
+
+def test_creds_invalid_delivery_enum_raises(manifest_dir):
+    caps_path = _write_caps(manifest_dir, _good_subprocess_capability_yaml(
+        extra="\n    creds:\n      delivery: smoke_signals\n      entry: foo"
+    ))
+    with pytest.raises(validator.ManifestError, match="delivery"):
+        validator.load_capabilities(caps_path)
+
+
+def test_creds_invalid_entry_pattern_raises(manifest_dir):
+    caps_path = _write_caps(manifest_dir, _good_subprocess_capability_yaml(
+        extra='\n    creds:\n      delivery: fd3\n      entry: "Has Spaces"'
+    ))
+    with pytest.raises(validator.ManifestError, match="entry"):
+        validator.load_capabilities(caps_path)
+
+
+def test_creds_string_instead_of_dict_raises(manifest_dir):
+    caps_path = _write_caps(manifest_dir, _good_subprocess_capability_yaml(
+        extra='\n    creds: "yes"'
+    ))
+    with pytest.raises(validator.ManifestError, match="creds"):
+        validator.load_capabilities(caps_path)
+
+
+def test_creds_null_or_list_raises(manifest_dir):
+    for bad in ("    creds: null", "    creds: []"):
+        caps_path = _write_caps(manifest_dir, _good_subprocess_capability_yaml(
+            extra=f"\n{bad}"
+        ))
+        with pytest.raises(validator.ManifestError, match="creds"):
+            validator.load_capabilities(caps_path)
