@@ -27,6 +27,7 @@ class FakeCapability:
     executor_type: str
     executor_target: str
     revalidate: dict[str, Any]
+    creds: Any = None
 
 
 @pytest.fixture
@@ -87,6 +88,8 @@ def test_module_importable():
         "ExecutionError",
         "ExecutionOutcome",
         "DEFAULT_EXECUTOR_TIMEOUT_SECONDS",
+        "CredsConfig",
+        "CredsBlockLike",
     ):
         assert hasattr(executor, name)
 
@@ -487,3 +490,85 @@ def test_audit_writer_exception_non_blocking(conn, tmp_path):
         cap, r, {}, conn, audit_writer=raising_writer,
     )
     assert outcome.state == "succeeded"
+
+
+# ---- §5 CredsConfig threading -------------------------------------------
+
+
+def test_execute_no_creds_config_accepted_for_capability_without_creds(conn, tmp_path):
+    """Baseline: a capability without creds runs fine without creds_config."""
+    r = _insert_approved(conn, "r-nocreds", "capA")
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target=_write_exec_script(tmp_path, 'import sys; sys.stdout.write("{}")'),
+        revalidate={"not_applicable": "no_external_state"},
+        creds=None,
+    )
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.state == "succeeded"
+
+
+def test_execute_missing_creds_config_fails_closed(conn, tmp_path):
+    """Capability declares creds:, but execute() was called without
+    creds_config. Row transitions to failed with creds_config_missing."""
+
+    class _FakeCredsBlock:
+        def __init__(self, delivery: str, entry: str) -> None:
+            self.delivery = delivery
+            self.entry = entry
+
+    r = _insert_approved(conn, "r-cfgmissing", "capB")
+    cap = FakeCapability(
+        name="capB", executor_type="subprocess",
+        executor_target="/usr/bin/true",
+        revalidate={"not_applicable": "no_external_state"},
+        creds=_FakeCredsBlock("fd3", "foo"),
+    )
+    outcome = executor.execute(cap, r, {}, conn, creds_config=None)
+    assert outcome.state == "failed"
+    assert outcome.error_code == "creds_config_missing"
+
+
+def test_credsconfig_is_frozen_dataclass(tmp_path):
+    cfg = executor.CredsConfig(
+        creds_dir=tmp_path,
+        identity_path=tmp_path / "identity.age",
+    )
+    assert cfg.age_binary == "age"
+    assert cfg.timeout_seconds == 10.0
+    with pytest.raises(Exception):  # dataclasses.FrozenInstanceError
+        cfg.age_binary = "something_else"  # type: ignore[misc]
+
+
+def test_creds_config_threads_to_execute_subprocess(conn, tmp_path, monkeypatch):
+    """Forward-guard: when a creds-declaring capability is dispatched
+    with a CredsConfig, the same config object must reach
+    _execute_subprocess. Task 5 wires in the real use; this test keeps
+    the threading honest in the interim."""
+
+    class _FakeCredsBlock:
+        def __init__(self, delivery: str, entry: str) -> None:
+            self.delivery = delivery
+            self.entry = entry
+
+    captured: dict[str, Any] = {}
+
+    def _spy(capability, request, params, state_conn, audit_writer,
+             timeout_seconds, creds_config):
+        captured["creds_config"] = creds_config
+        return executor.ExecutionOutcome(state="succeeded", result={})
+
+    monkeypatch.setattr(executor, "_execute_subprocess", _spy)
+
+    r = _insert_approved(conn, "r-thread", "capA")
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target="/usr/bin/true",
+        revalidate={"not_applicable": "no_external_state"},
+        creds=_FakeCredsBlock("fd3", "entry"),
+    )
+    cfg = executor.CredsConfig(
+        creds_dir=tmp_path, identity_path=tmp_path / "identity.age",
+    )
+    executor.execute(cap, r, {}, conn, creds_config=cfg)
+    assert captured["creds_config"] is cfg

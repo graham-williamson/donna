@@ -23,7 +23,9 @@ Contract:
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -44,6 +46,13 @@ STDERR_TRUNCATION_MARKER = b"\n...[truncated]"
 # Type protocols so executor doesn't depend on concrete validator /
 # requests_db classes. Read-only @property form so frozen dataclasses
 # (like requests_db.Request) satisfy the protocol.
+class CredsBlockLike(Protocol):
+    @property
+    def delivery(self) -> str: ...
+    @property
+    def entry(self) -> str: ...
+
+
 class CapabilityLike(Protocol):
     @property
     def name(self) -> str: ...
@@ -53,6 +62,8 @@ class CapabilityLike(Protocol):
     def executor_target(self) -> str: ...
     @property
     def revalidate(self) -> dict[str, Any]: ...
+    @property
+    def creds(self) -> CredsBlockLike | None: ...
 
 
 class RequestLike(Protocol):
@@ -86,6 +97,18 @@ class ExecutionOutcome:
     result: dict[str, Any] | None = None
     error_code: str | None = None
     error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class CredsConfig:
+    """§5 creds injection runtime config. Constructed by main.py from
+    broker constants; passed to execute() for every dispatch that may
+    touch a creds-declared capability. Never wired as module-global
+    state."""
+    creds_dir: Path
+    identity_path: Path
+    age_binary: str = "age"
+    timeout_seconds: float = 10.0
 
 
 # ---- helpers ------------------------------------------------------------
@@ -194,6 +217,7 @@ def execute(
     audit_writer: AuditWriter | None = None,
     revalidate_handlers: Optional[dict[str, Revalidator]] = None,
     subprocess_timeout_seconds: float = DEFAULT_EXECUTOR_TIMEOUT_SECONDS,
+    creds_config: CredsConfig | None = None,
 ) -> ExecutionOutcome:
     """Run a capability against an approved row.
 
@@ -243,11 +267,21 @@ def execute(
             state_conn, request, audit_writer, e.error_code, e.message,
         )
 
+    # §5.2 fail-closed guard: capability declares creds but no config
+    # was threaded into execute(). No unlock attempt, no spawn.
+    if capability.creds is not None and creds_config is None:
+        return _finalise_failure(
+            state_conn, request, audit_writer,
+            "creds_config_missing",
+            f"capability {capability.name!r} declares creds but "
+            f"execute() was called without creds_config",
+        )
+
     # 4. Dispatch by executor type. No fuzzy matching.
     if capability.executor_type == "subprocess":
         return _execute_subprocess(
             capability, request, params, state_conn, audit_writer,
-            subprocess_timeout_seconds,
+            subprocess_timeout_seconds, creds_config,
         )
     if capability.executor_type == "mcp_tool":
         return _execute_mcp_tool(
@@ -269,6 +303,7 @@ def _execute_subprocess(
     state_conn: Any,
     audit_writer: AuditWriter | None,
     timeout_seconds: float,
+    creds_config: CredsConfig | None,
 ) -> ExecutionOutcome:
     stdin_payload = json.dumps(
         {"capability": capability.name, "params": params},
