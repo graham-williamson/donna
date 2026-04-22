@@ -1,0 +1,6 @@
+# Runtime deps for donna-recon.
+# Compile with:
+#   pip-compile --generate-hashes --output-file=requirements.txt requirements.in
+
+playwright>=1.49,<2.0
+beautifulsoup4>=4.12,<5.0

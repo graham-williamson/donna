@@ -1,0 +1,40 @@
+[project]
+name = "donna-recon"
+version = "0.1.0"
+description = "Browser-recon recorder for spec'ing Donna capability executors from live sites"
+requires-python = ">=3.12"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+    "--tb=short",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+warn_unused_ignores = true
+explicit_package_bases = true
+namespace_packages = true
+
+# Tests may introspect dynamically; relax strict defs only there.
+[[tool.mypy.overrides]]
+module = "tests.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+
+# Playwright ships partial type stubs; bs4 doesn't ship any. Ignore at the
+# module boundary rather than pulling types-beautifulsoup4 into the lock.
+[[tool.mypy.overrides]]
+module = ["playwright", "playwright.*", "bs4", "bs4.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["pytest", "pytest.*", "_pytest.*"]
+ignore_missing_imports = true
