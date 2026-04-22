@@ -59,6 +59,23 @@ BROKER_MODES = {
     "audit-result", "rotate-hmac", "verify-audit", "verify-manifests",
 }
 
+# Structural fast-path for broker invocations. Bash treats every
+# character inside a single-quoted run as literal, so a payload like
+# '{"body":"<p>hi</p>"}' is safe even though `<` is in SHELL_METACHARS.
+# The anchored regex pins the command to exactly:
+#     sudo -u donna-broker <BROKER_BIN> <mode> '<json>'
+# with [^']* for the JSON slot. Anything outside the quotes is pinned
+# to literal characters by the regex — shell-substitution patterns
+# ($(...), backticks, redirects, `;cmd`, `&& cmd`) cannot be smuggled
+# because they would require characters the regex does not accept in
+# those positions. This runs BEFORE the raw-string metachar scan so
+# legitimate broker calls carrying angle brackets / `$` / etc. in
+# JSON string values are not false-positive-rejected.
+BROKER_CMD_RE = re.compile(
+    r"^sudo -u donna-broker " + re.escape(BROKER_BIN)
+    + r" (?P<mode>[a-z-]+) '(?P<json>[^']*)'$"
+)
+
 
 def emit(decision: str, reason: str) -> None:
     sys.stdout.write(json.dumps({
@@ -85,6 +102,22 @@ def allow(reason: str = "allowed") -> None:
 def check_bash(command: str) -> None:
     if not isinstance(command, str):
         deny("Bash tool_input.command missing or not a string")
+
+    # Structural fast-path for broker invocations — see BROKER_CMD_RE
+    # docstring. Validates mode + JSON and short-circuits before the
+    # raw-string metachar scan, which would otherwise false-positive
+    # on `<`, `>`, `$` etc. appearing inside JSON string values.
+    m = BROKER_CMD_RE.match(command)
+    if m:
+        mode = m.group("mode")
+        if mode not in BROKER_MODES:
+            deny(f"broker mode {mode!r} not in §13.1 allowlist")
+        try:
+            json.loads(m.group("json"))
+        except Exception as e:
+            deny(f"broker payload is not valid JSON: {e}")
+        allow("sudo donna-broker")
+
     for ch in command:
         if ch in SHELL_METACHARS:
             deny(f"Bash shell metacharacter rejected: {ch!r}")
@@ -100,22 +133,12 @@ def check_bash(command: str) -> None:
 
 
 def _check_bash_allowlist(t: list[str]) -> None:
+    # Broker invocations are handled by the BROKER_CMD_RE fast-path in
+    # check_bash(); they never reach this allowlist. The structural
+    # regex is the single source of truth for what counts as a valid
+    # broker call.
     if t and t[0] == "git":
         _check_banned_git(t)
-
-    if (
-        len(t) == 6
-        and t[0] == "sudo" and t[1] == "-u" and t[2] == "donna-broker"
-        and t[3] == BROKER_BIN
-    ):
-        mode = t[4]
-        if mode not in BROKER_MODES:
-            deny(f"broker mode {mode!r} not in §13.1 allowlist")
-        try:
-            json.loads(t[5])
-        except Exception as e:
-            deny(f"broker payload is not valid JSON: {e}")
-        allow("sudo donna-broker")
 
     if len(t) == 2 and t[0] == "ls":
         path = t[1]
