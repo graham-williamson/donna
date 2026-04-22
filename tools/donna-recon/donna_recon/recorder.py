@@ -84,8 +84,21 @@ class Recorder:
 
             for page in self._context.pages:
                 await self._attach_page(page)
-                # The indicator couldn't be injected pre-load for this page,
-                # but we can still capture what's currently rendered.
+                # `add_init_script` only applies to subsequent navigations
+                # (new documents loaded after the call). Pages that were
+                # already open when we attached — typically the one
+                # Chromium was launched with via --url — wouldn't get the
+                # indicator + F9 handler otherwise. Evaluate the script
+                # directly here; its own idempotency guard
+                # (`__donnaReconAttached`) prevents double-registration if
+                # it also fires on a later navigation.
+                try:
+                    await page.evaluate(_load_indicator_js())
+                except Exception as e:
+                    log.warning(
+                        "initial indicator injection failed for %s: %s",
+                        page.url, e,
+                    )
                 if page.url and page.url not in ("about:blank", ""):
                     await self._safe_capture(page, label=None)
 
