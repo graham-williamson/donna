@@ -8,6 +8,8 @@ from __future__ import annotations
 import io
 import json
 import os
+import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -790,3 +792,238 @@ def test_verify_vault_in_modes_frozen_set():
     assert "verify-vault" in main.MODES
     assert "verify-vault" in main.MODE_HANDLERS
     assert "verify-vault" in main.MODES_NEEDING_MANIFESTS
+
+
+# ---- lazy reconcile + in-flight visibility + idempotent execute --------
+#
+# These cover the four compounding broker bugs observed in prod 2026-04-22:
+#   - No sweep → rows stranded in non-terminal states forever.
+#   - get_by_approval_code + list-pending excluded 'executing' →
+#     stranded rows invisible.
+#   - cancel refused 'executing' → no manual rescue.
+# Fix is six changes: lazy sweep, broaden two queries, idempotent execute
+# from executing, allow cancel from executing (adds one transition pair).
+
+
+def _force_state(
+    db_path: str, request_id: str, state: str, **fields: Any
+) -> None:
+    """Bypass triggers to force a row into an arbitrary state+field combo.
+    Test-only helper — production code goes through db.transition()."""
+    conn = sqlite3.connect(db_path)
+    for f in ("approval_expires_at", "execution_expires_at", "approved_at"):
+        conn.execute(f"DROP TRIGGER IF EXISTS trg_immutable_{f}")
+        conn.execute(f"DROP TRIGGER IF EXISTS trg_set_once_{f}")
+    assignments = ["state = ?"] + [f"{k} = ?" for k in fields]
+    params = [state] + list(fields.values()) + [request_id]
+    conn.execute(
+        f"UPDATE requests SET {', '.join(assignments)} WHERE request_id = ?",
+        params,
+    )
+    conn.commit()
+    conn.close()
+
+
+def _make_pending(env: dict[str, str], date: str = "2026-04-21") -> dict[str, Any]:
+    _, resp = _run(
+        "request",
+        {
+            "capability": "puregym.book_class",
+            "params": {"class_id": "hiit", "date": date},
+        },
+        env,
+    )
+    return resp
+
+
+def test_lazy_reconcile_expires_pending_approval(broker_env):
+    req = _make_pending(broker_env)
+    past = int(time.time() * 1000) - 60_000
+    _force_state(
+        broker_env["DONNA_BROKER_DB"], req["request_id"],
+        "pending_approval", approval_expires_at=past,
+    )
+    # Any CLI call triggers the sweep.
+    _, st = _run("status", {"request_id": req["request_id"]}, broker_env)
+    assert st["state"] == "expired"
+
+
+def test_lazy_reconcile_expires_approved_past_exec_window(broker_env):
+    req = _make_pending(broker_env)
+    past = int(time.time() * 1000) - 60_000
+    _force_state(
+        broker_env["DONNA_BROKER_DB"], req["request_id"],
+        "approved",
+        approved_at=past,
+        execution_expires_at=past,
+    )
+    _, st = _run("status", {"request_id": req["request_id"]}, broker_env)
+    assert st["state"] == "expired"
+
+
+def test_lazy_reconcile_fails_executing_past_exec_window(broker_env):
+    req = _make_pending(broker_env)
+    past = int(time.time() * 1000) - 60_000
+    _force_state(
+        broker_env["DONNA_BROKER_DB"], req["request_id"],
+        "executing",
+        approved_at=past,
+        execution_expires_at=past,
+    )
+    _, st = _run("status", {"request_id": req["request_id"]}, broker_env)
+    assert st["state"] == "failed"
+    assert st["error_code"] == "exec_window_expired"
+
+
+def test_lazy_reconcile_emits_audit_events(broker_env):
+    req = _make_pending(broker_env)
+    past = int(time.time() * 1000) - 60_000
+    _force_state(
+        broker_env["DONNA_BROKER_DB"], req["request_id"],
+        "pending_approval", approval_expires_at=past,
+    )
+    _run("status", {"request_id": req["request_id"]}, broker_env)
+    log = Path(broker_env["DONNA_BROKER_AUDIT_DIR"]) / "audit.log"
+    assert "request_expired" in log.read_text(encoding="utf-8")
+
+
+def test_lazy_reconcile_leaves_unexpired_rows_alone(broker_env):
+    req = _make_pending(broker_env)
+    # Default approval window is 60min; row is well within window.
+    _, st = _run("status", {"request_id": req["request_id"]}, broker_env)
+    assert st["state"] == "pending_approval"
+
+
+def test_status_by_code_finds_executing_row(broker_env):
+    req = _make_pending(broker_env)
+    future = int(time.time() * 1000) + 60 * 60 * 1000
+    _force_state(
+        broker_env["DONNA_BROKER_DB"], req["request_id"],
+        "executing",
+        approved_at=int(time.time() * 1000),
+        execution_expires_at=future,
+    )
+    code, resp = _run(
+        "status-by-code", {"approval_code": req["code"]}, broker_env,
+    )
+    assert code == 0
+    assert resp["state"] == "executing"
+
+
+def test_list_pending_includes_executing_rows(broker_env):
+    req = _make_pending(broker_env)
+    future = int(time.time() * 1000) + 60 * 60 * 1000
+    _force_state(
+        broker_env["DONNA_BROKER_DB"], req["request_id"],
+        "executing",
+        approved_at=int(time.time() * 1000),
+        execution_expires_at=future,
+    )
+    code, resp = _run("list-pending", {}, broker_env)
+    assert code == 0
+    states = [r["state"] for r in resp["requests"]]
+    assert "executing" in states
+
+
+def test_cancel_from_executing(broker_env):
+    req = _make_pending(broker_env)
+    future = int(time.time() * 1000) + 60 * 60 * 1000
+    _force_state(
+        broker_env["DONNA_BROKER_DB"], req["request_id"],
+        "executing",
+        approved_at=int(time.time() * 1000),
+        execution_expires_at=future,
+    )
+    code, resp = _run(
+        "cancel", {"request_id": req["request_id"]}, broker_env,
+    )
+    assert code == 0
+    assert resp["status"] == "cancelled"
+    _, st = _run("status", {"request_id": req["request_id"]}, broker_env)
+    assert st["state"] == "cancelled"
+
+
+# ---- idempotent execute from executing (mcp_tool path) ------------------
+
+
+@pytest.fixture
+def broker_env_mcp(broker_env):
+    """broker_env plus an mcp_tool capability so we can exercise the
+    executing-state re-entry path. mcp_tool executor is a metadata
+    handoff — row stays in 'executing' after the first execute call,
+    which is exactly the state where Donna's MCP re-attempt currently
+    lives."""
+    home = Path(broker_env["DONNA_BROKER_HOME"])
+    schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "required": ["to"],
+        "additionalProperties": False,
+        "properties": {
+            "to": {"type": "string"},
+            "subject": {"type": "string"},
+        },
+    }
+    (home / "gmail_draft.json").write_text(
+        json.dumps(schema), encoding="utf-8",
+    )
+    caps = home / "capabilities.yaml"
+    caps.write_text(caps.read_text(encoding="utf-8") + """  - name: gmail.create_draft
+    executor:
+      type: mcp_tool
+      tool: mcp__claude_ai_Gmail__create_draft
+    param_schema:
+      $ref: ./gmail_draft.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: medium
+    revalidate:
+      not_applicable: stateless_write
+    idempotency_date_from: created_utc
+    approval_window_minutes: 60
+    execution_window_minutes: 30
+""", encoding="utf-8")
+    return broker_env
+
+
+def test_execute_reentry_from_executing_returns_handoff(broker_env_mcp):
+    """Once a row is in `executing` (mcp_tool handoff awaiting Donna's
+    re-attempt), calling execute again with the same approval_code must
+    succeed and re-emit the handoff metadata — not state-bounce."""
+    _, req = _run(
+        "request",
+        {
+            "capability": "gmail.create_draft",
+            "params": {"to": "x@y", "subject": "hi"},
+        },
+        broker_env_mcp,
+    )
+    rf = Path(broker_env_mcp["DONNA_BROKER_RESPONSES_DIR"]) / (
+        f"{req['request_id']}.json"
+    )
+    rf.write_text(
+        json.dumps({"request_id": req["request_id"], "decision": "approve"}),
+        encoding="utf-8",
+    )
+    # First execute: pending → approved → executing.
+    code1, resp1 = _run(
+        "execute", {"approval_code": req["code"]}, broker_env_mcp,
+    )
+    assert code1 == 0, resp1
+    assert resp1["status"] == "executing"
+    assert resp1["result"]["tool"] == "mcp__claude_ai_Gmail__create_draft"
+
+    # Second execute from executing: idempotent handoff, not an error.
+    code2, resp2 = _run(
+        "execute", {"approval_code": req["code"]}, broker_env_mcp,
+    )
+    assert code2 == 0, resp2
+    assert resp2["status"] == "executing"
+    assert resp2["result"]["tool"] == "mcp__claude_ai_Gmail__create_draft"
+    assert resp2["result"]["params"] == {"to": "x@y", "subject": "hi"}
+
+    # Row is still executing — not bounced through another transition.
+    _, st = _run(
+        "status", {"request_id": req["request_id"]}, broker_env_mcp,
+    )
+    assert st["state"] == "executing"

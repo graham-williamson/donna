@@ -146,6 +146,9 @@ VALID_TRANSITIONS: frozenset[tuple[str, str]] = frozenset({
     ("executing", "succeeded"),
     ("executing", "failed"),
     ("executing", "reconciliation_needed"),
+    # Manual rescue path: an operator (or cancel CLI) can pull a row
+    # out of executing when the re-attempt flow strands it.
+    ("executing", "cancelled"),
     # Manual reconcile (§11 rule 9).
     ("reconciliation_needed", "succeeded"),
     ("reconciliation_needed", "failed"),
@@ -281,7 +284,7 @@ def get_by_approval_code(
     addressable by code (§15 note on audit/operational split)."""
     row = conn.execute(
         "SELECT * FROM requests WHERE approval_code = ? "
-        "AND state IN ('pending_approval','approved')",
+        "AND state IN ('pending_approval','approved','executing')",
         (code,),
     ).fetchone()
     return _row_to_request(row) if row else None

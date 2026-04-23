@@ -19,6 +19,7 @@ errors, not crashes.
 """
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import sqlite3
@@ -464,7 +465,7 @@ def _handle_list_pending(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[s
         "SELECT request_id, capability, approval_code, state, resolved_summary, "
         "approval_expires_at, execution_expires_at, approved_at "
         "FROM requests "
-        "WHERE state IN ('pending_approval','approved') "
+        "WHERE state IN ('pending_approval','approved','executing') "
         "ORDER BY created_at ASC"
     ).fetchall()
     return {
@@ -745,8 +746,39 @@ def _handle_execute(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, A
         created_at=row.created_at,
         approval_expires_at=row.approval_expires_at,
     )
-    if row.approval_hmac is None or not policy.verify_hmac(
-        ctx["hmac_key"], creation_msg, row.approval_hmac,
+    # §7.3: the stored HMAC is the creation HMAC until the pending →
+    # approved transition, after which it's the extended approval-time
+    # HMAC covering execution_expires_at + approved_at. Pick the
+    # expected digest by state so re-entry from 'executing' (and a
+    # fresh execute on an already-approved row) verifies correctly.
+    if row.state == "pending_approval":
+        expected_hmac = policy.compute_creation_hmac(
+            key=ctx["hmac_key"],
+            request_id=row.request_id,
+            capability=row.capability,
+            params_hash=row.params_hash,
+            idempotency_key_=row.idempotency_key,
+            risk_level=row.risk_level,
+            created_at=row.created_at,
+            approval_expires_at=row.approval_expires_at,
+        )
+    else:
+        if row.execution_expires_at is None or row.approved_at is None:
+            db.quarantine(conn, row.request_id, "hmac_mismatch",
+                          "approval fields missing on post-pending row")
+            audit_mod.write_event(ctx["audit_dir"], {
+                "event": "audit.hmac_mismatch",
+                "request_id": row.request_id,
+            })
+            raise BrokerError("integrity_failed", "HMAC verification failed")
+        expected_hmac = policy.compute_approval_hmac(
+            key=ctx["hmac_key"],
+            creation_msg=creation_msg,
+            execution_expires_at=row.execution_expires_at,
+            approved_at=row.approved_at,
+        )
+    if row.approval_hmac is None or not hmac.compare_digest(
+        expected_hmac, row.approval_hmac,
     ):
         db.quarantine(conn, row.request_id, "hmac_mismatch", "creation HMAC")
         audit_mod.write_event(ctx["audit_dir"], {
@@ -754,6 +786,44 @@ def _handle_execute(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, A
             "request_id": row.request_id,
         })
         raise BrokerError("integrity_failed", "HMAC verification failed")
+
+    # Idempotent re-entry from `executing`. Happens when Donna's first
+    # execute call handed off mcp_tool metadata but the subsequent MCP
+    # re-attempt tripped params_mismatch at the hook (or Donna lost
+    # context and is re-calling execute to recover the handoff). The
+    # row is already executing; we must NOT re-run the approved →
+    # executing transition (which would fail). HMAC + params_hash +
+    # approval-response file are re-verified above, so re-emitting the
+    # handoff is safe — every guard that gated the original fires again.
+    # MVP: only mcp_tool capabilities are safe to re-dispatch this way.
+    # Subprocess capabilities would require orphan-detection of the
+    # previous Popen, which is out of scope for this fix.
+    if row.state == "executing":
+        cap = ctx["capabilities"][row.capability]
+        if cap.executor_type != "mcp_tool":
+            raise BrokerError(
+                "invalid_state",
+                "re-entry from 'executing' is only supported for "
+                "mcp_tool capabilities; subprocess capabilities stranded "
+                "in executing must be cancelled manually",
+            )
+        audit_mod.write_event(ctx["audit_dir"], {
+            "event": "request_execution_mcp_tool_reentry",
+            "request_id": row.request_id,
+            "capability": row.capability,
+            "tool": cap.executor_target,
+        })
+        return {
+            "status": "executing",
+            "request_id": row.request_id,
+            "result": {
+                "executor_type": "mcp_tool",
+                "tool": cap.executor_target,
+                "params": params,
+            },
+            "error_code": None,
+            "error_message": None,
+        }
 
     # If row is still pending_approval, promote it to approved first.
     if row.state == "pending_approval":
@@ -854,7 +924,7 @@ def _handle_cancel(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, An
     r = db.get_request(ctx["conn"], rid)
     if r is None:
         raise BrokerError("not_found", f"no request {rid!r}", status="not_found")
-    if r.state not in {"pending_approval", "approved"}:
+    if r.state not in {"pending_approval", "approved", "executing"}:
         raise BrokerError(
             "invalid_state",
             f"cannot cancel from state {r.state!r}",
@@ -1050,6 +1120,68 @@ MODES_NEEDING_MANIFESTS = frozenset({
 })
 
 
+def _lazy_reconcile(
+    conn: sqlite3.Connection, audit_dir: str
+) -> None:
+    """Sweep expired rows on every CLI invocation.
+
+    Replaces the (unimplemented) `reconcile` mode with in-band
+    self-healing — no background process needed. Runs before handler
+    dispatch so every CLI call is an opportunity to clear drift.
+
+    Three expiry cases (§5 state machine, §7.6):
+      - pending_approval past approval_expires_at → expired
+      - approved past execution_expires_at → expired
+      - executing past execution_expires_at → failed (exec_window_expired)
+
+    Transitions go through db.transition() so the §6 triggers and
+    state-machine guards apply. Audit events are emitted for each
+    transition. A transition that races with another writer (e.g. the
+    row already moved) is swallowed silently — whoever moved it already
+    audited the transition."""
+    now_ms = int(time.time() * 1000)
+
+    def _sweep(
+        select_sql: str,
+        from_state: str,
+        to_state: str,
+        audit_event: str,
+        **extra_fields: Any,
+    ) -> None:
+        stranded = conn.execute(select_sql, (now_ms,)).fetchall()
+        for r in stranded:
+            rid = r["request_id"]
+            try:
+                db.transition(conn, rid, from_state, to_state, **extra_fields)
+            except db.InvalidTransition:
+                continue
+            audit_mod.write_event(audit_dir, {
+                "event": audit_event,
+                "request_id": rid,
+                "from_state": from_state,
+                "reason": extra_fields.get("error_code", "window_expired"),
+            })
+
+    _sweep(
+        "SELECT request_id FROM requests "
+        "WHERE state = 'pending_approval' AND approval_expires_at < ?",
+        "pending_approval", "expired", "request_expired",
+    )
+    _sweep(
+        "SELECT request_id FROM requests "
+        "WHERE state = 'approved' AND execution_expires_at < ?",
+        "approved", "expired", "request_expired",
+    )
+    _sweep(
+        "SELECT request_id FROM requests "
+        "WHERE state = 'executing' AND execution_expires_at < ?",
+        "executing", "failed", "request_execution_failed",
+        error_code="exec_window_expired",
+        error_message="execution window expired before completion",
+        executed_at=now_ms,
+    )
+
+
 def main(
     argv: list[str] | None = None,
     stdin: Any = None,
@@ -1092,6 +1224,10 @@ def main(
     except BrokerError as e:
         stdout.write(json.dumps(_error_response(e)) + "\n")
         return 1
+
+    # Lazy reconcile: sweep expired rows before dispatch. Replaces the
+    # unimplemented `reconcile` mode with in-band self-healing.
+    _lazy_reconcile(ctx["conn"], ctx["audit_dir"])
 
     # §6 startup health sweep: operator-initiated modes only (see
     # MODES_WITH_STARTUP_SWEEP), and only when any capability declares
