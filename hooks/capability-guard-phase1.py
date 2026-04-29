@@ -76,6 +76,17 @@ BROKER_CMD_RE = re.compile(
     + r" (?P<mode>[a-z-]+) '(?P<json>[^']*)'$"
 )
 
+# Structural fast-path for python3 syntax-check invocations.
+# Pins the command to exactly:
+#     python3 -c "import py_compile; py_compile.compile('<path>', doraise=True)"
+# The path slot is constrained to characters that cannot escape the donna root
+# check performed after the regex matches. Shell-substitution patterns cannot
+# be smuggled because the outer double-quote run is anchored at both ends and
+# the path slot allows only safe filesystem characters.
+PYCOMPILE_CMD_RE = re.compile(
+    r'^python3 -c "import py_compile; py_compile\.compile\(\'(?P<path>[^\']+)\', doraise=True\)"$'
+)
+
 
 def emit(decision: str, reason: str) -> None:
     sys.stdout.write(json.dumps({
@@ -117,6 +128,18 @@ def check_bash(command: str) -> None:
         except Exception as e:
             deny(f"broker payload is not valid JSON: {e}")
         allow("sudo donna-broker")
+
+    # Structural fast-path for python3 py_compile syntax checks — see
+    # PYCOMPILE_CMD_RE docstring. Short-circuits before the raw-string
+    # metachar scan, which would otherwise reject `;` inside the -c arg.
+    m2 = PYCOMPILE_CMD_RE.match(command)
+    if m2:
+        path = m2.group("path")
+        if not DONNA_ROOT_RE.match(path):
+            deny(f"py_compile path {path!r} outside /Users/grahamwilliamson/donna")
+        if ".." in path:
+            deny(f"py_compile path {path!r} contains '..'")
+        allow("python3 py_compile syntax check under donna root")
 
     for ch in command:
         if ch in SHELL_METACHARS:
@@ -191,6 +214,42 @@ def _check_bash_allowlist(t: list[str]) -> None:
         and not t[2].startswith("-")
     ):
         allow("git diff <path>")
+
+    # donna-broker-send.py: reads a JSON file and pipes it to the broker
+    # via stdin, bypassing the single-quote constraint in BROKER_CMD_RE.
+    # Constrained to a specific script path + known mode + /tmp/donna-*.json.
+    DONNA_BROKER_SEND = "/Users/grahamwilliamson/donna/tools/donna-broker-send.py"
+    if len(t) == 4 and t[0] == "python3" and t[1] == DONNA_BROKER_SEND:
+        if t[2] in BROKER_MODES:
+            if re.fullmatch(r"/tmp/donna-[a-zA-Z0-9_\-]+\.json", t[3]):
+                allow("donna-broker-send.py")
+        deny("donna-broker-send.py: invalid invocation")
+
+    # chmod +x for executor scripts under donna root only.
+    if len(t) == 3 and t[0] == "chmod" and t[1] == "+x":
+        path = t[2]
+        if not DONNA_ROOT_RE.match(path):
+            deny(f"chmod path {path!r} outside /Users/grahamwilliamson/donna")
+        if ".." in path:
+            deny(f"chmod path {path!r} contains '..' (directory-escape reject)")
+        allow("chmod +x under donna root")
+
+    # python3 syntax check: py_compile on files under donna root.
+    # Accepts: python3 -c "import py_compile; py_compile.compile('<path>', doraise=True)"
+    if (
+        len(t) == 3 and t[0] == "python3" and t[1] == "-c"
+        and t[2].startswith("import py_compile; py_compile.compile(")
+    ):
+        inner = t[2]
+        path_match = re.search(r"py_compile\.compile\('([^']+)',\s*doraise=True\)", inner)
+        if path_match:
+            path = path_match.group(1)
+            if not DONNA_ROOT_RE.match(path):
+                deny(f"py_compile path {path!r} outside /Users/grahamwilliamson/donna")
+            if ".." in path:
+                deny(f"py_compile path {path!r} contains '..'")
+            allow("python3 py_compile syntax check under donna root")
+        deny("python3 -c py_compile: path not parseable or missing doraise=True")
 
     deny(f"Bash argv {t!r} not in §14.1 allowlist")
 
