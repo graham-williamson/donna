@@ -1,0 +1,33 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "donna://schemas/notion_update_data_source.json",
+  "title": "notion.update_data_source params",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["data_source_id"],
+  "properties": {
+    "data_source_id": {
+      "type": "string",
+      "minLength": 10,
+      "maxLength": 200
+    },
+    "title": {
+      "type": "string",
+      "maxLength": 500
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 2000
+    },
+    "statements": {
+      "type": "string",
+      "maxLength": 10000
+    },
+    "is_inline": {
+      "type": "boolean"
+    },
+    "in_trash": {
+      "type": "boolean"
+    }
+  }
+}

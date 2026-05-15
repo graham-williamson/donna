@@ -195,6 +195,63 @@ def _check_bash_allowlist(t: list[str]) -> None:
             deny(f"donna-cost.py: unexpected arg {tok!r}")
         allow("donna-cost.py")
 
+    # donna-memory.py: long-term operational memory (SQLite-backed).
+    # Write ops use a JSON file (avoids metachar issues with content).
+    # Read ops use CLI args with constrained values.
+    DONNA_MEMORY_SCRIPT = "/Users/grahamwilliamson/donna/tools/donna-memory.py"
+    if len(t) >= 2 and t[0] == "python3" and t[1] == DONNA_MEMORY_SCRIPT:
+        valid_commands = {"query", "search", "recent", "stats", "categories"}
+        valid_file_commands = {"add", "delete"}
+        rest = t[2:]
+        if not rest:
+            deny("donna-memory.py: subcommand required")
+        cmd = rest[0]
+        if cmd in valid_file_commands:
+            if len(rest) == 2 and re.fullmatch(
+                r"/tmp/donna-mem-[a-zA-Z0-9_\-]+\.json", rest[1]
+            ):
+                allow(f"donna-memory.py {cmd}")
+            deny(f"donna-memory.py {cmd}: requires /tmp/donna-mem-*.json")
+        if cmd in valid_commands:
+            valid_flags = {
+                "--category", "--subcategory", "--since",
+                "--limit", "--text",
+            }
+            i = 1
+            while i < len(rest):
+                tok = rest[i]
+                if tok in valid_flags:
+                    if i + 1 >= len(rest):
+                        deny(f"donna-memory.py: {tok} requires a value")
+                    val = rest[i + 1]
+                    if tok in ("--since", "--limit"):
+                        if not re.fullmatch(r"[1-9][0-9]*", val):
+                            deny(
+                                f"donna-memory.py: {tok} value "
+                                f"{val!r} not a positive integer"
+                            )
+                        if tok == "--limit" and int(val) > 100:
+                            deny(f"donna-memory.py: --limit exceeds 100")
+                        if tok == "--since" and int(val) > 3650:
+                            deny(f"donna-memory.py: --since exceeds 3650")
+                    if tok in ("--category", "--subcategory"):
+                        if not re.fullmatch(r"[a-z][a-z0-9_]{0,49}", val):
+                            deny(
+                                f"donna-memory.py: {tok} value "
+                                f"{val!r} not a valid identifier"
+                            )
+                    if tok == "--text":
+                        if not re.fullmatch(r"[a-zA-Z0-9_ -]{1,100}", val):
+                            deny(
+                                f"donna-memory.py: --text value "
+                                f"{val!r} contains invalid characters"
+                            )
+                    i += 2
+                    continue
+                deny(f"donna-memory.py: unexpected arg {tok!r}")
+            allow(f"donna-memory.py {cmd}")
+        deny(f"donna-memory.py: unknown subcommand {cmd!r}")
+
     if len(t) == 2 and t[0] == "git" and t[1] == "status":
         allow("git status")
     if (

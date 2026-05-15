@@ -1,0 +1,21 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "donna://schemas/notion_create_database.json",
+  "title": "notion-create-database params",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "parent"],
+  "properties": {
+    "title": {"type": "string", "maxLength": 200},
+    "description": {"type": "string", "maxLength": 1000},
+    "parent": {
+      "type": "object",
+      "required": ["page_id"],
+      "additionalProperties": false,
+      "properties": {
+        "page_id": {"type": "string", "minLength": 32, "maxLength": 40}
+      }
+    },
+    "schema": {"type": "string", "maxLength": 5000}
+  }
+}

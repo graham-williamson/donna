@@ -7,19 +7,20 @@
   "required": ["to", "subject", "body"],
   "properties": {
     "to": {
-      "type": "string",
-      "format": "email",
-      "maxLength": 254
+      "type": "array",
+      "items": { "type": "string", "format": "email", "maxLength": 254 },
+      "minItems": 1,
+      "maxItems": 1
     },
     "cc": {
-      "type": "string",
-      "format": "email",
-      "maxLength": 254
+      "type": "array",
+      "items": { "type": "string", "format": "email", "maxLength": 254 },
+      "maxItems": 1
     },
     "bcc": {
-      "type": "string",
-      "format": "email",
-      "maxLength": 254
+      "type": "array",
+      "items": { "type": "string", "format": "email", "maxLength": 254 },
+      "maxItems": 1
     },
     "subject": {
       "type": "string",

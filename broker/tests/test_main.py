@@ -74,6 +74,29 @@ capabilities:
     idempotency_date_from: params.date
     approval_window_minutes: 60
     execution_window_minutes: 30
+  - name: gmail.create_draft
+    executor:
+      type: mcp_tool
+      tool: mcp__claude_ai_Gmail__create_draft
+    param_schema:
+      type: object
+      required: [to, subject, body]
+      additionalProperties: false
+      properties:
+        to:
+          type: array
+          items: {{type: string}}
+          minItems: 1
+        subject: {{type: string}}
+        body: {{type: string}}
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: medium
+    revalidate:
+      not_applicable: stateless_write
+    idempotency_date_from: created_utc
+    approval_window_minutes: 60
+    execution_window_minutes: 30
 """, encoding="utf-8")
 
     mcp_yaml = home / "mcp-tools.yaml"
@@ -169,7 +192,7 @@ def test_policy_check_blocks_playwright(broker_env):
 def test_policy_check_blocks_medium_with_summary(broker_env):
     code, resp = _run(
         "policy-check",
-        {"tool_name": "mcp__claude_ai_Gmail__create_draft", "params": {"to": "x@y"}},
+        {"tool_name": "mcp__claude_ai_Gmail__create_draft", "params": {"to": ["x@y"]}},
         broker_env,
     )
     assert code == 0
@@ -444,6 +467,81 @@ def test_audit_result_records_low_risk_read(broker_env):
     assert result is None
 
 
+def _make_executing_gmail(env: dict[str, str]) -> dict[str, Any]:
+    """Create a gmail.create_draft request and force it into executing."""
+    _, req = _run(
+        "request",
+        {
+            "capability": "gmail.create_draft",
+            "params": {
+                "to": ["test@example.com"],
+                "subject": "hello",
+                "body": "world",
+            },
+        },
+        env,
+    )
+    future = int(time.time() * 1000) + 60 * 60 * 1000
+    _force_state(
+        env["DONNA_BROKER_DB"], req["request_id"],
+        "executing",
+        approved_at=int(time.time() * 1000),
+        execution_expires_at=future,
+    )
+    return req
+
+
+def test_audit_result_closes_executing_row_via_tool_name_fallback(broker_env):
+    """When request_id is absent, audit-result resolves the row by tool_name."""
+    req = _make_executing_gmail(broker_env)
+    code, resp = _run(
+        "audit-result",
+        {
+            "tool_name": "mcp__claude_ai_Gmail__create_draft",
+            "outcome": "succeeded",
+            # no request_id — mirrors real PostToolUse hook behaviour
+        },
+        broker_env,
+    )
+    assert code == 0
+    _, st = _run("status", {"request_id": req["request_id"]}, broker_env)
+    assert st["state"] == "succeeded"
+
+
+def test_audit_result_fails_executing_row_via_tool_name_fallback(broker_env):
+    """Failure outcome via tool_name fallback transitions row to failed."""
+    req = _make_executing_gmail(broker_env)
+    code, _ = _run(
+        "audit-result",
+        {
+            "tool_name": "mcp__claude_ai_Gmail__create_draft",
+            "outcome": "failed",
+        },
+        broker_env,
+    )
+    assert code == 0
+    _, st = _run("status", {"request_id": req["request_id"]}, broker_env)
+    assert st["state"] == "failed"
+    assert st["error_code"] == "mcp_tool_reported_failure"
+
+
+def test_audit_result_explicit_request_id_still_works(broker_env):
+    """Explicit request_id path still closes the row correctly."""
+    req = _make_executing_gmail(broker_env)
+    code, _ = _run(
+        "audit-result",
+        {
+            "tool_name": "mcp__claude_ai_Gmail__create_draft",
+            "outcome": "succeeded",
+            "request_id": req["request_id"],
+        },
+        broker_env,
+    )
+    assert code == 0
+    _, st = _run("status", {"request_id": req["request_id"]}, broker_env)
+    assert st["state"] == "succeeded"
+
+
 # ---- cancel --------------------------------------------------------------
 
 
@@ -602,8 +700,8 @@ def test_verify_manifests_ok(broker_env):
     assert code == 0, resp
     assert resp["status"] == "ok"
     assert resp["verified"] is True
-    assert resp["capabilities_count"] == 1
-    assert resp["capabilities"] == ["puregym.book_class"]
+    assert resp["capabilities_count"] == 2
+    assert resp["capabilities"] == ["gmail.create_draft", "puregym.book_class"]
     assert resp["mcp_tools_count"] == 3
 
 
@@ -894,6 +992,21 @@ def test_lazy_reconcile_leaves_unexpired_rows_alone(broker_env):
     assert st["state"] == "pending_approval"
 
 
+def test_lazy_reconcile_deletes_queue_file_on_expiry(broker_env):
+    """Queue file must be deleted when pending_approval expires, so a daemon
+    restart doesn't replay the prompt for a dead request."""
+    req = _make_pending(broker_env)
+    queue_file = Path(req["queue_file"])
+    assert queue_file.exists()
+    past = int(time.time() * 1000) - 60_000
+    _force_state(
+        broker_env["DONNA_BROKER_DB"], req["request_id"],
+        "pending_approval", approval_expires_at=past,
+    )
+    _run("status", {"request_id": req["request_id"]}, broker_env)
+    assert not queue_file.exists()
+
+
 def test_status_by_code_finds_executing_row(broker_env):
     req = _make_pending(broker_env)
     future = int(time.time() * 1000) + 60 * 60 * 1000
@@ -943,62 +1056,75 @@ def test_cancel_from_executing(broker_env):
     assert st["state"] == "cancelled"
 
 
+def test_cancel_deletes_queue_file(broker_env):
+    """Cancel must delete the queue file to prevent prompt replay on daemon restart."""
+    req = _make_pending(broker_env)
+    queue_file = Path(req["queue_file"])
+    assert queue_file.exists()
+    code, resp = _run("cancel", {"request_id": req["request_id"]}, broker_env)
+    assert code == 0
+    assert not queue_file.exists()
+
+
 # ---- idempotent execute from executing (mcp_tool path) ------------------
 
 
-@pytest.fixture
-def broker_env_mcp(broker_env):
-    """broker_env plus an mcp_tool capability so we can exercise the
-    executing-state re-entry path. mcp_tool executor is a metadata
-    handoff — row stays in 'executing' after the first execute call,
-    which is exactly the state where Donna's MCP re-attempt currently
-    lives."""
-    home = Path(broker_env["DONNA_BROKER_HOME"])
-    schema = {
-        "$schema": "http://json-schema.org/draft-07/schema#",
-        "type": "object",
-        "required": ["to"],
-        "additionalProperties": False,
-        "properties": {
-            "to": {"type": "string"},
-            "subject": {"type": "string"},
+def test_execute_deletes_queue_file_on_approve(broker_env):
+    """Queue file must be removed after execute reads an approve response.
+    Guards against daemon-restart re-sending the approval prompt."""
+    _, req_resp = _run(
+        "request",
+        {
+            "capability": "puregym.book_class",
+            "params": {"class_id": "hiit", "date": "2026-04-21"},
         },
-    }
-    (home / "gmail_draft.json").write_text(
-        json.dumps(schema), encoding="utf-8",
+        broker_env,
     )
-    caps = home / "capabilities.yaml"
-    caps.write_text(caps.read_text(encoding="utf-8") + """  - name: gmail.create_draft
-    executor:
-      type: mcp_tool
-      tool: mcp__claude_ai_Gmail__create_draft
-    param_schema:
-      $ref: ./gmail_draft.json
-    params_exact_match_required: true
-    derived_fields_allowed: []
-    risk_level: medium
-    revalidate:
-      not_applicable: stateless_write
-    idempotency_date_from: created_utc
-    approval_window_minutes: 60
-    execution_window_minutes: 30
-""", encoding="utf-8")
-    return broker_env
+    queue_file = Path(req_resp["queue_file"])
+    assert queue_file.exists()
+
+    response_file = Path(broker_env["DONNA_BROKER_RESPONSES_DIR"]) / f"{req_resp['request_id']}.json"
+    response_file.write_text(
+        json.dumps({"request_id": req_resp["request_id"], "decision": "approve"}),
+        encoding="utf-8",
+    )
+    _run("execute", {"approval_code": req_resp["code"]}, broker_env)
+    assert not queue_file.exists()
 
 
-def test_execute_reentry_from_executing_returns_handoff(broker_env_mcp):
+def test_execute_deletes_queue_file_on_deny(broker_env):
+    """Queue file must also be removed when execute reads a deny response."""
+    _, req_resp = _run(
+        "request",
+        {
+            "capability": "puregym.book_class",
+            "params": {"class_id": "hiit", "date": "2026-04-21"},
+        },
+        broker_env,
+    )
+    queue_file = Path(req_resp["queue_file"])
+    assert queue_file.exists()
+
+    response_file = Path(broker_env["DONNA_BROKER_RESPONSES_DIR"]) / f"{req_resp['request_id']}.json"
+    response_file.write_text(
+        json.dumps({"request_id": req_resp["request_id"], "decision": "deny"}),
+        encoding="utf-8",
+    )
+    _run("execute", {"approval_code": req_resp["code"]}, broker_env)
+    assert not queue_file.exists()
+
+
+def test_execute_reentry_from_executing_returns_handoff(broker_env):
     """Once a row is in `executing` (mcp_tool handoff awaiting Donna's
     re-attempt), calling execute again with the same approval_code must
     succeed and re-emit the handoff metadata — not state-bounce."""
+    params = {"to": ["x@y"], "subject": "hi", "body": "test"}
     _, req = _run(
         "request",
-        {
-            "capability": "gmail.create_draft",
-            "params": {"to": "x@y", "subject": "hi"},
-        },
-        broker_env_mcp,
+        {"capability": "gmail.create_draft", "params": params},
+        broker_env,
     )
-    rf = Path(broker_env_mcp["DONNA_BROKER_RESPONSES_DIR"]) / (
+    rf = Path(broker_env["DONNA_BROKER_RESPONSES_DIR"]) / (
         f"{req['request_id']}.json"
     )
     rf.write_text(
@@ -1007,7 +1133,7 @@ def test_execute_reentry_from_executing_returns_handoff(broker_env_mcp):
     )
     # First execute: pending → approved → executing.
     code1, resp1 = _run(
-        "execute", {"approval_code": req["code"]}, broker_env_mcp,
+        "execute", {"approval_code": req["code"]}, broker_env,
     )
     assert code1 == 0, resp1
     assert resp1["status"] == "executing"
@@ -1015,15 +1141,15 @@ def test_execute_reentry_from_executing_returns_handoff(broker_env_mcp):
 
     # Second execute from executing: idempotent handoff, not an error.
     code2, resp2 = _run(
-        "execute", {"approval_code": req["code"]}, broker_env_mcp,
+        "execute", {"approval_code": req["code"]}, broker_env,
     )
     assert code2 == 0, resp2
     assert resp2["status"] == "executing"
     assert resp2["result"]["tool"] == "mcp__claude_ai_Gmail__create_draft"
-    assert resp2["result"]["params"] == {"to": "x@y", "subject": "hi"}
+    assert resp2["result"]["params"] == params
 
     # Row is still executing — not bounced through another transition.
     _, st = _run(
-        "status", {"request_id": req["request_id"]}, broker_env_mcp,
+        "status", {"request_id": req["request_id"]}, broker_env,
     )
     assert st["state"] == "executing"

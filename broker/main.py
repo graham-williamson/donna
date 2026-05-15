@@ -681,6 +681,16 @@ def _write_queue_file(
     return str(final)
 
 
+def _delete_queue_file(queue_dir: str, request_id: str) -> None:
+    """Remove the approval-queue file once the approval response is confirmed.
+    Prevents prompt replay on daemon restart (seenRequestIds is volatile).
+    Idempotent — silently ignores missing files."""
+    try:
+        (Path(queue_dir) / f"{request_id}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _handle_execute(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     """Run an approved capability. Checks approval response file for a
     Telegram-approved code, verifies HMAC, dispatches to executor."""
@@ -713,6 +723,10 @@ def _handle_execute(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, A
             "approval_response_malformed",
             f"could not parse {response_path}: {e}",
         ) from e
+
+    # Queue file has served its purpose — delete it now so a daemon restart
+    # doesn't replay the approval prompt via the bridge's volatile seenRequestIds.
+    _delete_queue_file(ctx["queue_dir"], row.request_id)
 
     decision = response_payload.get("decision")
     if decision != "approve":
@@ -856,8 +870,15 @@ def _handle_execute(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, A
     def audit_writer(evt: dict[str, Any]) -> None:
         audit_mod.write_event(ctx["audit_dir"], evt)
 
+    creds_config = executor.CredsConfig(
+        creds_dir=Path(ctx["config"]["creds_dir"]),
+        identity_path=Path(ctx["config"]["identity_path"]),
+        age_binary=ctx["config"]["age_binary"],
+    ) if cap.creds is not None else None
+
     outcome = executor.execute(
         cap, row, params, conn, audit_writer=audit_writer,
+        creds_config=creds_config,
     )
     return {
         "status": outcome.state,
@@ -868,13 +889,82 @@ def _handle_execute(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, A
     }
 
 
+def _find_executing_by_tool(
+    conn: sqlite3.Connection, tool_name: str, capabilities: dict[str, Any]
+) -> Optional[str]:
+    """Return the request_id of the oldest executing mcp_tool row
+    whose capability's executor_target matches tool_name.
+
+    Oldest-first (ASC) so that when multiple rows are executing for the
+    same capability, the PostToolUse hook closes the one that was
+    dispatched first — matching the order in which MCP calls complete.
+    DESC caused the wrong row to be closed when two requests were
+    in-flight simultaneously (newer row was closed instead of older).
+
+    Used when the PostToolUse hook omits request_id — which happens
+    because including _donna_request_id in an MCP call's tool_input
+    would break the params_hash check at the PreToolUse hook.
+    """
+    for cap_name, cap in capabilities.items():
+        if getattr(cap, "executor_type", None) != "mcp_tool":
+            continue
+        if getattr(cap, "executor_target", None) != tool_name:
+            continue
+        row = conn.execute(
+            "SELECT request_id FROM requests "
+            "WHERE state = 'executing' AND capability = ? "
+            "ORDER BY created_at ASC LIMIT 1",
+            (cap_name,),
+        ).fetchone()
+        if row:
+            return str(row[0])
+    return None
+
+
+def _close_executing_row(
+    conn: sqlite3.Connection,
+    audit_dir: str,
+    request_id: str,
+    tool_outcome: str,
+) -> None:
+    """Transition executing → succeeded/failed and emit the audit event.
+    No-op when the row is not in executing state (race guard)."""
+    row = db.get_request(conn, request_id)
+    if row is None or row.state != "executing":
+        return
+    if tool_outcome == "succeeded":
+        db.transition(conn, request_id, "executing", "succeeded",
+                      executed_at=int(time.time() * 1000))
+        audit_mod.write_event(audit_dir, {
+            "event": "request_execution_succeeded",
+            "request_id": request_id,
+        })
+    else:
+        db.transition(conn, request_id, "executing", "failed",
+                      error_code="mcp_tool_reported_failure",
+                      executed_at=int(time.time() * 1000))
+        audit_mod.write_event(audit_dir, {
+            "event": "request_execution_failed",
+            "request_id": request_id,
+        })
+
+
 def _handle_audit_result(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     """PostToolUse hook. For low-risk reads: emit mcp_tool_allowed. For
     medium+ successful runs on tracked rows: transition executing →
     succeeded."""
     tool_name = payload.get("tool_name") or ""
     tool_outcome = payload.get("outcome") or "succeeded"
-    request_id = payload.get("request_id")  # optional, for tracked rows
+    request_id: Optional[str] = payload.get("request_id") or None
+
+    # Fallback: when the PostToolUse hook omits request_id (no
+    # _donna_request_id in tool_input — adding it would change the
+    # params_hash and break the PreToolUse executing-row bypass),
+    # resolve the executing row by capability lookup on tool_name.
+    if not request_id and tool_name:
+        request_id = _find_executing_by_tool(
+            ctx["conn"], tool_name, ctx.get("capabilities", {})
+        )
 
     mcp_tools: dict[str, str] = ctx["mcp_tools"]
     risk = mcp_tools.get(tool_name, "unknown")
@@ -885,28 +975,8 @@ def _handle_audit_result(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[s
         "outcome": tool_outcome,
         "request_id": request_id,
     })
-    if request_id and isinstance(request_id, str):
-        row = db.get_request(ctx["conn"], request_id)
-        if row is not None and row.state == "executing":
-            if tool_outcome == "succeeded":
-                db.transition(
-                    ctx["conn"], request_id, "executing", "succeeded",
-                    executed_at=int(time.time() * 1000),
-                )
-                audit_mod.write_event(ctx["audit_dir"], {
-                    "event": "request_execution_succeeded",
-                    "request_id": request_id,
-                })
-            else:
-                db.transition(
-                    ctx["conn"], request_id, "executing", "failed",
-                    error_code="mcp_tool_reported_failure",
-                    executed_at=int(time.time() * 1000),
-                )
-                audit_mod.write_event(ctx["audit_dir"], {
-                    "event": "request_execution_failed",
-                    "request_id": request_id,
-                })
+    if request_id:
+        _close_executing_row(ctx["conn"], ctx["audit_dir"], request_id, tool_outcome)
     return {"status": "ok"}
 
 
@@ -930,6 +1000,7 @@ def _handle_cancel(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, An
             f"cannot cancel from state {r.state!r}",
         )
     db.transition(ctx["conn"], rid, r.state, "cancelled")
+    _delete_queue_file(ctx["queue_dir"], rid)
     audit_mod.write_event(ctx["audit_dir"], {
         "event": "request_cancelled",
         "request_id": rid,
@@ -1121,7 +1192,7 @@ MODES_NEEDING_MANIFESTS = frozenset({
 
 
 def _lazy_reconcile(
-    conn: sqlite3.Connection, audit_dir: str
+    conn: sqlite3.Connection, audit_dir: str, queue_dir: str
 ) -> None:
     """Sweep expired rows on every CLI invocation.
 
@@ -1141,7 +1212,7 @@ def _lazy_reconcile(
     audited the transition."""
     now_ms = int(time.time() * 1000)
 
-    def _sweep(
+    def _sweep_and_clean(
         select_sql: str,
         from_state: str,
         to_state: str,
@@ -1155,6 +1226,7 @@ def _lazy_reconcile(
                 db.transition(conn, rid, from_state, to_state, **extra_fields)
             except db.InvalidTransition:
                 continue
+            _delete_queue_file(queue_dir, rid)
             audit_mod.write_event(audit_dir, {
                 "event": audit_event,
                 "request_id": rid,
@@ -1162,17 +1234,17 @@ def _lazy_reconcile(
                 "reason": extra_fields.get("error_code", "window_expired"),
             })
 
-    _sweep(
+    _sweep_and_clean(
         "SELECT request_id FROM requests "
         "WHERE state = 'pending_approval' AND approval_expires_at < ?",
         "pending_approval", "expired", "request_expired",
     )
-    _sweep(
+    _sweep_and_clean(
         "SELECT request_id FROM requests "
         "WHERE state = 'approved' AND execution_expires_at < ?",
         "approved", "expired", "request_expired",
     )
-    _sweep(
+    _sweep_and_clean(
         "SELECT request_id FROM requests "
         "WHERE state = 'executing' AND execution_expires_at < ?",
         "executing", "failed", "request_execution_failed",
@@ -1227,7 +1299,7 @@ def main(
 
     # Lazy reconcile: sweep expired rows before dispatch. Replaces the
     # unimplemented `reconcile` mode with in-band self-healing.
-    _lazy_reconcile(ctx["conn"], ctx["audit_dir"])
+    _lazy_reconcile(ctx["conn"], ctx["audit_dir"], ctx["queue_dir"])
 
     # §6 startup health sweep: operator-initiated modes only (see
     # MODES_WITH_STARTUP_SWEEP), and only when any capability declares

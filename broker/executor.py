@@ -143,8 +143,18 @@ def _sanitised_env(extras: dict[str, str] | None = None) -> dict[str, str]:
     is not sensitive — the pipe contents are only accessible to the fd
     holder, and the fd itself dies when the subprocess exits. Credentials
     never enter env.
+
+    HOME and TMPDIR are passed through because browser-automation
+    executors (Playwright channel="chrome") need HOME to locate Chrome's
+    profile directory. Values are taken from the broker's own env at
+    call time — both are set by launchd for the donna-broker service
+    account and contain no secrets.
     """
-    env = {"PATH": "/usr/bin:/bin"}
+    env: dict[str, str] = {"PATH": "/usr/bin:/bin"}
+    for key in ("HOME", "TMPDIR"):
+        val = os.environ.get(key)
+        if val:
+            env[key] = val
     if extras:
         env.update(extras)
     return env
@@ -479,10 +489,22 @@ def _execute_subprocess(
         })
 
     if exit_code != 0:
+        # Try to recover a structured error from stdout before discarding it.
+        # The executor's fail() writes {error_code, detail} to stdout then exits 1.
+        error_code = "executor_crashed"
+        error_detail = f"exit code {exit_code}"
+        if stdout:
+            try:
+                err_json: Any = json.loads(stdout)
+                if isinstance(err_json, dict):
+                    error_code = str(err_json.get("error_code") or error_code)
+                    error_detail = str(err_json.get("detail") or error_detail)
+            except (json.JSONDecodeError, Exception):
+                pass
         return _finalise_failure(
             state_conn, request, audit_writer,
-            "executor_crashed",
-            f"exit code {exit_code}",
+            error_code,
+            error_detail,
             extra={"exit_code": exit_code},
         )
 

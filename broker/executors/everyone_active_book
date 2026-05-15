@@ -1,0 +1,260 @@
+#!/Users/donna-broker/venv/bin/python3
+"""Everyone Active class-booking executor.
+
+Subprocess contract: reads JSON from stdin, credentials from DONNA_CREDS_FD
+pipe, writes JSON result to stdout. Exit 0 = success, exit 1 = failure.
+
+Spec: security-v1.1 §8 (capability executor), §17 (Phase 2 browser executor).
+Design: docs/superpowers/specs/2026-04-29-piece-d-ea-executor-design.md
+"""
+import json
+import os
+import re
+import sys
+
+from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+
+CENTRES = {
+    "chesham": ("0243", "Chesham Leisure Centre"),
+    "chilterns": ("0255", "Chilterns Lifestyle Centre"),
+}
+
+SEL_CENTRE = "#ctl00_MainContent__advanceSearchUserControl_SitesAdvanced"
+SEL_ACTIVITY_TYPE = "#ctl00_MainContent__advanceSearchUserControl_ActivityGroups"
+SEL_DATE_FROM = "#ctl00_MainContent__advanceSearchUserControl_startDate"
+SEL_DATE_TO = "#ctl00_MainContent__advanceSearchUserControl_endDate"
+SEL_SEARCH_BTN = "#ctl00_MainContent__advanceSearchUserControl__searchBtn"
+SEL_CONFIRM_BOOK = "#ctl00_MainContent_btnBasket"
+
+
+def fail(error_code: str, detail: str) -> None:
+    json.dump({"error_code": error_code, "detail": detail}, sys.stdout)
+    sys.stdout.flush()
+    sys.exit(1)
+
+
+def read_creds() -> dict:
+    fd_str = os.environ.get("DONNA_CREDS_FD")
+    if fd_str is None:
+        fail("login_failed", "DONNA_CREDS_FD not set")
+    fd = int(fd_str)
+    data = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        data += chunk
+    os.close(fd)
+    return json.loads(data)
+
+
+def read_params() -> dict:
+    request = json.load(sys.stdin)
+    return request["params"]
+
+
+def login(page, creds: dict) -> None:
+    try:
+        page.goto("https://account.everyoneactive.com/login", timeout=30000)
+    except PwTimeout:
+        fail("site_unavailable", "login page did not load within 30s")
+
+    page.fill("#emailAddress", creds["email"])
+    page.fill("#password", creds["password"])
+    page.click("button[type='submit']")
+
+    try:
+        page.wait_for_url("**/memberHomePage.aspx", timeout=30000)
+    except PwTimeout:
+        error_el = page.query_selector(".validation-summary-errors, .field-validation-error, .error-message")
+        detail = error_el.text_content().strip() if error_el else "login page did not redirect"
+        fail("login_failed", detail)
+
+
+def expand_advanced_search(page) -> None:
+    panel_heading = page.query_selector("[data-target='#collapseAdv']")
+    if panel_heading is None:
+        fail("unexpected_dom", "advanced search panel heading not found")
+    panel = page.query_selector("#collapseAdv")
+    if panel and "in" not in (panel.get_attribute("class") or ""):
+        panel_heading.click()
+        page.wait_for_timeout(500)
+
+
+def search_classes(page, centre_code: str, activity_name: str, date: str) -> None:
+    expand_advanced_search(page)
+
+    page.select_option(SEL_CENTRE, value=centre_code)
+    page.wait_for_load_state("networkidle")
+
+    options = page.query_selector_all(f"{SEL_ACTIVITY_TYPE} option")
+    matches = []
+    for opt in options:
+        text = (opt.text_content() or "").strip()
+        val = opt.get_attribute("value") or ""
+        if val == "":
+            continue
+        if activity_name.lower() in text.lower():
+            matches.append((val, text))
+
+    if not matches:
+        available = [
+            (opt.text_content() or "").strip()
+            for opt in options
+            if (opt.get_attribute("value") or "") != ""
+        ]
+        fail("class_not_found",
+             f"activity '{activity_name}' not found in dropdown. "
+             f"Available: {', '.join(available)}")
+    if len(matches) > 1:
+        names = [m[1] for m in matches]
+        fail("class_not_found",
+             f"ambiguous activity name '{activity_name}', "
+             f"matches: {', '.join(names)}")
+
+    page.select_option(SEL_ACTIVITY_TYPE, value=matches[0][0])
+    page.wait_for_load_state("networkidle")
+
+    page.fill(SEL_DATE_FROM, date)
+    page.fill(SEL_DATE_TO, date)
+
+    page.click(SEL_SEARCH_BTN)
+    try:
+        page.wait_for_url("**/mrmClassStatus.aspx", timeout=30000)
+    except PwTimeout:
+        fail("class_not_found", "search did not navigate to results page")
+
+
+def select_and_book(page, start_time: str | None, allow_waitlist: bool) -> dict:
+    buttons = page.query_selector_all("input[data-qa-id^='button-ActivityID=']")
+    if not buttons:
+        fail("class_not_found", "no bookable classes found in search results")
+
+    target = None
+    target_qa_id = ""
+    for btn in buttons:
+        qa_id = btn.get_attribute("data-qa-id") or ""
+        if start_time:
+            time_match = re.search(r"Date=\d{2}/\d{2}/\d{4}\s+(\d{2}:\d{2})", qa_id)
+            if time_match and time_match.group(1) == start_time:
+                target = btn
+                target_qa_id = qa_id
+                break
+        else:
+            target = btn
+            target_qa_id = qa_id
+            break
+
+    if not target:
+        fail("class_not_found", f"no class found at {start_time}")
+
+    btn_class = target.get_attribute("class") or ""
+    is_waitlist = "btn-wait" in btn_class
+    btn_value = target.get_attribute("value") or ""
+
+    if is_waitlist and not allow_waitlist:
+        fail("class_full", f"{btn_value} — waitlist available but allow_waitlist=false")
+
+    duration_match = re.search(r"Duration=(\d+)", target_qa_id)
+    date_match = re.search(r"Date=(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})", target_qa_id)
+
+    spaces = None
+    row = target.evaluate_handle("el => el.closest('tr') || el.parentElement")
+    if row:
+        avail_btn = row.as_element().query_selector("input[id$='_btnAvaliable']")
+        if avail_btn:
+            avail_text = avail_btn.get_attribute("value") or ""
+            spaces_match = re.search(r"(\d+)\s+space", avail_text)
+            if spaces_match:
+                spaces = int(spaces_match.group(1))
+
+    target.click()
+
+    try:
+        page.wait_for_url("**/mrmConfirmBooking.aspx", timeout=30000)
+    except PwTimeout:
+        fail("session_expired", "did not reach confirmation page")
+
+    if page.query_selector("input[id*='payment'], input[id*='Payment'], .payment-form"):
+        fail("booking_rejected", "payment step encountered — not yet supported")
+
+    confirm_btn = page.query_selector(SEL_CONFIRM_BOOK)
+    if not confirm_btn:
+        fail("unexpected_dom", "confirm booking button not found")
+    confirm_btn.click()
+
+    try:
+        page.wait_for_url("**/mrmBookingConfirmed.aspx", timeout=30000)
+    except PwTimeout:
+        fail("booking_rejected", "did not reach booking confirmed page")
+
+    confirmation_text = ""
+    conf_el = page.query_selector("#ctl00_MainContent_lblConfirmationMessage, .confirmation-message, h1 + p strong")
+    if conf_el:
+        confirmation_text = conf_el.text_content().strip()
+
+    iso_date = ""
+    matched_time = ""
+    if date_match:
+        d, m, y = date_match.group(1).split("/")
+        iso_date = f"{y}-{m}-{d}"
+        matched_time = date_match.group(2)
+
+    result = {
+        "status": "waitlisted" if is_waitlist else "booked",
+        "waitlisted": is_waitlist,
+        "date": iso_date,
+        "start_time": matched_time,
+        "duration_minutes": int(duration_match.group(1)) if duration_match else None,
+        "spaces_remaining": spaces if not is_waitlist else None,
+        "confirmation_text": confirmation_text,
+    }
+    return result
+
+
+def main() -> None:
+    params = read_params()
+    creds = read_creds()
+
+    activity_name = params["activity_name"]
+    centre = params["centre"]
+    date = params["date"]
+    start_time = params.get("start_time")
+    allow_waitlist = params.get("allow_waitlist", True)
+
+    centre_info = CENTRES.get(centre)
+    if not centre_info:
+        fail("class_not_found", f"unknown centre: {centre}")
+    centre_code, centre_display = centre_info
+
+    try:
+        pw = sync_playwright().start()
+    except Exception as exc:
+        fail("unexpected_dom", f"playwright_init: {type(exc).__name__}: {exc}")
+
+    try:
+        browser = pw.chromium.launch(headless=True, channel="chrome")
+    except Exception as exc:
+        pw.stop()
+        fail("unexpected_dom", f"browser_launch: {type(exc).__name__}: {exc}")
+
+    page = browser.new_page(viewport={"width": 1280, "height": 900})
+    try:
+        login(page, creds)
+        search_classes(page, centre_code, activity_name, date)
+        result = select_and_book(page, start_time, allow_waitlist)
+        result["activity_name"] = activity_name
+        result["centre"] = centre_display
+        json.dump(result, sys.stdout)
+        sys.stdout.flush()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        fail("unexpected_dom", f"{type(exc).__name__}: {exc}")
+    finally:
+        browser.close()
+        pw.stop()
+
+
+if __name__ == "__main__":
+    main()

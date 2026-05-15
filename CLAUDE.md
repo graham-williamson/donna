@@ -169,6 +169,7 @@ When I try to call a medium-risk MCP tool (`gmail.create_draft`, `gcal.create_ev
 | `mcp__claude_ai_Gmail__create_draft` | `gmail.create_draft` |
 | `mcp__claude_ai_Google_Calendar__create_event` | `gcal.create_event` |
 | `mcp__plugin_Notion_notion__notion-create-pages` | `notion.create_pages` |
+| `mcp__plugin_Notion_notion__notion-create-database` | `notion.create_database` |
 | `mcp__plugin_Notion_notion__notion-update-page` | `notion.update_page` |
 
 If I want to do something medium-risk and there's no matching capability in the table, I tell Graham rather than try a workaround: *"Chief, there's no capability for `<tool>` yet — want me to add one to capabilities.yaml?"*
@@ -177,6 +178,114 @@ If I want to do something medium-risk and there's no matching capability in the 
 
 The Telegram daemon routes my output to Graham ONLY through the `reply` MCP tool. If I write a text response in my transcript without wrapping it in a `reply` call, Graham sees nothing. Every response intended for Graham — answers, confirmations, follow-up questions, broker-approval nudges — goes through `reply`. Reactions alone don't count. A react without a following `reply` leaves Graham with just an emoji.
 
-### Activates in Phase 2+
+### Subprocess executor flow — capabilities that don't use MCP tools
 
-Executor abort awareness and capability-specific rules come online alongside their executors. Each capability's behavioural rules get added to this section when the capability itself ships.
+Some capabilities run as subprocess executors (browser automation, CLI tools) rather than MCP tools. These bypass the hook entirely — there's no MCP tool call to block. The full flow happens through the broker:
+
+1. **Request approval** the same way as MCP tools — `donna-broker request` with `capability`, `params`, `context_reason`.
+2. **After Graham approves, call `execute`** — `donna-broker execute '{"approval_code":"<code>"}'`.
+3. **The broker spawns the subprocess**, passes credentials via an inherited pipe fd, waits for the result, and returns it directly in the `execute` response.
+4. **Report the result to Graham.** The execute response contains the executor's JSON output — surface it in plain English.
+
+No MCP tool call needed. No hook interaction. The broker does everything.
+
+#### Subprocess capability mapping
+
+| Capability | What it does |
+|---|---|
+| `everyone_active.book_class` | Books a gym class at Everyone Active via browser automation |
+
+### Everyone Active class booking — capability rules
+
+**Capability:** `everyone_active.book_class`
+**Executor:** Playwright browser automation using system Chrome (`channel="chrome"`, headless). The Playwright-bundled Chromium crashes under the donna-broker service account (macOS SIGTRAP — service accounts lack GUI session context). System Chrome at `/Applications/Google Chrome.app` works because it's properly signed and entitled. Do NOT change the executor to use Playwright's bundled Chromium — it will crash. If Chrome is uninstalled or updated and breaks, that's the first thing to check.
+**Centres:** Chesham Leisure Centre (`chesham`), Chilterns Lifestyle Centre (`chilterns`)
+
+**Parameters:**
+- `activity_name` (required) — activity type as shown on EA timetable (e.g. "Swimming Sessions")
+- `centre` (required) — `chesham` or `chilterns`
+- `date` (required) — ISO date, e.g. `2026-04-30`
+- `start_time` (optional) — `HH:MM`, e.g. `09:00`. If omitted, books the first matching class.
+- `allow_waitlist` (optional, default true) — if false, fails with `class_full` instead of joining waitlist.
+
+**Success result fields:** `status` (booked/waitlisted), `date`, `start_time`, `duration_minutes`, `spaces_remaining`, `confirmation_text`, `activity_name`, `centre`.
+
+**Error codes and what to tell Graham:**
+- `login_failed` — "EA login didn't work — credentials might need updating."
+- `class_not_found` — "Couldn't find that class. Check the name/date/time."
+- `class_full` — "Class is full and waitlist was disabled."
+- `booking_rejected` — "EA rejected the booking (might need payment or have a restriction)."
+- `session_expired` — "Session timed out mid-booking. Want me to try again?"
+- `site_unavailable` — "EA website isn't responding."
+- `unexpected_dom` — "Something changed on the EA website — the executor needs updating."
+
+**Behavioural rules:**
+- When Graham says "book me into X" — use the broker request flow. Don't guess parameters; confirm the class, centre, and date if ambiguous.
+- After a successful booking, offer to check Graham's email for the EA confirmation.
+- If `unexpected_dom` comes back, tell Graham the website layout may have changed and the executor might need a recon update.
+- Approval window is 2 hours, execution window is 1 hour. If Graham approves but doesn't trigger execute quickly, the window may close.
+
+### Activates later
+
+Additional executor capabilities and their rules get added here as they ship.
+
+## Donna's Long-Term Memory (SQLite)
+
+A SQLite database at `data/donna-memory.db` for granular facts, routine logs, and knowledge that doesn't need to be in every conversation's context. Token-efficient: store thousands of entries, query only what's relevant.
+
+**When to use this vs other storage:**
+- **Memory files** (`~/.claude/projects/.../memory/`) — persona, preferences, workflow rules. Always loaded. Keep small.
+- **SQLite memory** — operational facts, routine logs, things said/sent, granular knowledge. Never loaded until queried. Scales indefinitely.
+- **Notion** — polished content Graham browses. Donna's Desk, exercise plans, project trackers.
+
+**Categories to use:**
+- `motivation` — inspirational messages sent, to avoid repeats
+- `fitness` — workout logs, progress notes
+- `people` — facts about people Graham mentions (birthdays, preferences)
+- `preferences` — things Graham likes/dislikes mentioned in passing
+- `routines` — routine execution logs (what was sent, when)
+- `conversations` — key facts from Telegram chats worth remembering long-term
+- New categories as needed — use lowercase, underscores, descriptive names.
+
+**Writing entries (use a JSON file to avoid shell metachar issues):**
+
+1. Write a JSON file with the Write tool:
+   ```json
+   {"category": "motivation", "content": "The obstacle is the way",
+    "subcategory": "stoicism", "tags": ["resilience"],
+    "metadata": {"source": "values"}}
+   ```
+   Save to `/tmp/donna-mem-<unique-id>.json`
+
+2. Run: `python3 tools/donna-memory.py add /tmp/donna-mem-<id>.json`
+
+   Deduplicates automatically by content hash within category.
+
+**Querying entries:**
+- `python3 tools/donna-memory.py query --category motivation --limit 10` — recent entries in a category
+- `python3 tools/donna-memory.py query --category motivation --since 30` — last 30 days
+- `python3 tools/donna-memory.py search --text obstacle --limit 20` — full-text search
+- `python3 tools/donna-memory.py recent --limit 5` — most recent across all categories
+- `python3 tools/donna-memory.py stats` — entry counts by category
+- `python3 tools/donna-memory.py categories` — list all categories with counts
+
+**Rules:**
+- Write throughout the day as useful facts come up — the cost is zero until queried.
+- Query narrowly — `--category` and `--since` keep result sets small.
+- Don't duplicate what's in memory files or Notion. This is for volume.
+- Content that Graham would want to browse himself belongs in Notion, not here.
+
+## Morning Routines
+
+Donna runs morning routines via the local Telegram daemon scheduler. Each routine is a scheduled job that fires at a set time, composes a message using data from Notion and the SQLite memory, and sends it via Telegram.
+
+**Pattern for creating a morning routine:**
+1. Create a CronCreate job with the schedule and a prompt describing what to do
+2. The prompt should specify: what data to fetch (Notion pages, memory queries), how to compose the message, and what to log to SQLite memory after sending
+3. Log every sent message to SQLite memory (category `routines` or a routine-specific category like `motivation`) so future runs can check for repeats
+
+**Active routines:**
+
+- **Morning Motivation + Exercise Plan** — fires daily, reads Graham's values from Donna's Desk in Notion, queries SQLite for recently sent motivational messages (avoid repeats), fetches the day's exercise plan from the Exercise System Master Plan (Notion ID: 3494dc8bb6d8811fb759c2e128886ff8), composes a combined message, sends via Telegram, logs the motivational sentence to SQLite (`category: motivation`).
+
+**Creating new routines:** Graham may ask for new scheduled messages. Follow the same pattern: CronCreate with a descriptive prompt, read from appropriate data sources, send via Telegram, log to SQLite. Keep prompts self-contained so the routine works across daemon restarts.

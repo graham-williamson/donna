@@ -1,5 +1,14 @@
 {
   "enabledPlugins": {
     "brightdata-plugin@claude-plugins-official": true
+  },
+  "permissions": {
+    "allow": [
+      "Bash(cat *)",
+      "Bash(grep *)",
+      "Bash(ls *)",
+      "Read(/Users/grahamwilliamson/donna/broker)",
+      "Read"
+    ]
   }
 }
