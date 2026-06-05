@@ -82,6 +82,23 @@ We **lift TradeAlly's proven, working code and patterns** where they fit, and **
 - **Hard broker, not prompt-authority.** TradeAlly trusts prompt-written authority tables; we use the injection-resistant capability-guard broker.
 - **No bidirectional Notion sync.** TradeAlly pushes insights to Notion; we keep local memory as the single source of truth and feed Notion one-way only (§3.2).
 
+### 2.5 ICM layer alignment (TradeAlly's Interpretable Context Methodology)
+
+TradeAlly defines agents with a documented 5-layer ICM model (`_shared/_context/icm-layer-conventions.md`). We adopt its principles where the one-daemon model fits, and diverge where it doesn't:
+
+| ICM Layer | Question | Personal system | Status |
+|---|---|---|---|
+| **0 — Identity** | who am I? | per-persona `personas/<id>/PERSONA.md` | ✅ adopted |
+| **1 — Routing** | where do I go? | centralized `tools/dispatch.py` (routes *between* personas, not per-persona self-routing) | ⚠️ deliberately collapsed — one daemon, one shared dispatcher |
+| **2 — Stage contract** | what do I do? | per-ritual `SKILL.md` with INPUTS / PROCESS / OUTPUTS | 🔜 **adopt from Plan 5 onward** |
+| **3 — Reference** | what rules apply? | `_shared/_policies/` (e.g. `recall-topics.json`); persona methods embedded inline at this scale | ◑ partial |
+| **4 — Working** | what am I working with? | `pmem` memory floor + `_shared/_state/` (`active_voice.json`, later `goals.json`) + agent-mail (later) | ✅ core present |
+
+**Commitments:**
+- Every ritual/workflow (morning check-in, weekly review, …) is built as a **Layer-2 stage contract** (INPUTS / PROCESS / OUTPUTS), per ICM. The morning check-in (Plan 5) is the first.
+- Add a thin per-persona **capability manifest** when wiring the broker — declaring which broker capabilities each voice may reach (the Layer-1 capability-declaration role, minus the routing).
+- We forgo ICM's selective-layer loading (~80% token saving) at v1 scale — four short overlays load whole. Revisit if overlays grow heavy.
+
 ---
 
 ## 3. The Brain — memory substrate (THE key system)
