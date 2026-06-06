@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Daruma board dashboard — coloured goal dolls with fillable eyes, an
-Atomic-Habits panel with streaks, a context-efficiency (token) panel, and a
-daemon model switcher + restart button (so you never touch bash for it).
+"""Daruma board dashboard — a calm, Japanese-themed local board.
+
+Three themes: washi 和 / sakura 桜 (light) and twilight temple 月 (dark mode).
+Goals are daruma with fillable eyes; wishes hang on an ema wall; wins rest in
+the tokonoma. Plus habits with streaks, a context-efficiency (token) panel,
+an incense focus timer, and a daemon model switcher + restart button.
 
 Launch on demand (NOT a daemon):  python3 tools/dashboard.py
-Serves on http://localhost:8765. Reads/writes via goals.py, habits.py; reads
-tokens.py; switches the daemon model via the launchd plist + launchctl.
+Serves on http://localhost:8765. Reads/writes via goals.py, habits.py,
+wishes.py; reads tokens.py and evidence.py; switches the daemon model via the
+launchd plist + launchctl. Static assets live in tools/dashboard_assets/.
 """
 import os
 import json
@@ -126,16 +130,37 @@ def _esc(s):
 
 def _daruma_svg(colour, state):
     hexc = COLOUR_HEX.get(colour, "#888888")
-    left = '<circle cx="34" cy="48" r="4.5" fill="#111"/>' if state in ("left", "both") else ""
-    right = '<circle cx="58" cy="48" r="4.5" fill="#111"/>' if state == "both" else ""
+    left = '<circle cx="38" cy="50" r="4.6" fill="#111"/>' if state in ("left", "both") else ""
+    right = '<circle cx="58" cy="50" r="4.6" fill="#111"/>' if state == "both" else ""
     return (
-        f'<svg width="96" height="108" viewBox="0 0 96 108" data-state="{state}">'
-        f'<ellipse cx="48" cy="60" rx="42" ry="46" fill="{hexc}" stroke="#2a1f1f" stroke-width="2.5"/>'
-        f'<ellipse cx="48" cy="54" rx="26" ry="28" fill="#f6efe1"/>'
-        f'<circle cx="34" cy="48" r="9" fill="#fff" stroke="#2a1f1f" stroke-width="1.6"/>'
-        f'<circle cx="58" cy="48" r="9" fill="#fff" stroke="#2a1f1f" stroke-width="1.6"/>'
+        f'<svg class="daruma" width="96" height="106" viewBox="0 0 96 106" data-state="{state}">'
+        # round-bottomed okiagari body
+        f'<path d="M48 5 C71 5 89 27 89 59 C89 87 72 99 48 99 C24 99 7 87 7 59 C7 27 25 5 48 5 Z" '
+        f'fill="{hexc}" stroke="#241a16" stroke-width="2"/>'
+        # soft top light + ground shadow (no gradient ids, safe to repeat per card)
+        f'<ellipse cx="38" cy="30" rx="24" ry="16" fill="#fff" opacity=".14"/>'
+        f'<ellipse cx="48" cy="88" rx="30" ry="9" fill="#000" opacity=".10"/>'
+        # cream face patch
+        f'<path d="M48 22 C61 22 69 33 69 47 C69 63 60 72 48 72 C36 72 27 63 27 47 C27 33 35 22 48 22 Z" '
+        f'fill="#f6efdd"/>'
+        # gold flourishes framing the face
+        f'<path d="M28 40 q-5 6 -3 13 M68 40 q5 6 3 13" stroke="#caa64b" stroke-width="2" '
+        f'fill="none" opacity=".9"/>'
+        # ink brows (crane strokes)
+        f'<path d="M30 37 q7 -6 15 -2" stroke="#241a16" stroke-width="3" fill="none" stroke-linecap="round"/>'
+        f'<path d="M51 35 q8 -4 15 2" stroke="#241a16" stroke-width="3" fill="none" stroke-linecap="round"/>'
+        # eye whites + pupils (the contract: pupils are the only fill="#111")
+        f'<ellipse cx="38" cy="50" rx="8" ry="8.6" fill="#fff" stroke="#241a16" stroke-width="1.6"/>'
+        f'<ellipse cx="58" cy="50" rx="8" ry="8.6" fill="#fff" stroke="#241a16" stroke-width="1.6"/>'
         f'{left}{right}'
-        f'<path d="M40 70 q8 7 16 0" stroke="#2a1f1f" stroke-width="1.6" fill="none"/>'
+        # nose, moustache (tortoise whiskers), mouth
+        f'<path d="M46 56 q2 2 4 0" stroke="#241a16" stroke-width="1.4" fill="none"/>'
+        f'<path d="M40 62 q-7 5 -12 3 M56 62 q7 5 12 3" stroke="#241a16" stroke-width="1.8" '
+        f'fill="none" stroke-linecap="round"/>'
+        f'<path d="M43 67 q5 4 10 0" stroke="#241a16" stroke-width="1.8" fill="none" stroke-linecap="round"/>'
+        # gold belly kanji 福 (fortune)
+        f'<text x="48" y="92" text-anchor="middle" font-size="11" fill="#caa64b" '
+        f'font-family="Hiragino Mincho ProN,serif">福</text>'
         f'</svg>'
     )
 
@@ -146,14 +171,64 @@ def _goal_card(g):
     done_d = (g.get("achieved_at") or "—")[:10]
     won = g.get("daruma_state") == "both"
     return (
-        f'<div class="card {"won" if won else ""}">{svg}'
-        f'<div class="meta"><h3>{g["title"]}</h3>'
-        f'<p class="why">{g.get("why_it_matters", "")}</p>'
+        f'<div class="card goal {"won" if won else ""}" data-goal-id="{g["id"]}">{svg}'
+        f'<div class="meta"><h3>{_esc(g["title"])}</h3>'
+        f'<p class="why">{_esc(g.get("why_it_matters", ""))}</p>'
         f'<p class="track"><span class="pill {g["colour"]}"></span> {g["colour"]}'
         f' · {g["owner"]} · set {set_d} · done {done_d}</p>'
         f'<div class="actions"><a href="/commit?id={g["id"]}">◑ commit</a>'
         f'<a href="/achieve?id={g["id"]}">● achieve</a></div></div></div>'
     )
+
+
+def _swatches(checked="red"):
+    out = ""
+    for c, hx in COLOUR_HEX.items():
+        chk = " checked" if c == checked else ""
+        out += (f'<label class="swatch" title="{c}">'
+                f'<input type="radio" name="colour" value="{c}"{chk}>'
+                f'<span style="--c:{hx}"></span></label>')
+    return f'<div class="swatches">{out}</div>'
+
+
+def _goal_form():
+    return (
+        '<details class="adder"><summary>＋ new daruma</summary>'
+        '<form method="post" action="/add-goal">'
+        '<input name="title" placeholder="the goal" required maxlength="120">'
+        '<input name="why" placeholder="why it matters" maxlength="200">'
+        + _swatches() +
+        '<button type="submit">place on the board</button></form></details>'
+    )
+
+
+EMA_TILTS = ["-2.2deg", "1.6deg", "-1.1deg", "2.4deg", "-1.8deg"]
+
+
+def _ema(w, i=0):
+    tilt = EMA_TILTS[i % len(EMA_TILTS)]
+    return (
+        f'<div class="ema" style="--tilt:{tilt}">'
+        f'<p class="ema-text">{_esc(w["text"])}</p>'
+        f'<p class="ema-date">{(w.get("created_at") or "")[:10]}</p>'
+        f'<details class="ema-promote"><summary>→ daruma</summary>'
+        f'<form method="post" action="/promote-wish">'
+        f'<input type="hidden" name="id" value="{w["id"]}">'
+        + _swatches() +
+        f'<button type="submit">commit to it</button></form></details>'
+        f'<a class="ema-release" href="/release-wish?id={w["id"]}" '
+        f'title="let this wish go">release</a></div>'
+    )
+
+
+def _ema_wall(wishes):
+    plaques = "".join(_ema(w, i) for i, w in enumerate(wishes)) \
+        or '<p class="sub">No wishes hung yet.</p>'
+    form = ('<details class="adder"><summary>＋ hang a wish</summary>'
+            '<form method="post" action="/add-wish">'
+            '<input name="text" placeholder="one day…" required maxlength="160">'
+            '<button type="submit">hang it</button></form></details>')
+    return f'<div class="ema-rail"></div><div class="ema-wall">{plaques}</div>{form}'
 
 
 def _habit_card(h):
@@ -165,10 +240,48 @@ def _habit_card(h):
     return (
         f'<div class="card habit{" done-today" if done else ""}">'
         f'<div class="streak">{flames}</div>'
-        f'<div class="meta"><h3>{h["name"]}</h3>'
-        f'<p class="identity">{h.get("identity", "")}</p>'
-        f'<p class="track">cue: {h.get("cue", "")} · {h.get("owner", "")}</p>'
+        f'<div class="meta"><h3>{_esc(h["name"])}</h3>'
+        f'<p class="identity">{_esc(h.get("identity", ""))}</p>'
+        f'<p class="track">cue: {_esc(h.get("cue", ""))} · {_esc(h.get("owner", ""))}</p>'
         f'<div class="actions">{tick}</div></div></div>'
+    )
+
+
+def _habit_form():
+    return (
+        '<details class="adder"><summary>＋ new habit</summary>'
+        '<form method="post" action="/add-habit">'
+        '<input name="name" placeholder="the habit" required maxlength="80">'
+        '<input name="identity" placeholder="I am someone who…" required maxlength="160">'
+        '<input name="cue" placeholder="cue (when I…)" maxlength="120">'
+        '<button type="submit">begin the chain</button></form></details>'
+    )
+
+
+def _tokonoma(wins):
+    if not wins:
+        return '<p class="sub">The alcove awaits its first treasure.</p>'
+    items = "".join(
+        f'<div class="treasure"><span class="treasure-mark">◆</span>'
+        f'<p>{_esc(w.get("content", ""))}</p>'
+        f'<span class="treasure-date">{(w.get("created_at") or "")[:10]}</span></div>'
+        for w in wins)
+    return f'<div class="tokonoma">{items}</div>'
+
+
+def _incense():
+    return (
+        '<div class="card incense" id="incense">'
+        '<div class="incense-holder"><div class="incense-stick">'
+        '<div class="incense-burn"></div><div class="incense-tip"></div></div>'
+        '<div class="incense-smoke"><span></span><span></span><span></span></div></div>'
+        '<div class="meta"><h3>Incense focus</h3>'
+        '<p class="why">Light a stick. Work until it burns down.</p>'
+        '<div class="actions incense-controls">'
+        '<button data-incense="25">25 min</button>'
+        '<button data-incense="50">50 min</button>'
+        '<button data-incense-stop hidden>extinguish</button>'
+        '<b class="incense-left" hidden></b></div></div></div>'
     )
 
 
@@ -231,43 +344,62 @@ def _model_panel(current):
     )
 
 
-STYLE = """
-:root{--ink:#2a1f1f;--paper:#efe7d6}*{box-sizing:border-box}
-body{font-family:-apple-system,system-ui,"Hiragino Sans",sans-serif;color:var(--ink);
- background:radial-gradient(circle at 20% 0%,#f6efe1,var(--paper));margin:0;padding:32px 18px;max-width:780px;margin-inline:auto}
-h1{margin:0 0 4px}.sub{color:#8a7d6a;margin:0 0 22px}
-h2{font-size:14px;text-transform:uppercase;letter-spacing:2px;color:#8a7d6a;border-bottom:1px solid #d8ccb6;padding-bottom:6px;margin:30px 0 14px}
-.card{display:flex;gap:18px;align-items:center;background:#fffdf8;border:1px solid #e6dcc6;border-radius:16px;padding:18px;margin:12px 0;box-shadow:0 2px 10px rgba(60,40,20,.06)}
-.card.won{background:linear-gradient(#fffdf8,#f3f8ee);border-color:#cfe6c4}
-.card.done-today{background:linear-gradient(#fffdf8,#f0f4fb)}
-.meta{flex:1}.meta h3{margin:0 0 4px;font-size:17px}
-.why,.identity{color:#6b5d49;margin:0 0 7px}.identity{font-style:italic}
-.track{color:#9a8c76;font-size:12.5px;margin:0 0 9px}.track b{color:#5b4d39}.track b.hot{color:#c0392b}
-.pill{display:inline-block;width:11px;height:11px;border-radius:50%;vertical-align:-1px}
-.pill.green{background:#2e7d32}.pill.purple{background:#6a1b9a}.pill.red{background:#c62828}
-.pill.black{background:#212121}.pill.pink{background:#d81b60}.pill.gold{background:#f9a825}
-.pill.white{background:#fafafa;border:1px solid #ccc}.pill.blue{background:#1565c0}
-.actions a,.ticked,.cur{font-size:13px;text-decoration:none;color:#6a1b9a;margin-right:14px}
-.actions.big a,.actions.big .cur{font-size:15px;font-weight:600}
-.cur{color:#2e7d32}.actions a:hover{text-decoration:underline}.ticked{color:#2e7d32}
-.restart{color:#c0392b}.streak{min-width:74px;text-align:center;font-size:15px;font-weight:600;color:#c0532a}
-.recent{margin:6px 0 0;padding-left:18px;color:#9a8c76;font-size:12px}.recent li{margin:2px 0}
-"""
+# Inline theme boot — runs before first paint so there is no flash of wrong theme.
+BOOT_JS = (
+    "(function(){try{var t=localStorage.getItem('daruma-theme')||"
+    "(matchMedia('(prefers-color-scheme: dark)').matches?'twilight':"
+    "(localStorage.getItem('daruma-light-pref')||'washi'));"
+    "document.documentElement.dataset.theme=t;}catch(e){"
+    "document.documentElement.setAttribute('data-theme','washi');}})();"
+)
 
 
-def render_board(goals, habits=None, tokens=None, model=None):
-    s = "<h1>🎯 Daruma Board</h1><p class='sub'>One eye to commit. One eye to arrive.</p>"
-    s += "<h2>Goals</h2>" + ("\n".join(_goal_card(g) for g in goals) or "<p class='sub'>No goals yet.</p>")
+def render_board(goals, habits=None, tokens=None, model=None, wishes=None,
+                 wins=None, today=None, celebrate=None, error=None):
+    today = today or date.today()
+    season = season_for(today)
+    zen = zen_for(today)
+    err = f'<p class="notice">{_esc(error)}</p>' if error else ""
+    s = (
+        '<header class="masthead"><div>'
+        '<h1><span class="kanji">達磨</span> Daruma Board</h1>'
+        f'<p class="sub season">{season["kanji"]} — {season["english"]}'
+        ' · one eye to commit, one eye to arrive</p></div>'
+        '<div class="theme-controls" role="group" aria-label="theme">'
+        '<button data-theme-btn="washi" title="Washi — paper and ink">和</button>'
+        '<button data-theme-btn="sakura" title="Sakura — blossom and koi">桜</button>'
+        '<button data-theme-btn="twilight" title="Twilight temple — dark">月</button>'
+        '</div></header>' + err +
+        f'<section class="zen"><p class="zen-text">{_esc(zen["text"])}</p>'
+        f'<p class="zen-by">{_esc(zen.get("by", ""))}</p></section>'
+    )
+    s += "<h2>Goals</h2>" + ("\n".join(_goal_card(g) for g in goals)
+                             or "<p class='sub'>No goals yet.</p>")
+    s += _goal_form()
+    if wishes is not None:
+        s += '<h2>Ema Wall <span class="jp">絵馬</span></h2>' + _ema_wall(wishes)
     if habits:
         s += "<h2>Habits</h2>" + "\n".join(_habit_card(h) for h in habits)
+    s += _habit_form()
+    if wins is not None:
+        s += '<h2>Tokonoma <span class="jp">床の間</span></h2>' + _tokonoma(wins)
+    s += '<h2>Focus <span class="jp">線香</span></h2>' + _incense()
     if tokens is not None:
         s += "<h2>Context efficiency</h2>" + _token_panel(tokens)
     if model is not None:
         s += "<h2>Daemon</h2>" + _model_panel(model)
-    return (f"<!doctype html><html><head><meta charset='utf-8'>"
-            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            f"<meta http-equiv='refresh' content='30'>"
-            f"<title>Daruma Board</title><style>{STYLE}</style></head><body>{s}</body></html>")
+    cel = f' data-celebrate="{_esc(celebrate)}"' if celebrate else ""
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<script>{BOOT_JS}</script>"
+        "<link rel='stylesheet' href='/static/style.css'>"
+        "<title>達磨 Daruma Board</title></head>"
+        f"<body{cel}><canvas id='particles'></canvas>"
+        "<div class='koi-layer' aria-hidden='true'></div>"
+        f"<main>{s}</main>"
+        "<script src='/static/board.js'></script></body></html>"
+    )
 
 
 def _mod(name):
@@ -278,7 +410,6 @@ def _mod(name):
 
 
 def _enriched_habits():
-    from datetime import date
     h = _mod("habits")
     return [{**hb, "streak": h.streak(hb["id"]),
              "done_today": date.today().isoformat() in hb.get("log", [])}

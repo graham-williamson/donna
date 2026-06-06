@@ -78,3 +78,31 @@ def test_zen_deterministic_per_day():
     a = dash.zen_for(date(2026, 6, 6))
     assert a == dash.zen_for(date(2026, 6, 6))
     assert a["text"]
+
+
+def test_render_new_sections_and_assets():
+    dash = load_dashboard()
+    page = dash.render_board(
+        [{"id": 1, "title": "x", "colour": "green", "owner": "nike", "daruma_state": "left"}],
+        wishes=[{"id": 1, "text": "Daru SaaS", "created_at": "2026-06-06T00:00:00Z", "status": "open"}],
+        wins=[{"content": "Achieved goal: Run 10k", "created_at": "2026-06-01T00:00:00Z"}],
+        today=date(2026, 6, 12))
+    assert 'data-theme-btn="twilight"' in page                      # theme switcher
+    assert "絵馬" in page and "Daru SaaS" in page                    # ema wall
+    assert "床の間" in page and "Run 10k" in page                    # tokonoma
+    assert 'action="/add-goal"' in page and 'action="/add-wish"' in page
+    assert 'action="/add-habit"' in page and 'action="/promote-wish"' in page
+    assert "/static/style.css" in page and "/static/board.js" in page
+    assert "腐草為螢" in page                                        # season subtitle
+    assert "incense" in page                                         # focus timer block
+
+
+def test_render_celebrate_flag_and_escaping():
+    dash = load_dashboard()
+    page = dash.render_board(
+        [{"id": 7, "title": "<script>alert(1)</script>", "colour": "red",
+          "owner": "shared", "daruma_state": "none"}],
+        celebrate=7, today=date(2026, 6, 12))
+    assert 'data-celebrate="7"' in page
+    assert "<script>alert(1)</script>" not in page
+    assert "&lt;script&gt;" in page
