@@ -211,3 +211,20 @@ def test_main_board_is_zen_panels_live_on_engawa(server):
     assert 'href="/engawa"' in main_page          # quiet doorway in the footer
     engawa = urllib.request.urlopen(server + "/engawa").read().decode()
     assert "Daemon model" in engawa and "Context efficiency" in engawa
+
+
+# ---- polish round: reference-grade daruma + selection meanings ----
+
+def test_daruma_belly_kanji_carries_meaning():
+    dash = load_dashboard()
+    green = dash.render_board([{"id": 1, "title": "x", "colour": "green",
+                                "owner": "nike", "daruma_state": "none"}])
+    purple = dash.render_board([{"id": 1, "title": "x", "colour": "purple",
+                                 "owner": "esme", "daruma_state": "none"}])
+    assert "健" in green and "志" in purple
+
+
+def test_swatch_shows_selected_meaning():
+    dash = load_dashboard()
+    page = dash.render_board([])
+    assert '<em class="meaning">' in page and "love & connection" in page

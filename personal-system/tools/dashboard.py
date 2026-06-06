@@ -128,39 +128,50 @@ def _esc(s):
     return html.escape(str(s or ""), quote=True)
 
 
+GOLD = "#f0c25c"
+
+# The belly kanji IS the colour's meaning, brushed onto the doll itself.
+COLOUR_KANJI = {
+    "red": "福", "gold": "富", "white": "始", "black": "守",
+    "green": "健", "purple": "志", "pink": "愛", "blue": "学",
+}
+_SVG_BODY = {"white": "#efece3"}   # a pure-white body would swallow the mask
+_SVG_DECO = {"gold": "#7c4a12"}    # gold brushwork needs contrast on a gold body
+
+
 def _daruma_svg(colour, state):
-    hexc = COLOUR_HEX.get(colour, "#888888")
-    left = '<circle cx="38" cy="50" r="4.6" fill="#111"/>' if state in ("left", "both") else ""
-    right = '<circle cx="58" cy="50" r="4.6" fill="#111"/>' if state == "both" else ""
+    body = _SVG_BODY.get(colour) or COLOUR_HEX.get(colour, "#888888")
+    deco = _SVG_DECO.get(colour, GOLD)
+    kanji = COLOUR_KANJI.get(colour, "福")
+    # eyes: a bold open ring until filled; pupils are the only fill="#111" (test contract)
+    left = ('<circle cx="38.5" cy="45" r="11.5" fill="#111"/>' if state in ("left", "both") else
+            '<circle cx="38.5" cy="45" r="9.5" fill="none" stroke="#1a1a1a" stroke-width="4.6"/>')
+    right = ('<circle cx="81.5" cy="45" r="11.5" fill="#111"/>' if state == "both" else
+             '<circle cx="81.5" cy="45" r="9.5" fill="none" stroke="#1a1a1a" stroke-width="4.6"/>')
     return (
-        f'<svg class="daruma" width="96" height="106" viewBox="0 0 96 106" data-state="{state}">'
-        # round-bottomed okiagari body
-        f'<path d="M48 5 C71 5 89 27 89 59 C89 87 72 99 48 99 C24 99 7 87 7 59 C7 27 25 5 48 5 Z" '
-        f'fill="{hexc}" stroke="#241a16" stroke-width="2"/>'
-        # soft top light + ground shadow (no gradient ids, safe to repeat per card)
-        f'<ellipse cx="38" cy="30" rx="24" ry="16" fill="#fff" opacity=".14"/>'
-        f'<ellipse cx="48" cy="88" rx="30" ry="9" fill="#000" opacity=".10"/>'
-        # cream face patch
-        f'<path d="M48 22 C61 22 69 33 69 47 C69 63 60 72 48 72 C36 72 27 63 27 47 C27 33 35 22 48 22 Z" '
-        f'fill="#f6efdd"/>'
-        # gold flourishes framing the face
-        f'<path d="M28 40 q-5 6 -3 13 M68 40 q5 6 3 13" stroke="#caa64b" stroke-width="2" '
-        f'fill="none" opacity=".9"/>'
-        # ink brows (crane strokes)
-        f'<path d="M30 37 q7 -6 15 -2" stroke="#241a16" stroke-width="3" fill="none" stroke-linecap="round"/>'
-        f'<path d="M51 35 q8 -4 15 2" stroke="#241a16" stroke-width="3" fill="none" stroke-linecap="round"/>'
-        # eye whites + pupils (the contract: pupils are the only fill="#111")
-        f'<ellipse cx="38" cy="50" rx="8" ry="8.6" fill="#fff" stroke="#241a16" stroke-width="1.6"/>'
-        f'<ellipse cx="58" cy="50" rx="8" ry="8.6" fill="#fff" stroke="#241a16" stroke-width="1.6"/>'
+        f'<svg class="daruma" width="104" height="90" viewBox="0 0 120 104" data-state="{state}">'
+        # wide, round-bottomed body — flat vector, no outline
+        f'<path d="M60 4 C92 4 114 25 114 57 C114 86 91 100 60 100 '
+        f'C29 100 6 86 6 57 C6 25 28 4 60 4 Z" fill="{body}"/>'
+        f'<ellipse cx="45" cy="22" rx="30" ry="12" fill="#fff" opacity=".12"/>'
+        f'<ellipse cx="60" cy="93" rx="44" ry="10" fill="#000" opacity=".07"/>'
+        # white goggle mask across both eyes
+        f'<circle cx="38.5" cy="45" r="25" fill="#fffdf7"/>'
+        f'<circle cx="81.5" cy="45" r="25" fill="#fffdf7"/>'
+        f'<rect x="38.5" y="22" width="43" height="46" fill="#fffdf7"/>'
         f'{left}{right}'
-        # nose, moustache (tortoise whiskers), mouth
-        f'<path d="M46 56 q2 2 4 0" stroke="#241a16" stroke-width="1.4" fill="none"/>'
-        f'<path d="M40 62 q-7 5 -12 3 M56 62 q7 5 12 3" stroke="#241a16" stroke-width="1.8" '
-        f'fill="none" stroke-linecap="round"/>'
-        f'<path d="M43 67 q5 4 10 0" stroke="#241a16" stroke-width="1.8" fill="none" stroke-linecap="round"/>'
-        # gold belly kanji 福 (fortune)
-        f'<text x="48" y="92" text-anchor="middle" font-size="11" fill="#caa64b" '
-        f'font-family="Hiragino Mincho ProN,serif">福</text>'
+        # gold brush flourishes flanking the belly
+        f'<path d="M26 66 q-9 11 -3 26" stroke="{deco}" stroke-width="5.6" '
+        f'stroke-linecap="round" fill="none"/>'
+        f'<path d="M36 69 q-7 9 -2 20" stroke="{deco}" stroke-width="4.8" '
+        f'stroke-linecap="round" fill="none"/>'
+        f'<path d="M94 66 q9 11 3 26" stroke="{deco}" stroke-width="5.6" '
+        f'stroke-linecap="round" fill="none"/>'
+        f'<path d="M84 69 q7 9 2 20" stroke="{deco}" stroke-width="4.8" '
+        f'stroke-linecap="round" fill="none"/>'
+        # the meaning, written on the belly
+        f'<text x="60" y="92" text-anchor="middle" font-size="27" font-weight="700" '
+        f'fill="{deco}" font-family="Hiragino Mincho ProN,Yu Mincho,serif">{kanji}</text>'
         f'</svg>'
     )
 
@@ -203,10 +214,12 @@ def _swatches(checked="red"):
     out = ""
     for c, hx in COLOUR_HEX.items():
         chk = " checked" if c == checked else ""
-        title = f'{c} — {COLOUR_MEANING.get(c, c)}'
-        out += (f'<label class="swatch" title="{title}">'
+        meaning = COLOUR_MEANING.get(c, c)
+        out += (f'<label class="swatch" title="{c} — {meaning}">'
                 f'<input type="radio" name="colour" value="{c}"{chk}>'
-                f'<span style="--c:{hx}"></span></label>')
+                f'<span style="--c:{hx}"></span>'
+                # only the checked swatch's meaning is shown (pure CSS)
+                f'<em class="meaning">{COLOUR_KANJI.get(c, "")} {meaning}</em></label>')
     return f'<div class="swatches">{out}</div>'
 
 
@@ -390,6 +403,17 @@ def _page(body, title="達磨 Daruma Board", celebrate=None):
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"<script>{BOOT_JS}</script>"
         "<link rel='stylesheet' href='/static/style.css'>"
+        # favicon: a tiny daruma, no asset file needed
+        "<link rel='icon' href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' "
+        "viewBox='0 0 120 104'><path d='M60 4 C92 4 114 25 114 57 C114 86 91 100 60 100 "
+        "C29 100 6 86 6 57 C6 25 28 4 60 4 Z' fill='%23c0392b'/>"
+        "<circle cx='38.5' cy='45' r='25' fill='%23fffdf7'/>"
+        "<circle cx='81.5' cy='45' r='25' fill='%23fffdf7'/>"
+        "<rect x='38.5' y='22' width='43' height='46' fill='%23fffdf7'/>"
+        "<circle cx='38.5' cy='45' r='11.5' fill='%23111111'/>"
+        "<circle cx='81.5' cy='45' r='9.5' fill='none' stroke='%23111111' stroke-width='4.6'/>"
+        "<text x='60' y='92' text-anchor='middle' font-size='27' font-weight='700' "
+        "fill='%23d8a94e' font-family='serif'>志</text></svg>\">"
         f"<title>{title}</title></head>"
         f"<body{cel}><canvas id='particles'></canvas>"
         "<div class='koi-layer' aria-hidden='true'></div>"
