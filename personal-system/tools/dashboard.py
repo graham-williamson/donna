@@ -73,27 +73,50 @@ def _habit_card(h):
     )
 
 
-def _token_panel(t):
-    if not t or not t.get("turns"):
-        return "<p class='sub'>No token data yet.</p>"
-    heavy = t["avg_fresh_input_per_turn"] >= 4000
-    verdict = ("⚠ heavy — context may be bloating; check the per-turn injection"
-               if heavy else "✓ lean — context cost is reasonable")
-    recent = "".join(
-        f"<li>{x['ctx']:,} ctx · {x['out']:,} out · "
-        f"{x['model'].split('-')[1] if '-' in x['model'] else x['model']}</li>"
-        for x in t.get("last", []))
-    models = ", ".join(
-        f"{(k.split('-')[1] if '-' in k else k)}×{v}" for k, v in t.get("by_model", {}).items())
+AGENT_GLYPH = {"donna": "💁‍♀️", "nike": "💪", "esme": "🌱", "bodhi": "🗻",
+               "unknown": "·", "cli": "🖥️"}
+
+
+def _models_str(by_model):
+    return ", ".join(
+        f"{(k.split('-')[1] if '-' in k else k)}×{v}" for k, v in (by_model or {}).items())
+
+
+def _agent_lines(by_agent):
+    rows = ""
+    for ag, d in (by_agent or {}).items():
+        if not d.get("turns"):
+            continue
+        g = AGENT_GLYPH.get(ag, "·")
+        rows += (f"<li>{g} <b>{ag}</b> · {d['turns']} turns · "
+                 f"ctx {d['avg_context_per_turn']:,} · fresh {d['avg_fresh_input_per_turn']:,} · "
+                 f"out {d['avg_output_per_turn']:,}</li>")
+    return f"<ul class='recent'>{rows}</ul>" if rows else ""
+
+
+def _chan_card(title, d):
+    if not d or not d.get("turns"):
+        return (f"<div class='card'><div class='meta'><h3>{title}</h3>"
+                f"<p class='sub'>No turns recorded yet.</p></div></div>")
+    heavy = d["avg_context_per_turn"] >= 60000 or d["avg_fresh_input_per_turn"] >= 5000
+    verdict = ("⚠ heavy — turns carry a lot of context; trim CLAUDE.md / history"
+               if heavy else "✓ lean — per-turn context is reasonable")
     return (
         f"<div class='card'><div class='meta'>"
-        f"<h3>Context efficiency · last {t['turns']} turns</h3>"
-        f"<p class='track'>avg context/turn <b>{t['avg_context_per_turn']:,}</b> · "
-        f"fresh input/turn <b class='{'hot' if heavy else ''}'>{t['avg_fresh_input_per_turn']:,}</b> · "
-        f"output/turn {t['avg_output_per_turn']:,} · cache hit {t['cache_hit_rate']}%</p>"
-        f"<p class='why'>{verdict} · models: {models}</p>"
-        f"<ul class='recent'>{recent}</ul></div></div>"
+        f"<h3>{title} · last {d['turns']} turns</h3>"
+        f"<p class='track'>avg context/turn <b>{d['avg_context_per_turn']:,}</b> · "
+        f"fresh input/turn <b class='{'hot' if heavy else ''}'>{d['avg_fresh_input_per_turn']:,}</b> · "
+        f"output/turn {d['avg_output_per_turn']:,} · cache hit {d['cache_hit_rate']}%</p>"
+        f"<p class='why'>{verdict} · models: {_models_str(d.get('by_model'))}</p>"
+        f"{_agent_lines(d.get('by_agent'))}</div></div>"
     )
+
+
+def _token_panel(summary):
+    if not summary:
+        return "<p class='sub'>No token data yet.</p>"
+    return (_chan_card("📱 Telegram — the live bot", summary.get("telegram"))
+            + _chan_card("🖥️ CLI — dev terminal", summary.get("cli")))
 
 
 def _model_panel(current):
@@ -144,6 +167,7 @@ def render_board(goals, habits=None, tokens=None, model=None):
         s += "<h2>Daemon</h2>" + _model_panel(model)
     return (f"<!doctype html><html><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"<meta http-equiv='refresh' content='30'>"
             f"<title>Daruma Board</title><style>{STYLE}</style></head><body>{s}</body></html>")
 
 
@@ -222,8 +246,9 @@ def serve(port=8765):
             if u.path == "/restart":
                 _restart_daemon()
                 return self._redirect()
+            model = _current_model()
             html = render_board(g.list_goals(), _enriched_habits(),
-                                tok.summary(recent=50), _current_model())
+                                tok.summary(recent=50), model)
             body = html.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -235,4 +260,10 @@ def serve(port=8765):
 
 
 if __name__ == "__main__":
-    serve()
+    import sys
+    # Optional port override (env or argv) so a second instance — e.g. a
+    # separate TradeAlly board — can run alongside this one on another port.
+    # Bound to 127.0.0.1, which is shared across all local macOS user
+    # accounts, so either account can view either board at localhost:<port>.
+    port = int(os.environ.get("DARUMA_PORT") or (sys.argv[1] if len(sys.argv) > 1 else 8765))
+    serve(port)

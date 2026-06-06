@@ -40,10 +40,21 @@ def test_render_habits_panel():
 def test_render_token_panel():
     dash = load_dashboard()
     html = dash.render_board([], None, {
-        "turns": 12, "avg_context_per_turn": 9000, "avg_fresh_input_per_turn": 5000,
-        "avg_output_per_turn": 300, "cache_hit_rate": 40, "by_model": {"claude-haiku-4-5": 12},
-        "last": [{"ctx": 9000, "out": 300, "model": "claude-haiku-4-5"}]})
-    assert "Context efficiency" in html and "9,000" in html and "heavy" in html
+        "telegram": {
+            "turns": 12, "avg_context_per_turn": 90000, "avg_fresh_input_per_turn": 6000,
+            "avg_output_per_turn": 300, "cache_hit_rate": 40,
+            "by_model": {"claude-haiku-4-5": 12},
+            "by_agent": {"nike": {
+                "turns": 5, "avg_context_per_turn": 90000, "avg_fresh_input_per_turn": 6000,
+                "avg_output_per_turn": 300, "cache_hit_rate": 40, "by_model": {}}},
+            "last": []},
+        "cli": {
+            "turns": 3, "avg_context_per_turn": 200000, "avg_fresh_input_per_turn": 1000,
+            "avg_output_per_turn": 500, "cache_hit_rate": 90, "by_model": {}, "last": []},
+    })
+    # both channels labelled, the agent named, the heavy verdict shown
+    assert "Telegram" in html and "CLI" in html
+    assert "nike" in html and "90,000" in html and "heavy" in html
 
 
 def test_render_model_panel():

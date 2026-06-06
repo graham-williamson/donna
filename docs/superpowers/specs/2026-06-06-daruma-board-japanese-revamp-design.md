@@ -57,7 +57,7 @@ Existing test contract preserved: rendered SVG carries `data-state` and pupils u
 1. **Header** — 達磨 Daruma Board title, current 72-micro-season subtitle, theme controls.
 2. **Daily zen** — one line from `zen.json`, deterministic pick by date (`hash(date) % len`), calligraphy-styled card.
 3. **Goals** — daruma cards (redrawn), commit/achieve actions, add-goal form (collapsible): title, colour (8 swatches), why-it-matters.
-4. **Ema Wall (wish list)** — wishes as wooden ema plaques hanging on a rack rail. Add-wish form (text only). Each ema: wish text, added date, actions: *promote to daruma* (choose colour → calls `goals.add_goal`, wish marked promoted) and *release* (archived, not deleted). Seeded with: "Internet-friendly SaaS version of the Daruma Board".
+4. **Ema Wall (wish list)** — wishes as wooden ema plaques hanging on a rack rail. Add-wish form (text only). Each ema: wish text, added date, actions: *promote to daruma* (choose colour → calls `goals.add_goal`, wish marked promoted) and *release* (archived, not deleted). Seeded with: "Daru (daru.life) — internet-friendly SaaS version of the Daruma Board".
 5. **Habits** — existing habit cards restyled; mark-done keeps streak flame; add-habit form (name, identity, cue).
 6. **Tokonoma (wins alcove)** — recent wins from `evidence.surface_evidence()` (achieved goals already log there) displayed as treasures in an alcove-styled band.
 7. **Incense focus timer** — client-side: choose 25/50 min, an incense stick burns down visually, soft WebAudio chime at the end. No persistence.

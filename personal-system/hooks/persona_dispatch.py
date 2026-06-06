@@ -45,6 +45,22 @@ def main():
         glyph = dispatch.PERSONAS[persona]["glyph"]
         clean = routed.get("text", body)
 
+        # Turn-marker sidecar for token telemetry (tokens.py joins by ts).
+        # The active persona isn't persisted in the transcript, so we record
+        # (ts, persona) here — the one place that authoritatively knows it.
+        try:
+            from datetime import datetime, timezone
+            mid = re.search(r'message_id="([^"]+)"', prompt)
+            rec = {"ts": datetime.now(timezone.utc).isoformat(),
+                   "persona": persona, "channel": "telegram",
+                   "message_id": mid.group(1) if mid else None}
+            log = PS / "data" / "turns.jsonl"
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec) + "\n")
+        except Exception:
+            pass  # telemetry must never block a reply
+
         # Deterministic capture: a chatty model won't reliably stop to run a log
         # command mid-conversation, so when Graham explicitly says "remember ...",
         # the hook itself writes it to the never-forget floor. No model compliance
