@@ -161,13 +161,14 @@ def _daruma_svg(colour, state):
         f'<rect x="38.5" y="22" width="43" height="46" fill="#fffdf7"/>'
         f'{left}{right}'
         # gold brush flourishes flanking the belly
-        f'<path d="M26 66 q-9 11 -3 26" stroke="{deco}" stroke-width="5.6" '
+        # tucked between the mask and the belly edge so they sit ON the body
+        f'<path d="M28 73 q-7 9 -2 18" stroke="{deco}" stroke-width="5.2" '
         f'stroke-linecap="round" fill="none"/>'
-        f'<path d="M36 69 q-7 9 -2 20" stroke="{deco}" stroke-width="4.8" '
+        f'<path d="M37 75 q-5 7 -1.5 15" stroke="{deco}" stroke-width="4.4" '
         f'stroke-linecap="round" fill="none"/>'
-        f'<path d="M94 66 q9 11 3 26" stroke="{deco}" stroke-width="5.6" '
+        f'<path d="M92 73 q7 9 2 18" stroke="{deco}" stroke-width="5.2" '
         f'stroke-linecap="round" fill="none"/>'
-        f'<path d="M84 69 q7 9 2 20" stroke="{deco}" stroke-width="4.8" '
+        f'<path d="M83 75 q5 7 1.5 15" stroke="{deco}" stroke-width="4.4" '
         f'stroke-linecap="round" fill="none"/>'
         # the meaning, written on the belly
         f'<text x="60" y="92" text-anchor="middle" font-size="27" font-weight="700" '
