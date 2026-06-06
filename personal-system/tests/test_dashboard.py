@@ -61,3 +61,20 @@ def test_render_model_panel():
     dash = load_dashboard()
     html = dash.render_board([], None, None, "haiku")
     assert "Daemon model" in html and "restart daemon" in html and "/set-model?m=sonnet" in html
+
+
+from datetime import date
+
+
+def test_season_for_known_dates():
+    dash = load_dashboard()
+    assert dash.season_for(date(2026, 6, 12))["kanji"] == "腐草為螢"
+    assert dash.season_for(date(2026, 1, 2))["kanji"] == "雪下出麦"  # wraps to year end
+    assert dash.season_for(date(2026, 3, 27))["english"] == "First cherry blossoms"
+
+
+def test_zen_deterministic_per_day():
+    dash = load_dashboard()
+    a = dash.zen_for(date(2026, 6, 6))
+    assert a == dash.zen_for(date(2026, 6, 6))
+    assert a["text"]
