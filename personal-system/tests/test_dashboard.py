@@ -106,3 +106,68 @@ def test_render_celebrate_flag_and_escaping():
     assert 'data-celebrate="7"' in page
     assert "<script>alert(1)</script>" not in page
     assert "&lt;script&gt;" in page
+
+
+import threading
+import urllib.error
+import urllib.parse
+import urllib.request
+
+import pytest
+
+
+@pytest.fixture
+def server(tmp_path, monkeypatch):
+    monkeypatch.setenv("GOALS_PATH", str(tmp_path / "g.json"))
+    monkeypatch.setenv("HABITS_PATH", str(tmp_path / "h.json"))
+    monkeypatch.setenv("WISHES_PATH", str(tmp_path / "w.json"))
+    monkeypatch.setenv("PMEM_DB", str(tmp_path / "memory.db"))
+    dash = load_dashboard()
+    srv = dash.make_server(0)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    yield f"http://127.0.0.1:{srv.server_port}"
+    srv.shutdown()
+
+
+def _post(url, **fields):
+    data = urllib.parse.urlencode(fields).encode()
+    return urllib.request.urlopen(urllib.request.Request(url, data=data)).read().decode()
+
+
+def test_index_serves_with_daru_seed(server):
+    page = urllib.request.urlopen(server + "/").read().decode()
+    assert "Daruma Board" in page and "daru.life" in page
+
+
+def test_static_served_and_traversal_blocked(server):
+    res = urllib.request.urlopen(server + "/static/style.css")
+    assert res.headers["Content-Type"].startswith("text/css")
+    with pytest.raises(urllib.error.HTTPError):
+        urllib.request.urlopen(server + "/static/%2e%2e%2fgoals.py")
+    with pytest.raises(urllib.error.HTTPError):
+        urllib.request.urlopen(server + "/static/dashboard.py")
+
+
+def test_add_goal_and_wish_via_post(server):
+    page = _post(server + "/add-goal", title="Climb Fuji", colour="green",
+                 why="because it is there")
+    assert "Climb Fuji" in page
+    page = _post(server + "/add-wish", text="open a dojo")
+    assert "open a dojo" in page
+
+
+def test_promote_wish_via_post(server):
+    _post(server + "/add-wish", text="run a marathon")
+    page = _post(server + "/promote-wish", id="2", colour="green")  # id 1 = Daru seed
+    assert "run a marathon" in page and 'data-state="none"' in page
+
+
+def test_bad_colour_redirects_with_error(server):
+    page = _post(server + "/add-goal", title="x", colour="teal", why="")
+    assert "could not save" in page
+
+
+def test_achieve_redirect_carries_celebrate(server):
+    _post(server + "/add-goal", title="zz", colour="red", why="")
+    page = urllib.request.urlopen(server + "/achieve?id=1").read().decode()
+    assert 'data-celebrate="1"' in page

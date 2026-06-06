@@ -442,33 +442,53 @@ def _set_model(m):
     _restart_daemon()
 
 
-def serve(port=8765):
+ASSET_TYPES = {".css": "text/css; charset=utf-8",
+               ".js": "application/javascript; charset=utf-8",
+               ".json": "application/json", ".svg": "image/svg+xml"}
+
+
+def make_handler(g, hmod, tok, wmod, ev):
     import http.server
     import urllib.parse
-    g = _mod("goals")
-    hmod = _mod("habits")
-    tok = _mod("tokens")
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
 
-        def _redirect(self):
+        def _redirect(self, loc="/"):
             self.send_response(303)
-            self.send_header("Location", "/")
+            self.send_header("Location", loc)
             self.end_headers()
+
+        def _serve_static(self, name):
+            target = (ASSETS / name).resolve()
+            if (target.parent != ASSETS.resolve()
+                    or target.suffix not in ASSET_TYPES or not target.is_file()):
+                return self.send_error(404)
+            body = target.read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", ASSET_TYPES[target.suffix])
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def do_GET(self):
             u = urllib.parse.urlparse(self.path)
             q = urllib.parse.parse_qs(u.query)
+            if u.path.startswith("/static/"):
+                return self._serve_static(urllib.parse.unquote(u.path[len("/static/"):]))
             if u.path == "/commit" and "id" in q:
                 g.commit_goal(int(q["id"][0]))
                 return self._redirect()
             if u.path == "/achieve" and "id" in q:
-                g.achieve_goal(int(q["id"][0]))
-                return self._redirect()
+                gid = int(q["id"][0])
+                g.achieve_goal(gid)
+                return self._redirect(f"/?celebrate={gid}")
             if u.path == "/habit-done" and "id" in q:
                 hmod.log_done(int(q["id"][0]))
+                return self._redirect()
+            if u.path == "/release-wish" and "id" in q:
+                wmod.release_wish(int(q["id"][0]))
                 return self._redirect()
             if u.path == "/set-model" and "m" in q:
                 _set_model(q["m"][0])
@@ -476,17 +496,65 @@ def serve(port=8765):
             if u.path == "/restart":
                 _restart_daemon()
                 return self._redirect()
-            model = _current_model()
-            html = render_board(g.list_goals(), _enriched_habits(),
-                                tok.summary(recent=50), model)
-            body = html.encode("utf-8")
+            page = render_board(
+                g.list_goals(), _enriched_habits(), tok.summary(recent=50),
+                _current_model(), wishes=wmod.list_wishes(),
+                wins=ev.surface_evidence(limit=8),
+                celebrate=q.get("celebrate", [None])[0],
+                error=q.get("error", [None])[0])
+            body = page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.end_headers()
             self.wfile.write(body)
 
-    print(f"Daruma board → http://localhost:{port}  (Ctrl-C to stop)")
-    http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length).decode()
+            fields = {k: v[0].strip() for k, v in urllib.parse.parse_qs(raw).items()}
+
+            def need(*names):
+                for n in names:
+                    if not fields.get(n):
+                        raise ValueError(f"{n} required")
+            try:
+                if self.path == "/add-goal":
+                    need("title", "colour")
+                    g.add_goal(fields["title"], fields["colour"], fields.get("why", ""))
+                elif self.path == "/add-habit":
+                    need("name", "identity")
+                    hmod.add_habit(fields["name"], fields["identity"], fields.get("cue", ""))
+                elif self.path == "/add-wish":
+                    need("text")
+                    wmod.add_wish(fields["text"])
+                elif self.path == "/promote-wish":
+                    need("id", "colour")
+                    wmod.promote_wish(int(fields["id"]), fields["colour"])
+                else:
+                    return self.send_error(404)
+            except (ValueError, KeyError) as e:
+                return self._redirect("/?error=" + urllib.parse.quote(f"could not save: {e}"))
+            self._redirect()
+
+    return Handler
+
+
+def make_server(port=8765):
+    import http.server
+    g = _mod("goals")
+    hmod = _mod("habits")
+    tok = _mod("tokens")
+    wmod = _mod("wishes")
+    ev = _mod("evidence")
+    wmod.seed_defaults()
+    return http.server.HTTPServer(("127.0.0.1", port),
+                                  make_handler(g, hmod, tok, wmod, ev))
+
+
+def serve(port=8765):
+    srv = make_server(port)
+    print(f"Daruma board → http://localhost:{srv.server_port}  (Ctrl-C to stop)")
+    srv.serve_forever()
 
 
 if __name__ == "__main__":
