@@ -155,6 +155,99 @@ def check_bash(command: str) -> None:
     _check_bash_allowlist(tokens)
 
 
+PS_TOOLS_DIR = "/Users/grahamwilliamson/donna/personal-system/tools/"
+PS_IDENT_RE = re.compile(r"[a-z][a-z0-9_-]{0,49}")
+PS_COLOURS = {"green", "purple", "red", "black", "pink", "gold", "white", "blue"}
+
+
+def _ps_flags_ok(args: list[str], flag_specs: dict, bool_flags: set) -> bool:
+    """Validate a flag/value list for personal-system tools."""
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        if tok in bool_flags:
+            i += 1
+            continue
+        if tok in flag_specs:
+            if i + 1 >= len(args):
+                return False
+            val = args[i + 1]
+            spec = flag_specs[tok]
+            if spec == "int100":
+                if not re.fullmatch(r"[1-9][0-9]*", val) or int(val) > 100:
+                    return False
+            elif not PS_IDENT_RE.fullmatch(val):
+                return False
+            i += 2
+            continue
+        return False
+    return True
+
+
+def _check_personal_system(rest: list[str], script: str) -> None:
+    """Allowlist for personal-system memory tools. Local SQLite + JSON only:
+    no secrets, no network, never-delete — low blast radius. Reached only after
+    the metachar scan + shlex tokenisation have already run on the command."""
+    if script == "pmem.py":
+        if not rest:
+            deny("pmem.py: subcommand required")
+        cmd = rest[0]
+        if cmd == "add":
+            if len(rest) == 2 and re.fullmatch(r"/tmp/pmem-[a-zA-Z0-9_\-]+\.json", rest[1]):
+                allow("pmem.py add")
+            deny("pmem.py add: requires /tmp/pmem-*.json")
+        if cmd == "sweep" and len(rest) == 1:
+            allow("pmem.py sweep")
+        if cmd == "verify" and len(rest) == 2 and re.fullmatch(r"[1-9][0-9]*", rest[1]):
+            allow("pmem.py verify")
+        if cmd in ("recall", "promote"):
+            specs = {"--topic": "id", "--persona": "id", "--owner": "id",
+                     "--kind": "id", "--limit": "int100", "--threshold": "int100"}
+            if _ps_flags_ok(rest[1:], specs, {"--include-stale"}):
+                allow(f"pmem.py {cmd}")
+            deny(f"pmem.py {cmd}: bad flags")
+        deny(f"pmem.py: bad invocation {rest!r}")
+    if script == "goals.py":
+        if not rest:
+            deny("goals.py: subcommand required")
+        cmd = rest[0]
+        if cmd == "add" and len(rest) >= 3 and rest[2] in PS_COLOURS:
+            allow("goals.py add")
+        if cmd in ("commit", "achieve") and len(rest) == 2 and re.fullmatch(r"[1-9][0-9]*", rest[1]):
+            allow(f"goals.py {cmd}")
+        if cmd == "list":
+            allow("goals.py list")
+        deny(f"goals.py: bad invocation {rest!r}")
+    if script == "evidence.py":
+        if not rest:
+            allow("evidence.py surface")
+        if rest[0] == "log" and len(rest) >= 2:
+            allow("evidence.py log")
+        deny(f"evidence.py: bad invocation {rest!r}")
+    if script == "dream.py":
+        if not rest:
+            allow("dream.py")
+        deny("dream.py: no args")
+    if script == "tokens.py":
+        if not rest:
+            allow("tokens.py")
+        if rest[0] == "--recent" and len(rest) == 2 and re.fullmatch(r"[1-9][0-9]*", rest[1]):
+            allow("tokens.py --recent")
+        deny(f"tokens.py: bad invocation {rest!r}")
+    if script == "habits.py":
+        if not rest:
+            deny("habits.py: subcommand required")
+        cmd = rest[0]
+        if cmd in ("list", "seed", "due") and len(rest) == 1:
+            allow(f"habits.py {cmd}")
+        if cmd in ("done", "streak") and len(rest) == 2 and re.fullmatch(r"[1-9][0-9]*", rest[1]):
+            allow(f"habits.py {cmd}")
+        if cmd == "add" and len(rest) >= 3:
+            allow("habits.py add")
+        deny(f"habits.py: bad invocation {rest!r}")
+    deny(f"personal-system tool not allowed: {script!r}")
+
+
 def _check_bash_allowlist(t: list[str]) -> None:
     # Broker invocations are handled by the BROKER_CMD_RE fast-path in
     # check_bash(); they never reach this allowlist. The structural
@@ -307,6 +400,10 @@ def _check_bash_allowlist(t: list[str]) -> None:
                 deny(f"py_compile path {path!r} contains '..'")
             allow("python3 py_compile syntax check under donna root")
         deny("python3 -c py_compile: path not parseable or missing doraise=True")
+
+    # personal-system memory tools (local SQLite + goals JSON; no secrets/network).
+    if len(t) >= 2 and t[0] == "python3" and t[1].startswith(PS_TOOLS_DIR):
+        _check_personal_system(t[2:], t[1][len(PS_TOOLS_DIR):])
 
     deny(f"Bash argv {t!r} not in §14.1 allowlist")
 
