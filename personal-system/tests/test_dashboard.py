@@ -228,3 +228,14 @@ def test_swatch_shows_selected_meaning():
     dash = load_dashboard()
     page = dash.render_board([])
     assert '<em class="meaning">' in page and "love & connection" in page
+
+
+def test_burned_daruma_leave_the_board_and_won_offer_kuyo():
+    dash = load_dashboard()
+    won = dash.render_board([{"id": 5, "title": "won", "colour": "red",
+                              "owner": "shared", "daruma_state": "both"}])
+    assert "/burn?id=5" in won and "temple" in won
+    gone = dash.render_board([{"id": 6, "title": "ashes", "colour": "red",
+                               "owner": "shared", "daruma_state": "both",
+                               "burned_at": "2026-06-06T00:00:00Z"}])
+    assert "ashes" not in gone

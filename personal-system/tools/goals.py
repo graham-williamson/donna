@@ -92,6 +92,22 @@ def achieve_goal(gid, goals_path=None):
     return g
 
 
+def burn_goal(gid, goals_path=None):
+    """Daruma kuyo — a fulfilled daruma is returned to the temple and burned.
+
+    Only an achieved (both-eyes) daruma may be burned. The record is stamped,
+    never deleted; the win already lives in Esme's evidence ledger.
+    """
+    path = goals_path or DEFAULT_GOALS_PATH
+    data = _load(path)
+    g = _find(data, gid)
+    if g["daruma_state"] != "both":
+        raise ValueError("only an achieved daruma may be returned to the temple")
+    g["burned_at"] = g.get("burned_at") or now_iso()
+    _save(path, data)
+    return g
+
+
 def list_goals(colour=None, owner=None, state=None, goals_path=None):
     path = goals_path or DEFAULT_GOALS_PATH
     gs = _load(path)["goals"]
@@ -116,6 +132,8 @@ def main(argv=None):
     c.add_argument("id", type=int)
     ac = sub.add_parser("achieve")
     ac.add_argument("id", type=int)
+    b = sub.add_parser("burn")
+    b.add_argument("id", type=int)
     ls = sub.add_parser("list")
     ls.add_argument("--colour")
     ls.add_argument("--owner")
@@ -127,6 +145,8 @@ def main(argv=None):
         print(json.dumps(commit_goal(args.id)))
     elif args.cmd == "achieve":
         print(json.dumps(achieve_goal(args.id)))
+    elif args.cmd == "burn":
+        print(json.dumps(burn_goal(args.id)))
     elif args.cmd == "list":
         print(json.dumps(list_goals(args.colour, args.owner, args.state), indent=2))
 

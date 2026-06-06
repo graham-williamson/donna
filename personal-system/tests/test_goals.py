@@ -50,3 +50,16 @@ def test_list_filters(tmp_path):
     goals.add_goal("a", "green", goals_path=gp)
     goals.add_goal("b", "purple", goals_path=gp)
     assert len(goals.list_goals(colour="green", goals_path=gp)) == 1
+
+
+def test_burn_requires_achievement_then_archives(tmp_path, monkeypatch):
+    monkeypatch.setenv("PMEM_DB", str(tmp_path / "memory.db"))
+    goals = load("goals")
+    gp = str(tmp_path / "g.json")
+    g = goals.add_goal("x", "red", goals_path=gp)
+    with pytest.raises(ValueError):
+        goals.burn_goal(g["id"], goals_path=gp)      # not yet achieved — no kuyo
+    goals.achieve_goal(g["id"], goals_path=gp)
+    b = goals.burn_goal(g["id"], goals_path=gp)
+    assert b["burned_at"]
+    assert goals.list_goals(goals_path=gp)[0]["burned_at"]  # archived, never deleted

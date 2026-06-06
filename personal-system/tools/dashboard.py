@@ -198,7 +198,9 @@ def _goal_card(g):
     elif state == "left":
         action = f'<a href="/achieve?id={g["id"]}">● achieve</a>'
     else:
-        action = ""
+        # daruma kuyo — a fulfilled daruma is returned to the temple and burned
+        action = (f'<a class="kuyo" href="/burn?id={g["id"]}" '
+                  f'title="daruma kuyo — its work is done">🔥 return to the temple</a>')
     actions = f'<div class="actions">{action}</div>' if action else ""
     return (
         f'<div class="card goal {"won" if won else ""}" data-goal-id="{g["id"]}">{svg}'
@@ -425,6 +427,7 @@ def _page(body, title="達磨 Daruma Board", celebrate=None):
 def render_board(goals, habits=None, tokens=None, model=None, wishes=None,
                  wins=None, today=None, celebrate=None, error=None):
     today = today or date.today()
+    goals = [g for g in goals if not g.get("burned_at")]
     season = season_for(today)
     zen = zen_for(today)
     err = f'<p class="notice">{_esc(error)}</p>' if error else ""
@@ -556,6 +559,9 @@ def make_handler(g, hmod, tok, wmod, ev):
                 return self._redirect(f"/?celebrate={gid}")
             if u.path == "/habit-done" and "id" in q:
                 hmod.log_done(int(q["id"][0]))
+                return self._redirect()
+            if u.path == "/burn" and "id" in q:
+                g.burn_goal(int(q["id"][0]))
                 return self._redirect()
             if u.path == "/release-wish" and "id" in q:
                 wmod.release_wish(int(q["id"][0]))

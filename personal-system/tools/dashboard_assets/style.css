@@ -103,6 +103,8 @@ html[data-theme="twilight"] .track b.hot { color:#ff8a7a; }
 .actions.big a, .actions.big .cur { font-size:15px; font-weight:600; }
 .cur { color:var(--gold); } .actions a:hover { text-decoration:underline; }
 .ticked { color:var(--gold); } .restart { color:#c0392b; }
+.actions a.kuyo { color:#c0532a; }
+html[data-theme="twilight"] .actions a.kuyo { color:#e8956a; }
 html[data-theme="twilight"] .restart { color:#ff8a7a; }
 .streak { min-width:74px; text-align:center; font-size:15px; font-weight:600; color:#c0532a; }
 html[data-theme="twilight"] .streak { color:#e8a06a; }
