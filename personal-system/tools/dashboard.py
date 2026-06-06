@@ -144,34 +144,33 @@ def _daruma_svg(colour, state):
     deco = _SVG_DECO.get(colour, GOLD)
     kanji = COLOUR_KANJI.get(colour, "福")
     # eyes: a bold open ring until filled; pupils are the only fill="#111" (test contract)
-    left = ('<circle cx="38.5" cy="45" r="11.5" fill="#111"/>' if state in ("left", "both") else
-            '<circle cx="38.5" cy="45" r="9.5" fill="none" stroke="#1a1a1a" stroke-width="4.6"/>')
-    right = ('<circle cx="81.5" cy="45" r="11.5" fill="#111"/>' if state == "both" else
-             '<circle cx="81.5" cy="45" r="9.5" fill="none" stroke="#1a1a1a" stroke-width="4.6"/>')
+    left = ('<circle cx="35" cy="48" r="10.5" fill="#111"/>' if state in ("left", "both") else
+            '<circle cx="35" cy="48" r="8.8" fill="none" stroke="#1a1a1a" stroke-width="4.4"/>')
+    right = ('<circle cx="73" cy="48" r="10.5" fill="#111"/>' if state == "both" else
+             '<circle cx="73" cy="48" r="8.8" fill="none" stroke="#1a1a1a" stroke-width="4.4"/>')
     return (
-        f'<svg class="daruma" width="104" height="90" viewBox="0 0 120 104" data-state="{state}">'
-        # wide, round-bottomed body — flat vector, no outline
-        f'<path d="M60 4 C92 4 114 25 114 57 C114 86 91 100 60 100 '
-        f'C29 100 6 86 6 57 C6 25 28 4 60 4 Z" fill="{body}"/>'
-        f'<ellipse cx="45" cy="22" rx="30" ry="12" fill="#fff" opacity=".12"/>'
-        f'<ellipse cx="60" cy="93" rx="44" ry="10" fill="#000" opacity=".07"/>'
+        f'<svg class="daruma" width="94" height="104" viewBox="0 0 108 120" data-state="{state}">'
+        # okiagari body — slightly taller than wide, flat vector, no outline
+        f'<path d="M54 6 C82 6 100 28 100 62 C100 96 80 114 54 114 '
+        f'C28 114 8 96 8 62 C8 28 26 6 54 6 Z" fill="{body}"/>'
+        f'<ellipse cx="42" cy="24" rx="26" ry="13" fill="#fff" opacity=".12"/>'
+        f'<ellipse cx="54" cy="106" rx="38" ry="9" fill="#000" opacity=".07"/>'
         # white goggle mask across both eyes
-        f'<circle cx="38.5" cy="45" r="25" fill="#fffdf7"/>'
-        f'<circle cx="81.5" cy="45" r="25" fill="#fffdf7"/>'
-        f'<rect x="38.5" y="22" width="43" height="46" fill="#fffdf7"/>'
+        f'<circle cx="35" cy="48" r="22.5" fill="#fffdf7"/>'
+        f'<circle cx="73" cy="48" r="22.5" fill="#fffdf7"/>'
+        f'<rect x="35" y="27" width="38" height="42" fill="#fffdf7"/>'
         f'{left}{right}'
-        # gold brush flourishes flanking the belly
-        # tucked between the mask and the belly edge so they sit ON the body
-        f'<path d="M28 73 q-7 9 -2 18" stroke="{deco}" stroke-width="5.2" '
+        # brushwork tucked between the mask and the belly edge, on the body
+        f'<path d="M26 76 q-7 10 -2 20" stroke="{deco}" stroke-width="5.2" '
         f'stroke-linecap="round" fill="none"/>'
-        f'<path d="M37 75 q-5 7 -1.5 15" stroke="{deco}" stroke-width="4.4" '
+        f'<path d="M35 78 q-5 8 -1.5 16" stroke="{deco}" stroke-width="4.4" '
         f'stroke-linecap="round" fill="none"/>'
-        f'<path d="M92 73 q7 9 2 18" stroke="{deco}" stroke-width="5.2" '
+        f'<path d="M82 76 q7 10 2 20" stroke="{deco}" stroke-width="5.2" '
         f'stroke-linecap="round" fill="none"/>'
-        f'<path d="M83 75 q5 7 1.5 15" stroke="{deco}" stroke-width="4.4" '
+        f'<path d="M73 78 q5 8 1.5 16" stroke="{deco}" stroke-width="4.4" '
         f'stroke-linecap="round" fill="none"/>'
         # the meaning, written on the belly
-        f'<text x="60" y="92" text-anchor="middle" font-size="27" font-weight="700" '
+        f'<text x="54" y="100" text-anchor="middle" font-size="26" font-weight="700" '
         f'fill="{deco}" font-family="Hiragino Mincho ProN,Yu Mincho,serif">{kanji}</text>'
         f'</svg>'
     )
@@ -406,14 +405,14 @@ def _page(body, title="達磨 Daruma Board", celebrate=None):
         "<link rel='stylesheet' href='/static/style.css'>"
         # favicon: a tiny daruma, no asset file needed
         "<link rel='icon' href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' "
-        "viewBox='0 0 120 104'><path d='M60 4 C92 4 114 25 114 57 C114 86 91 100 60 100 "
-        "C29 100 6 86 6 57 C6 25 28 4 60 4 Z' fill='%23c0392b'/>"
-        "<circle cx='38.5' cy='45' r='25' fill='%23fffdf7'/>"
-        "<circle cx='81.5' cy='45' r='25' fill='%23fffdf7'/>"
-        "<rect x='38.5' y='22' width='43' height='46' fill='%23fffdf7'/>"
-        "<circle cx='38.5' cy='45' r='11.5' fill='%23111111'/>"
-        "<circle cx='81.5' cy='45' r='9.5' fill='none' stroke='%23111111' stroke-width='4.6'/>"
-        "<text x='60' y='92' text-anchor='middle' font-size='27' font-weight='700' "
+        "viewBox='0 0 108 120'><path d='M54 6 C82 6 100 28 100 62 C100 96 80 114 54 114 "
+        "C28 114 8 96 8 62 C8 28 26 6 54 6 Z' fill='%23c0392b'/>"
+        "<circle cx='35' cy='48' r='22.5' fill='%23fffdf7'/>"
+        "<circle cx='73' cy='48' r='22.5' fill='%23fffdf7'/>"
+        "<rect x='35' y='27' width='38' height='42' fill='%23fffdf7'/>"
+        "<circle cx='35' cy='48' r='10.5' fill='%23111111'/>"
+        "<circle cx='73' cy='48' r='8.8' fill='none' stroke='%23111111' stroke-width='4.4'/>"
+        "<text x='54' y='100' text-anchor='middle' font-size='26' font-weight='700' "
         "fill='%23d8a94e' font-family='serif'>志</text></svg>\">"
         f"<title>{title}</title></head>"
         f"<body{cel}><canvas id='particles'></canvas>"
