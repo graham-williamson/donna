@@ -34,7 +34,7 @@ def test_render_habits_panel():
     html = dash.render_board([], [{
         "id": 1, "name": "Morning Calm", "identity": "I am someone who begins in stillness",
         "cue": "when I wake", "owner": "bodhi", "streak": 3, "done_today": False}])
-    assert "Morning Calm" in html and "🔥 3 days" in html and "mark done" in html
+    assert "Morning Calm" in html and "🔥 3 days" in html and "kept today" in html
 
 
 def test_render_token_panel():
@@ -171,3 +171,43 @@ def test_achieve_redirect_carries_celebrate(server):
     _post(server + "/add-goal", title="zz", colour="red", why="")
     page = urllib.request.urlopen(server + "/achieve?id=1").read().decode()
     assert 'data-celebrate="1"' in page
+
+
+# ---- live-feedback round (2026-06-06): meanings, habit wording, next-action, engawa ----
+
+def test_goal_actions_show_only_next_step():
+    dash = load_dashboard()
+    fresh = dash.render_board([{"id": 1, "title": "x", "colour": "red",
+                                "owner": "shared", "daruma_state": "none"}])
+    committed = dash.render_board([{"id": 2, "title": "y", "colour": "red",
+                                    "owner": "shared", "daruma_state": "left"}])
+    won = dash.render_board([{"id": 3, "title": "z", "colour": "red",
+                              "owner": "shared", "daruma_state": "both"}])
+    assert "/commit?id=1" in fresh and "/achieve?id=1" not in fresh
+    assert "/achieve?id=2" in committed and "/commit?id=2" not in committed
+    assert "/commit?id=3" not in won and "/achieve?id=3" not in won
+
+
+def test_colour_meanings_surface():
+    dash = load_dashboard()
+    page = dash.render_board([{"id": 1, "title": "x", "colour": "green",
+                               "owner": "nike", "daruma_state": "none"}])
+    assert "health" in page                       # green's meaning on the card
+    assert "wealth" in page                       # gold's meaning in swatch titles
+
+
+def test_habits_are_kept_not_done():
+    dash = load_dashboard()
+    page = dash.render_board([], [{
+        "id": 1, "name": "Morning Calm", "identity": "i", "cue": "c",
+        "owner": "bodhi", "streak": 0, "done_today": False}])
+    assert "mark done" not in page and "not yet started" not in page
+    assert "kept today" in page and "not yet begun" in page
+
+
+def test_main_board_is_zen_panels_live_on_engawa(server):
+    main_page = urllib.request.urlopen(server + "/").read().decode()
+    assert "Daemon model" not in main_page and "Context efficiency" not in main_page
+    assert 'href="/engawa"' in main_page          # quiet doorway in the footer
+    engawa = urllib.request.urlopen(server + "/engawa").read().decode()
+    assert "Daemon model" in engawa and "Context efficiency" in engawa

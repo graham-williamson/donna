@@ -241,6 +241,13 @@ html[data-theme="sakura"] .koi { opacity:.17; }
            pointer-events:none; z-index:4; }
 .goal { position:relative; }
 
+/* ---------- engawa doorway (quiet footer link to system panels) ---------- */
+.engawa-door { text-align:center; margin-top:54px; }
+.engawa-door a { color:var(--muted); text-decoration:none; font-size:13px;
+                 letter-spacing:3px; opacity:.6; transition:opacity .25s ease, color .25s ease;
+                 font-family:"Hiragino Mincho ProN", Georgia, serif; }
+.engawa-door a:hover { color:var(--accent); opacity:1; }
+
 /* ---------- responsive + reduced motion ---------- */
 @media (max-width: 700px) {
   main { padding:18px 12px 70px; }

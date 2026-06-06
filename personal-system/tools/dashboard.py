@@ -165,19 +165,37 @@ def _daruma_svg(colour, state):
     )
 
 
+# Traditional daruma colour symbolism — each doll's colour carries its wish.
+COLOUR_MEANING = {
+    "red": "luck & protection", "gold": "wealth & prosperity",
+    "white": "balance & beginnings", "black": "wards off misfortune",
+    "green": "health & vitality", "purple": "growth & self-mastery",
+    "pink": "love & connection", "blue": "work & learning",
+}
+
+
 def _goal_card(g):
-    svg = _daruma_svg(g["colour"], g.get("daruma_state", "none"))
+    state = g.get("daruma_state", "none")
+    svg = _daruma_svg(g["colour"], state)
     set_d = (g.get("committed_at") or "—")[:10]
     done_d = (g.get("achieved_at") or "—")[:10]
-    won = g.get("daruma_state") == "both"
+    won = state == "both"
+    meaning = COLOUR_MEANING.get(g["colour"], g["colour"])
+    # one daruma, one next step — never both eyes' actions at once
+    if state == "none":
+        action = f'<a href="/commit?id={g["id"]}">◑ commit</a>'
+    elif state == "left":
+        action = f'<a href="/achieve?id={g["id"]}">● achieve</a>'
+    else:
+        action = ""
+    actions = f'<div class="actions">{action}</div>' if action else ""
     return (
         f'<div class="card goal {"won" if won else ""}" data-goal-id="{g["id"]}">{svg}'
         f'<div class="meta"><h3>{_esc(g["title"])}</h3>'
         f'<p class="why">{_esc(g.get("why_it_matters", ""))}</p>'
-        f'<p class="track"><span class="pill {g["colour"]}"></span> {g["colour"]}'
+        f'<p class="track"><span class="pill {g["colour"]}"></span> {meaning}'
         f' · {g["owner"]} · set {set_d} · done {done_d}</p>'
-        f'<div class="actions"><a href="/commit?id={g["id"]}">◑ commit</a>'
-        f'<a href="/achieve?id={g["id"]}">● achieve</a></div></div></div>'
+        f'{actions}</div></div>'
     )
 
 
@@ -185,7 +203,8 @@ def _swatches(checked="red"):
     out = ""
     for c, hx in COLOUR_HEX.items():
         chk = " checked" if c == checked else ""
-        out += (f'<label class="swatch" title="{c}">'
+        title = f'{c} — {COLOUR_MEANING.get(c, c)}'
+        out += (f'<label class="swatch" title="{title}">'
                 f'<input type="radio" name="colour" value="{c}"{chk}>'
                 f'<span style="--c:{hx}"></span></label>')
     return f'<div class="swatches">{out}</div>'
@@ -232,11 +251,12 @@ def _ema_wall(wishes):
 
 
 def _habit_card(h):
+    # a habit is a practice, never "done" — today it is kept, or not yet
     s = h.get("streak", 0)
-    flames = ("🔥 " + str(s) + (" day" if s == 1 else " days")) if s else "not yet started"
+    flames = ("🔥 " + str(s) + (" day" if s == 1 else " days")) if s else "not yet begun"
     done = h.get("done_today")
-    tick = ('<span class="ticked">✓ done today</span>' if done
-            else f'<a href="/habit-done?id={h["id"]}">✓ mark done</a>')
+    tick = ('<span class="ticked">kept today ✓</span>' if done
+            else f'<a href="/habit-done?id={h["id"]}">✓ kept today</a>')
     return (
         f'<div class="card habit{" done-today" if done else ""}">'
         f'<div class="streak">{flames}</div>'
@@ -354,6 +374,30 @@ BOOT_JS = (
 )
 
 
+THEME_CONTROLS = (
+    '<div class="theme-controls" role="group" aria-label="theme">'
+    '<button data-theme-btn="washi" title="Washi — paper and ink">和</button>'
+    '<button data-theme-btn="sakura" title="Sakura — blossom and koi">桜</button>'
+    '<button data-theme-btn="twilight" title="Twilight temple — dark">月</button>'
+    '</div>'
+)
+
+
+def _page(body, title="達磨 Daruma Board", celebrate=None):
+    cel = f' data-celebrate="{_esc(celebrate)}"' if celebrate else ""
+    return (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<script>{BOOT_JS}</script>"
+        "<link rel='stylesheet' href='/static/style.css'>"
+        f"<title>{title}</title></head>"
+        f"<body{cel}><canvas id='particles'></canvas>"
+        "<div class='koi-layer' aria-hidden='true'></div>"
+        f"<main>{body}</main>"
+        "<script src='/static/board.js'></script></body></html>"
+    )
+
+
 def render_board(goals, habits=None, tokens=None, model=None, wishes=None,
                  wins=None, today=None, celebrate=None, error=None):
     today = today or date.today()
@@ -365,11 +409,7 @@ def render_board(goals, habits=None, tokens=None, model=None, wishes=None,
         '<h1><span class="kanji">達磨</span> Daruma Board</h1>'
         f'<p class="sub season">{season["kanji"]} — {season["english"]}'
         ' · one eye to commit, one eye to arrive</p></div>'
-        '<div class="theme-controls" role="group" aria-label="theme">'
-        '<button data-theme-btn="washi" title="Washi — paper and ink">和</button>'
-        '<button data-theme-btn="sakura" title="Sakura — blossom and koi">桜</button>'
-        '<button data-theme-btn="twilight" title="Twilight temple — dark">月</button>'
-        '</div></header>' + err +
+        + THEME_CONTROLS + '</header>' + err +
         f'<section class="zen"><p class="zen-text">{_esc(zen["text"])}</p>'
         f'<p class="zen-by">{_esc(zen.get("by", ""))}</p></section>'
     )
@@ -384,22 +424,28 @@ def render_board(goals, habits=None, tokens=None, model=None, wishes=None,
     if wins is not None:
         s += '<h2>Tokonoma <span class="jp">床の間</span></h2>' + _tokonoma(wins)
     s += '<h2>Focus <span class="jp">線香</span></h2>' + _incense()
+    # The system panels live on the engawa — the quiet veranda off the main room.
     if tokens is not None:
         s += "<h2>Context efficiency</h2>" + _token_panel(tokens)
     if model is not None:
         s += "<h2>Daemon</h2>" + _model_panel(model)
-    cel = f' data-celebrate="{_esc(celebrate)}"' if celebrate else ""
-    return (
-        "<!doctype html><html><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"<script>{BOOT_JS}</script>"
-        "<link rel='stylesheet' href='/static/style.css'>"
-        "<title>達磨 Daruma Board</title></head>"
-        f"<body{cel}><canvas id='particles'></canvas>"
-        "<div class='koi-layer' aria-hidden='true'></div>"
-        f"<main>{s}</main>"
-        "<script src='/static/board.js'></script></body></html>"
+    s += ('<footer class="engawa-door">'
+          '<a href="/engawa" title="the engawa — system panels, off the main room">縁側</a>'
+          '</footer>')
+    return _page(s, celebrate=celebrate)
+
+
+def render_engawa(tokens, model):
+    s = (
+        '<header class="masthead"><div>'
+        '<h1><span class="kanji">縁側</span> Engawa</h1>'
+        '<p class="sub">the veranda behind the house — where the machinery hums</p></div>'
+        + THEME_CONTROLS + '</header>'
     )
+    s += "<h2>Context efficiency</h2>" + _token_panel(tokens)
+    s += "<h2>Daemon</h2>" + _model_panel(model)
+    s += '<footer class="engawa-door"><a href="/">← back to the board</a></footer>'
+    return _page(s, title="縁側 Engawa — Daruma Board")
 
 
 def _mod(name):
@@ -496,12 +542,15 @@ def make_handler(g, hmod, tok, wmod, ev):
             if u.path == "/restart":
                 _restart_daemon()
                 return self._redirect()
-            page = render_board(
-                g.list_goals(), _enriched_habits(), tok.summary(recent=50),
-                _current_model(), wishes=wmod.list_wishes(),
-                wins=ev.surface_evidence(limit=8),
-                celebrate=q.get("celebrate", [None])[0],
-                error=q.get("error", [None])[0])
+            if u.path == "/engawa":
+                page = render_engawa(tok.summary(recent=50), _current_model())
+            else:
+                page = render_board(
+                    g.list_goals(), _enriched_habits(),
+                    wishes=wmod.list_wishes(),
+                    wins=ev.surface_evidence(limit=8),
+                    celebrate=q.get("celebrate", [None])[0],
+                    error=q.get("error", [None])[0])
             body = page.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
