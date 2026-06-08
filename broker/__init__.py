@@ -6,6 +6,7 @@ Phase 1 skeleton. Module responsibilities (see per-module docstrings):
   - main:          CLI dispatcher (§13.1)
   - canonicalize:  RFC 8785 params hashing (§7.1)
   - requests_db:   SQLite schema, WAL, immutable triggers (§6, §7.5)
+  - grants_db:     standing-grants store (broker-standing-grants §4)
   - audit:         hash-chained JSONL writer (§7.6)
   - validator:     capability manifest validation (§8)
   - policy:        HMAC, idempotency, rate limits, cooldown (§13.2, §7.2, §7.4)

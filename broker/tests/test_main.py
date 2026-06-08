@@ -1153,3 +1153,382 @@ def test_execute_reentry_from_executing_returns_handoff(broker_env):
         "status", {"request_id": req["request_id"]}, broker_env,
     )
     assert st["state"] == "executing"
+
+
+# ---- standing grants (broker-standing-grants §7) ------------------------
+
+
+@pytest.fixture
+def grants_env(tmp_path, broker_env):
+    """Extend broker_env with a high-risk gmail.send capability so grant
+    flows have a real capability to grant + auto-execute against."""
+    home = Path(broker_env["DONNA_BROKER_HOME"])
+
+    gmail_send_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "required": ["to", "subject", "body"],
+        "additionalProperties": False,
+        "properties": {
+            "to": {"type": "string"},
+            "subject": {"type": "string"},
+            "body": {"type": "string"},
+            "thread_id": {"type": "string"},
+        },
+    }
+    (home / "gmail_send.json").write_text(
+        json.dumps(gmail_send_schema), encoding="utf-8"
+    )
+
+    capabilities_yaml = home / "capabilities.yaml"
+    capabilities_yaml.write_text(f"""
+capabilities:
+  - name: gmail.create_draft
+    executor:
+      type: mcp_tool
+      tool: mcp__claude_ai_Gmail__create_draft
+    param_schema:
+      type: object
+      required: [to, subject, body]
+      additionalProperties: false
+      properties:
+        to: {{type: array, items: {{type: string}}, minItems: 1}}
+        subject: {{type: string}}
+        body: {{type: string}}
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: medium
+    revalidate:
+      not_applicable: stateless_write
+    idempotency_date_from: created_utc
+    approval_window_minutes: 60
+    execution_window_minutes: 30
+  - name: gmail.send
+    executor:
+      type: mcp_tool
+      tool: mcp__claude_ai_Gmail__send_message
+    param_schema:
+      $ref: ./gmail_send.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: high
+    revalidate:
+      not_applicable: stateless_write
+    idempotency_date_from: created_utc
+    approval_window_minutes: 1440
+    execution_window_minutes: 720
+""", encoding="utf-8")
+
+    mcp_yaml = home / "mcp-tools.yaml"
+    mcp_yaml.write_text("""
+tools:
+  mcp__claude_ai_Gmail__gmail_search_messages: low
+  mcp__claude_ai_Gmail__create_draft: medium
+  mcp__claude_ai_Gmail__send_message: high
+  mcp__plugin_playwright_playwright__browser_navigate: blocked
+""", encoding="utf-8")
+
+    return broker_env
+
+
+def _approve(env: dict[str, str], request_id: str, decision: str = "approve") -> None:
+    rf = Path(env["DONNA_BROKER_RESPONSES_DIR"]) / f"{request_id}.json"
+    rf.write_text(
+        json.dumps({"request_id": request_id, "decision": decision}),
+        encoding="utf-8",
+    )
+
+
+def _create_grant(
+    env: dict[str, str],
+    *,
+    to: str = "graham@example.com",
+    max_per_period: int = 1,
+    period_seconds: int = 604_800,
+    expires_in_days: int = 90,
+) -> str:
+    """grant-create → approve → execute; returns the grant_id."""
+    _, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {"to": to},
+            "purpose": "School roundup",
+            "max_per_period": max_per_period,
+            "period_seconds": period_seconds,
+            "expires_in_days": expires_in_days,
+        },
+        env,
+    )
+    assert resp["status"] == "approval_required", resp
+    _approve(env, resp["request_id"])
+    _, fin = _run("execute", {"approval_code": resp["code"]}, env)
+    assert fin["status"] == "succeeded", fin
+    return fin["grant_id"]
+
+
+def test_grant_create_returns_approval_required_not_persisted(grants_env):
+    """grant-create raises approval_required and does NOT persist a grant."""
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {"to": "graham@example.com"},
+            "purpose": "School roundup",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+            "expires_in_days": 90,
+        },
+        grants_env,
+    )
+    assert code == 0, resp
+    assert resp["status"] == "approval_required"
+    assert len(resp["code"]) == 6
+    assert resp["risk_level"] == "high"
+    assert resp["is_grant"] is True
+    # Full scope spelled out in the human summary.
+    assert "graham@example.com" in resp["summary"]
+    assert "90d" in resp["summary"]
+    assert "School roundup" in resp["summary"]
+    # No grant persisted yet.
+    _, listing = _run("grant-list", {}, grants_env)
+    assert listing["grants"] == []
+
+
+def test_grant_create_persists_only_on_execute(grants_env):
+    grant_id = _create_grant(grants_env)
+    _, listing = _run("grant-list", {}, grants_env)
+    assert len(listing["grants"]) == 1
+    g = listing["grants"][0]
+    assert g["grant_id"] == grant_id
+    assert g["capability"] == "gmail.send"
+    assert g["status"] == "active"
+    assert g["constraints"] == {"to": "graham@example.com"}
+
+
+def test_grant_create_gmail_send_requires_to(grants_env):
+    """§5: a gmail.send grant whose constraints omit `to` is rejected."""
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {"subject": {"prefix": "School"}},
+            "purpose": "x",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+        },
+        grants_env,
+    )
+    assert code == 1
+    assert resp["error_code"] == "invalid_constraints"
+
+
+def test_grant_create_rejects_overlong_expiry(grants_env):
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {"to": "g@x.com"},
+            "purpose": "x",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+            "expires_in_days": 400,
+        },
+        grants_env,
+    )
+    assert code == 1
+    assert resp["error_code"] == "invalid_input"
+
+
+def test_grant_create_unknown_capability(grants_env):
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "not.real",
+            "constraints": {"to": "g@x.com"},
+            "purpose": "x",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+        },
+        grants_env,
+    )
+    assert code == 1
+    assert resp["error_code"] == "unknown_capability"
+
+
+def test_gmail_send_matching_grant_auto_executes(grants_env):
+    """A gmail.send request matching an active grant auto-executes (no
+    approval) — returns executing + the mcp_tool handoff + via grant."""
+    grant_id = _create_grant(grants_env)
+    code, resp = _run(
+        "request",
+        {
+            "capability": "gmail.send",
+            "params": {
+                "to": "graham@example.com",
+                "subject": "School roundup — week 3",
+                "body": "the news",
+            },
+        },
+        grants_env,
+    )
+    assert code == 0, resp
+    assert resp["status"] == "executing"
+    assert resp["via"] == "standing_grant"
+    assert resp["grant_id"] == grant_id
+    assert resp["result"]["tool"] == "mcp__claude_ai_Gmail__send_message"
+
+
+def test_gmail_send_non_matching_to_falls_through_to_approval(grants_env):
+    """NON-NEGOTIABLE: a gmail.send whose `to` doesn't match the grant
+    falls through to approval_required — never auto-sent."""
+    _create_grant(grants_env, to="graham@example.com")
+    code, resp = _run(
+        "request",
+        {
+            "capability": "gmail.send",
+            "params": {
+                "to": "stranger@elsewhere.com",
+                "subject": "hi",
+                "body": "x",
+            },
+        },
+        grants_env,
+    )
+    assert code == 0, resp
+    assert resp["status"] == "approval_required"
+    assert resp.get("via") != "standing_grant"
+
+
+def test_gmail_send_rate_limit_second_within_window_needs_approval(grants_env):
+    """Rate limit: with max_per_period=1, the first send auto-executes,
+    the second within the window falls through to approval."""
+    _create_grant(grants_env, max_per_period=1)
+    p1 = {"to": "graham@example.com", "subject": "roundup 1", "body": "a"}
+    code1, r1 = _run("request", {"capability": "gmail.send", "params": p1}, grants_env)
+    assert r1["status"] == "executing", r1
+    # Different body so idempotency key differs (fresh request).
+    p2 = {"to": "graham@example.com", "subject": "roundup 2", "body": "b"}
+    code2, r2 = _run("request", {"capability": "gmail.send", "params": p2}, grants_env)
+    assert r2["status"] == "approval_required", r2
+
+
+def test_grant_revoke_always_allowed_and_audited(grants_env):
+    grant_id = _create_grant(grants_env)
+    code, resp = _run("grant-revoke", {"grant_id": grant_id}, grants_env)
+    assert code == 0, resp
+    assert resp["status"] == "revoked"
+    assert resp["grant_id"] == grant_id
+    # Audit recorded.
+    log = Path(grants_env["DONNA_BROKER_AUDIT_DIR"]) / "audit.log"
+    assert "grant.revoked" in log.read_text(encoding="utf-8")
+    # grant-list shows it revoked.
+    _, listing = _run("grant-list", {}, grants_env)
+    assert listing["grants"][0]["status"] == "revoked"
+
+
+def test_grant_revoke_no_manifest_needed(grants_env, tmp_path):
+    """Revoke must always work — even if the capabilities manifest is
+    broken (revocation only reduces privilege, §3.6)."""
+    grant_id = _create_grant(grants_env)
+    env = dict(grants_env)
+    env["DONNA_BROKER_CAPABILITIES"] = str(tmp_path / "nope.yaml")
+    code, resp = _run("grant-revoke", {"grant_id": grant_id}, env)
+    assert code == 0, resp
+    assert resp["status"] == "revoked"
+
+
+def test_revoked_grant_no_longer_auto_executes(grants_env):
+    grant_id = _create_grant(grants_env)
+    _run("grant-revoke", {"grant_id": grant_id}, grants_env)
+    code, resp = _run(
+        "request",
+        {
+            "capability": "gmail.send",
+            "params": {"to": "graham@example.com", "subject": "x", "body": "y"},
+        },
+        grants_env,
+    )
+    assert resp["status"] == "approval_required"
+
+
+def test_grant_revoke_unknown_grant(grants_env):
+    code, resp = _run("grant-revoke", {"grant_id": "nope"}, grants_env)
+    assert code == 1
+    assert resp["error_code"] == "not_found"
+
+
+def test_grant_create_never_authorised_by_a_grant(grants_env):
+    """NON-NEGOTIABLE §3.1: grant.create is never matched by any standing
+    grant. There is no manifest capability `grant.create`, and the policy
+    layer short-circuits it — so a grant-create always requires the human
+    approval code, never an auto-execute."""
+    # Even after a grant exists, grant-create still raises approval_required.
+    _create_grant(grants_env)
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {"to": "other@example.com"},
+            "purpose": "another",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+        },
+        grants_env,
+    )
+    assert resp["status"] == "approval_required"
+    assert resp["is_grant"] is True
+
+
+def test_grant_create_audits_proposed_and_created(grants_env):
+    _create_grant(grants_env)
+    log = (Path(grants_env["DONNA_BROKER_AUDIT_DIR"]) / "audit.log").read_text()
+    assert "grant.create.proposed" in log
+    assert "grant.created" in log
+
+
+def test_auto_exec_audits_policy_allow_standing_grant(grants_env):
+    _create_grant(grants_env)
+    _run(
+        "request",
+        {
+            "capability": "gmail.send",
+            "params": {"to": "graham@example.com", "subject": "r", "body": "b"},
+        },
+        grants_env,
+    )
+    log = (Path(grants_env["DONNA_BROKER_AUDIT_DIR"]) / "audit.log").read_text()
+    assert "policy.allow.standing_grant" in log
+
+
+def test_grant_modes_in_frozen_sets():
+    for m in ("grant-create", "grant-list", "grant-revoke"):
+        assert m in main.MODES
+        assert m in main.MODE_HANDLERS
+    assert "grant-create" in main.MODES_NEEDING_MANIFESTS
+
+
+def test_grant_list_empty(grants_env):
+    code, resp = _run("grant-list", {}, grants_env)
+    assert code == 0
+    assert resp["status"] == "ok"
+    assert resp["grants"] == []
+
+
+def test_grant_create_subject_prefix_in_summary(grants_env):
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {
+                "to": "graham@example.com",
+                "subject": {"prefix": "School roundup"},
+            },
+            "purpose": "weekly",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+        },
+        grants_env,
+    )
+    assert code == 0
+    assert "School roundup" in resp["summary"]

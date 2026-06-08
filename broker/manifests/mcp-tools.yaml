@@ -17,6 +17,10 @@ tools:
   mcp__claude_ai_Gmail__list_labels: low
   mcp__claude_ai_Gmail__search_threads: low
   mcp__claude_ai_Gmail__create_draft: medium
+  # gmail.send is HIGH risk: always per-action approval at the hook unless
+  # a matching broker standing grant covers it (broker-standing-grants §8).
+  # Added by the standing-grants extension — no send tool was listed before.
+  mcp__claude_ai_Gmail__send_message: high
   mcp__claude_ai_Gmail__create_label: medium
   mcp__claude_ai_Gmail__label_message: medium
   mcp__claude_ai_Gmail__label_thread: medium

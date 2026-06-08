@@ -33,6 +33,7 @@ from typing import Any, Callable, Optional
 from broker import audit as audit_mod
 from broker import canonicalize
 from broker import executor
+from broker import grants_db
 from broker import policy
 from broker import requests_db as db
 from broker import resolver
@@ -45,7 +46,13 @@ MODES = frozenset({
     "status", "status-by-code", "list-pending", "list-recent",
     "audit-result", "rotate-hmac", "verify-audit", "verify-manifests",
     "verify-vault",
+    # broker-standing-grants §7: scoped approve-once autonomy.
+    "grant-create", "grant-list", "grant-revoke",
 })
+
+# broker-standing-grants §3.3 grant scope bounds.
+GRANT_DEFAULT_EXPIRES_DAYS = 90
+GRANT_MAX_EXPIRES_DAYS = 365
 
 
 # ---- config -------------------------------------------------------------
@@ -551,6 +558,22 @@ def _handle_request(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, A
             ),
         }
 
+    # broker-standing-grants §6: consult active standing grants BEFORE
+    # the risk-tier fallthrough. A matching, in-rate, MAC-verified grant
+    # auto-authorises the request (skips the per-run approval). The check
+    # is pure (now_ms passed in, grant store read locally). grant.create
+    # is never matched here (no self-escalation) — enforced inside
+    # check_standing_grants.
+    grants_db.ensure_grant_tables(conn)
+    grant_decision = policy.check_standing_grants(
+        conn, capability_name, params, now_ms, ctx["hmac_key"],
+    )
+    if grant_decision is not None:
+        return _auto_execute_via_grant(
+            ctx, cap, capability_name, params, params_hash, idem_key,
+            context_reason, now_ms, grant_decision,
+        )
+
     # Build the row.
     request_id = f"req-{uuid.uuid4().hex[:12]}"
     risk_level = cap.risk_level
@@ -653,6 +676,155 @@ def _handle_request(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, A
         "risk_level": risk_level,
         "approval_expires_at": approval_expires_at,
         "queue_file": queue_file_path,
+    }
+
+
+def _auto_execute_via_grant(
+    ctx: dict[str, Any],
+    cap: validator.Capability,
+    capability_name: str,
+    params: dict[str, Any],
+    params_hash: str,
+    idem_key: str,
+    context_reason: Optional[str],
+    now_ms: int,
+    grant_decision: dict[str, Any],
+) -> dict[str, Any]:
+    """broker-standing-grants §6: a standing grant matched this request.
+
+    Skip the per-run approval entirely. We still create a tracked
+    `requests` row (full audit + state machine), drive it
+    pending_approval → approved → executing through the normal HMAC-bound
+    path, then dispatch the executor. For mcp_tool capabilities this
+    returns the executor handoff (status `executing`); the PostToolUse
+    hook closes the row exactly as for a human-approved send.
+
+    The auto-allow is audited as `policy.allow.standing_grant` with the
+    matching grant_id (§9).
+    """
+    conn = ctx["conn"]
+    audit_dir = ctx["audit_dir"]
+    grant_id = grant_decision["grant_id"]
+
+    request_id = f"req-{uuid.uuid4().hex[:12]}"
+    risk_level = cap.risk_level
+    approval_expires_at = now_ms + cap.approval_window_minutes * 60 * 1000
+    exec_expires = now_ms + cap.execution_window_minutes * 60 * 1000
+    approval_code = policy.generate_approval_code()
+
+    creation_hmac = policy.compute_creation_hmac(
+        key=ctx["hmac_key"],
+        request_id=request_id,
+        capability=capability_name,
+        params_hash=params_hash,
+        idempotency_key_=idem_key,
+        risk_level=risk_level,
+        created_at=now_ms,
+        approval_expires_at=approval_expires_at,
+    )
+    resolved = resolver.policy_check_mode(capability_name, params)
+    resolved_summary = resolved.get("resolved_summary", capability_name)
+
+    row = db.Request(
+        request_id=request_id,
+        capability=capability_name,
+        params_json=json.dumps(params, sort_keys=True),
+        params_hash=params_hash,
+        idempotency_key=idem_key,
+        resolved_summary=resolved_summary,
+        context_reason=context_reason,
+        risk_level=risk_level,
+        state="pending_approval",
+        approval_code=approval_code,
+        approval_hmac=creation_hmac,
+        created_at=now_ms,
+        approval_expires_at=approval_expires_at,
+        execution_expires_at=None,
+        approved_at=None,
+        executed_at=None,
+        result_json=None,
+        error_code=None,
+        error_message=None,
+        prev_audit_hash=None,
+    )
+    try:
+        db.insert_request(conn, row)
+    except sqlite3.IntegrityError as e:
+        existing = db.get_by_idempotency_key(conn, idem_key)
+        if existing is not None:
+            return {
+                "status": "existing",
+                "request_id": existing.request_id,
+                "approval_code": existing.approval_code,
+                "state": existing.state,
+                "resolved_summary": existing.resolved_summary,
+            }
+        raise BrokerError("db_insert_failed", str(e)) from e
+
+    audit_mod.write_event(audit_dir, {
+        "event": "request_created",
+        "request_id": request_id,
+        "capability": capability_name,
+        "params_hash": params_hash,
+        "risk_level": risk_level,
+    })
+    # §9 auto-exec audit: the grant that authorised this, plus a hash of
+    # the canonical params (never the params themselves — §15 forbidden).
+    audit_mod.write_event(audit_dir, {
+        "event": "policy.allow.standing_grant",
+        "request_id": request_id,
+        "capability": capability_name,
+        "grant_id": grant_id,
+        "params_hash": params_hash,
+    })
+
+    # Promote pending_approval → approved with the extended approval HMAC.
+    creation_msg = policy.build_creation_message(
+        request_id=request_id,
+        capability=capability_name,
+        params_hash=params_hash,
+        idempotency_key_=idem_key,
+        risk_level=risk_level,
+        created_at=now_ms,
+        approval_expires_at=approval_expires_at,
+    )
+    approval_hmac = policy.compute_approval_hmac(
+        key=ctx["hmac_key"],
+        creation_msg=creation_msg,
+        execution_expires_at=exec_expires,
+        approved_at=now_ms,
+    )
+    db.transition(
+        conn, request_id, "pending_approval", "approved",
+        execution_expires_at=exec_expires,
+        approved_at=now_ms,
+        approval_hmac=approval_hmac,
+    )
+
+    approved_row = db.get_request(conn, request_id)
+    assert approved_row is not None
+
+    def audit_writer(evt: dict[str, Any]) -> None:
+        audit_mod.write_event(audit_dir, evt)
+
+    creds_config = executor.CredsConfig(
+        creds_dir=Path(ctx["config"]["creds_dir"]),
+        identity_path=Path(ctx["config"]["identity_path"]),
+        age_binary=ctx["config"]["age_binary"],
+    ) if cap.creds is not None else None
+
+    outcome = executor.execute(
+        cap, approved_row, params, conn, audit_writer=audit_writer,
+        creds_config=creds_config,
+    )
+    return {
+        "status": outcome.state,
+        "request_id": request_id,
+        "via": "standing_grant",
+        "grant_id": grant_id,
+        "result": outcome.result,
+        "error_code": outcome.error_code,
+        "error_message": outcome.error_message,
     }
 
 
@@ -800,6 +972,39 @@ def _handle_execute(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, A
             "request_id": row.request_id,
         })
         raise BrokerError("integrity_failed", "HMAC verification failed")
+
+    # broker-standing-grants §7: specialise execute to finalise a pending
+    # grant. A grant.create row is NOT a manifest capability — it has no
+    # executor. The approve decision + params_hash + HMAC have all been
+    # verified above (same guards as any approval), so persisting the
+    # grant now is safe. We promote pending → approved, then
+    # _finalise_grant drives approved → executing → succeeded and inserts
+    # the standing grant.
+    if row.capability == policy.GRANT_CREATE_CAPABILITY:
+        if row.state == "pending_approval":
+            now_ms = int(time.time() * 1000)
+            grant_exec_window_minutes = 720
+            exec_expires = now_ms + grant_exec_window_minutes * 60 * 1000
+            approval_hmac = policy.compute_approval_hmac(
+                key=ctx["hmac_key"],
+                creation_msg=creation_msg,
+                execution_expires_at=exec_expires,
+                approved_at=now_ms,
+            )
+            db.transition(
+                conn, row.request_id, "pending_approval", "approved",
+                execution_expires_at=exec_expires,
+                approved_at=now_ms,
+                approval_hmac=approval_hmac,
+            )
+            audit_mod.write_event(ctx["audit_dir"], {
+                "event": "request_approved",
+                "request_id": row.request_id,
+            })
+            refreshed = db.get_request(conn, row.request_id)
+            assert refreshed is not None
+            row = refreshed
+        return _finalise_grant(ctx, row, params)
 
     # Idempotent re-entry from `executing`. Happens when Donna's first
     # execute call handed off mcp_tool metadata but the subsequent MCP
@@ -1008,6 +1213,361 @@ def _handle_cancel(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, An
     return {"status": "cancelled", "request_id": rid}
 
 
+# ---- standing-grant modes (broker-standing-grants §7) -------------------
+
+
+def _format_grant_scope(
+    capability: str,
+    constraints: dict[str, Any],
+    purpose: str,
+    max_per_period: int,
+    period_seconds: int,
+    expires_in_days: int,
+) -> str:
+    """Plain-English full-scope summary shown at the grant approval (§7).
+
+    e.g. "Allow: send email to graham@… , ≤1/week, expires 90d, purpose
+    'School roundup'". The whole scope must be legible to the human
+    approving it — this is the meta-privilege consent string."""
+    if capability == "gmail.send":
+        target = constraints.get("to", "?")
+        action = f"send email to {target}"
+        subj = constraints.get("subject")
+        if isinstance(subj, dict) and "prefix" in subj:
+            action += f" with subject starting '{subj['prefix']}'"
+        elif isinstance(subj, str):
+            action += f" with subject '{subj}'"
+    else:
+        pins = ", ".join(f"{k}={v}" for k, v in sorted(constraints.items()))
+        action = f"{capability} ({pins})" if pins else capability
+
+    period_days = period_seconds / 86400
+    if abs(period_days - 7) < 1e-9:
+        rate = f"≤{max_per_period}/week"
+    elif abs(period_days - 1) < 1e-9:
+        rate = f"≤{max_per_period}/day"
+    else:
+        rate = f"≤{max_per_period} per {int(period_seconds)}s"
+
+    return (
+        f"Allow: {action} , {rate}, expires {expires_in_days}d, "
+        f"purpose '{purpose}'"
+    )
+
+
+def _handle_grant_create(
+    payload: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """broker-standing-grants §7. The meta-approval. Does NOT persist the
+    grant — it raises a normal approval_required whose summary spells out
+    the FULL scope. The grant is persisted only when that code is approved
+    via the existing execute path (see _finalise_grant).
+
+    `grant.create` is hard-coded high-risk and (by construction) excluded
+    from §6 grant-matching — no grant can authorise creating grants.
+    """
+    capability = payload.get("capability")
+    constraints = payload.get("constraints")
+    purpose = payload.get("purpose")
+    max_per_period = payload.get("max_per_period")
+    period_seconds = payload.get("period_seconds")
+    expires_in_days = payload.get("expires_in_days", GRANT_DEFAULT_EXPIRES_DAYS)
+    raw_context_reason = payload.get("context_reason") or ""
+
+    if not isinstance(capability, str) or not capability:
+        raise BrokerError("invalid_input", "capability required")
+    if not isinstance(constraints, dict):
+        raise BrokerError("invalid_input", "constraints must be an object")
+    if not isinstance(purpose, str) or not purpose:
+        raise BrokerError("invalid_input", "purpose required")
+    if not isinstance(max_per_period, int) or isinstance(max_per_period, bool) \
+            or max_per_period <= 0:
+        raise BrokerError("invalid_input", "max_per_period must be a positive int")
+    if not isinstance(period_seconds, int) or isinstance(period_seconds, bool) \
+            or period_seconds <= 0:
+        raise BrokerError("invalid_input", "period_seconds must be a positive int")
+    if not isinstance(expires_in_days, int) or isinstance(expires_in_days, bool) \
+            or expires_in_days <= 0:
+        raise BrokerError("invalid_input", "expires_in_days must be a positive int")
+    if expires_in_days > GRANT_MAX_EXPIRES_DAYS:
+        raise BrokerError(
+            "invalid_input",
+            f"expires_in_days {expires_in_days} exceeds max "
+            f"{GRANT_MAX_EXPIRES_DAYS}",
+        )
+
+    # The grant must target a known capability (you can't grant standing
+    # autonomy for something the broker can't execute).
+    _require_capability(ctx["capabilities"], capability)
+
+    # §5 structural validation (e.g. gmail.send must pin `to`).
+    try:
+        policy.validate_constraints(capability, constraints)
+    except policy.GrantConstraintError as e:
+        raise BrokerError("invalid_constraints", str(e)) from e
+
+    try:
+        context_reason, redactions = policy.sanitise_context_reason(
+            raw_context_reason
+        )
+    except policy.ContextReasonTooLong as e:
+        raise BrokerError("invalid_input", str(e)) from e
+
+    conn = ctx["conn"]
+    grants_db.ensure_grant_tables(conn)
+    now_ms = int(time.time() * 1000)
+
+    # The grant proposal is carried in the request row's params_json so
+    # the existing execute path can finalise it after human approval.
+    proposal = {
+        "capability": capability,
+        "constraints": constraints,
+        "purpose": purpose,
+        "max_per_period": max_per_period,
+        "period_seconds": period_seconds,
+        "expires_in_days": expires_in_days,
+    }
+    params_hash = canonicalize.params_hash(proposal)
+    canonical = canonicalize.canonicalize(proposal)
+    date_component = time.strftime("%Y-%m-%d", time.gmtime(now_ms / 1000))
+    idem_key = policy.idempotency_key(
+        policy.GRANT_CREATE_CAPABILITY, canonical, date_component,
+    )
+
+    existing = db.get_by_idempotency_key(conn, idem_key)
+    if existing is not None:
+        return {
+            "status": "existing",
+            "request_id": existing.request_id,
+            "approval_code": existing.approval_code,
+            "state": existing.state,
+            "resolved_summary": existing.resolved_summary,
+        }
+
+    request_id = f"req-{uuid.uuid4().hex[:12]}"
+    # grant.create is HARD-CODED high-risk (§3.1). Reuse gmail.send's
+    # windows as a sensible default for the meta-approval; the exact
+    # window isn't grant-scope, just how long the approval code lives.
+    approval_window_minutes = 1440
+    approval_expires_at = now_ms + approval_window_minutes * 60 * 1000
+    approval_code = policy.generate_approval_code()
+    summary = _format_grant_scope(
+        capability, constraints, purpose, max_per_period,
+        period_seconds, expires_in_days,
+    )
+    creation_hmac = policy.compute_creation_hmac(
+        key=ctx["hmac_key"],
+        request_id=request_id,
+        capability=policy.GRANT_CREATE_CAPABILITY,
+        params_hash=params_hash,
+        idempotency_key_=idem_key,
+        risk_level="high",
+        created_at=now_ms,
+        approval_expires_at=approval_expires_at,
+    )
+
+    row = db.Request(
+        request_id=request_id,
+        capability=policy.GRANT_CREATE_CAPABILITY,
+        params_json=json.dumps(proposal, sort_keys=True),
+        params_hash=params_hash,
+        idempotency_key=idem_key,
+        resolved_summary=summary,
+        context_reason=context_reason,
+        risk_level="high",
+        state="pending_approval",
+        approval_code=approval_code,
+        approval_hmac=creation_hmac,
+        created_at=now_ms,
+        approval_expires_at=approval_expires_at,
+        execution_expires_at=None,
+        approved_at=None,
+        executed_at=None,
+        result_json=None,
+        error_code=None,
+        error_message=None,
+        prev_audit_hash=None,
+    )
+    try:
+        db.insert_request(conn, row)
+    except sqlite3.IntegrityError as e:
+        existing = db.get_by_idempotency_key(conn, idem_key)
+        if existing is not None:
+            return {
+                "status": "existing",
+                "request_id": existing.request_id,
+                "approval_code": existing.approval_code,
+                "state": existing.state,
+                "resolved_summary": existing.resolved_summary,
+            }
+        raise BrokerError("db_insert_failed", str(e)) from e
+
+    audit_dir = ctx["audit_dir"]
+    audit_mod.write_event(audit_dir, {
+        "event": "grant.create.proposed",
+        "request_id": request_id,
+        "grant_capability": capability,
+        "params_hash": params_hash,
+    })
+    if redactions:
+        audit_mod.write_event(audit_dir, {
+            "event": "audit.context_reason_redacted",
+            "request_id": request_id,
+            "original_length": len(raw_context_reason),
+            "redaction_types": redactions,
+            "context_reason_original": raw_context_reason,
+        })
+
+    queue_file_path = _write_queue_file(
+        ctx["queue_dir"], request_id, approval_code, approval_expires_at,
+        policy.GRANT_CREATE_CAPABILITY, "high", summary,
+        context_reason or "",
+    )
+
+    return {
+        "status": "approval_required",
+        "request_id": request_id,
+        "code": approval_code,
+        "summary": summary,
+        "risk_level": "high",
+        "is_grant": True,
+        "approval_expires_at": approval_expires_at,
+        "queue_file": queue_file_path,
+    }
+
+
+def _finalise_grant(
+    ctx: dict[str, Any], row: db.Request, proposal: dict[str, Any]
+) -> dict[str, Any]:
+    """Persist a grant from an approved grant.create row. Called from the
+    execute path AFTER the approve decision + HMAC verify. The grant's
+    constraints MAC is computed here with the broker key; the requests
+    row is transitioned approved → succeeded."""
+    conn = ctx["conn"]
+    grants_db.ensure_grant_tables(conn)
+    now_ms = int(time.time() * 1000)
+
+    capability = proposal["capability"]
+    constraints = proposal["constraints"]
+    expires_in_days = int(proposal["expires_in_days"])
+    expires_at = now_ms + expires_in_days * 86400 * 1000
+
+    grant_id = f"grant-{uuid.uuid4().hex[:12]}"
+    constraints_mac = policy.compute_constraints_mac(
+        ctx["hmac_key"], capability, constraints,
+    )
+    grant = grants_db.StandingGrant(
+        id=grant_id,
+        capability=capability,
+        constraints=json.dumps(constraints, sort_keys=True),
+        constraints_mac=constraints_mac,
+        purpose=proposal["purpose"],
+        max_per_period=int(proposal["max_per_period"]),
+        period_seconds=int(proposal["period_seconds"]),
+        created_at=now_ms,
+        expires_at=expires_at,
+        approved_via=row.approval_code or "",
+        revoked_at=None,
+    )
+    grants_db.insert_grant(conn, grant)
+
+    db.transition(
+        conn, row.request_id, "approved", "executing",
+    )
+    db.transition(
+        conn, row.request_id, "executing", "succeeded",
+        result_json=json.dumps({"grant_id": grant_id}),
+        executed_at=now_ms,
+    )
+    audit_mod.write_event(ctx["audit_dir"], {
+        "event": "grant.created",
+        "request_id": row.request_id,
+        "grant_id": grant_id,
+        "grant_capability": capability,
+        "max_per_period": grant.max_per_period,
+        "period_seconds": grant.period_seconds,
+        "expires_at": expires_at,
+    })
+    return {
+        "status": "succeeded",
+        "request_id": row.request_id,
+        "grant_id": grant_id,
+        "result": {"grant_id": grant_id},
+        "error_code": None,
+        "error_message": None,
+    }
+
+
+def _handle_grant_list(
+    payload: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """broker-standing-grants §7. Returns active + expired (and revoked)
+    grants for the app. now_ms is computed here only to label active vs
+    expired in the response — the stored rows are unchanged."""
+    conn = ctx["conn"]
+    grants_db.ensure_grant_tables(conn)
+    now_ms = int(time.time() * 1000)
+    grants = grants_db.list_grants(conn)
+    out = []
+    for g in grants:
+        if g.revoked_at is not None:
+            status = "revoked"
+        elif g.expires_at <= now_ms:
+            status = "expired"
+        else:
+            status = "active"
+        out.append({
+            "grant_id": g.id,
+            "capability": g.capability,
+            "constraints": json.loads(g.constraints),
+            "purpose": g.purpose,
+            "max_per_period": g.max_per_period,
+            "period_seconds": g.period_seconds,
+            "created_at": g.created_at,
+            "expires_at": g.expires_at,
+            "revoked_at": g.revoked_at,
+            "status": status,
+        })
+    return {"status": "ok", "grants": out}
+
+
+def _handle_grant_revoke(
+    payload: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """broker-standing-grants §7. Sets revoked_at. ALWAYS allowed (revoke
+    only ever reduces privilege, §3.6) — no approval, no rate limit.
+    Audited."""
+    grant_id = payload.get("grant_id")
+    if not isinstance(grant_id, str) or not grant_id:
+        raise BrokerError("invalid_input", "grant_id required")
+
+    conn = ctx["conn"]
+    grants_db.ensure_grant_tables(conn)
+    now_ms = int(time.time() * 1000)
+    revoked = grants_db.revoke_grant(conn, grant_id, now_ms)
+    if not revoked:
+        # Either missing or already revoked. Idempotent + always-allowed:
+        # report the state without erroring (revoke never fails for a
+        # policy reason).
+        existing = grants_db.get_grant(conn, grant_id)
+        if existing is None:
+            raise BrokerError(
+                "not_found", f"no grant with id {grant_id!r}",
+                status="not_found",
+            )
+        return {
+            "status": "already_revoked",
+            "grant_id": grant_id,
+            "revoked_at": existing.revoked_at,
+        }
+    audit_mod.write_event(ctx["audit_dir"], {
+        "event": "grant.revoked",
+        "grant_id": grant_id,
+        "revoked_at": now_ms,
+    })
+    return {"status": "revoked", "grant_id": grant_id, "revoked_at": now_ms}
+
+
 def _handle_verify_audit(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, Any]:
     result = audit_mod.verify_chain(ctx["audit_dir"])
     if result is None:
@@ -1139,6 +1699,9 @@ MODE_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, An
     "verify-audit": _handle_verify_audit,
     "verify-manifests": _handle_verify_manifests,
     "verify-vault": _handle_verify_vault,
+    "grant-create": _handle_grant_create,
+    "grant-list": _handle_grant_list,
+    "grant-revoke": _handle_grant_revoke,
 }
 
 # Modes left as explicit not-implemented so the CLI doesn't silently
@@ -1188,6 +1751,11 @@ def _build_ctx(config: dict[str, str], need_manifests: bool) -> dict[str, Any]:
 MODES_NEEDING_MANIFESTS = frozenset({
     "request", "execute", "policy-check", "audit-result",
     "verify-manifests", "verify-vault",
+    # grant-create validates the target capability against the manifest
+    # and needs the broker key to bind the constraints MAC. grant-list
+    # and grant-revoke are deliberately manifest-free (revoke must always
+    # work, even if a manifest is broken — §3.6).
+    "grant-create",
 })
 
 

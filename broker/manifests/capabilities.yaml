@@ -26,6 +26,24 @@ capabilities:
     approval_window_minutes: 1440
     execution_window_minutes: 720
 
+  # gmail.send is HIGH-risk: always per-action approval UNLESS a matching
+  # standing grant covers it (broker-standing-grants §8). A grant for
+  # gmail.send MUST pin `to` — the validator rejects an unpinned recipient.
+  - name: gmail.send
+    executor:
+      type: mcp_tool
+      tool: mcp__claude_ai_Gmail__send_message
+    param_schema:
+      $ref: ./schemas/gmail_send.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: high
+    revalidate:
+      not_applicable: stateless_write
+    idempotency_date_from: created_utc
+    approval_window_minutes: 1440
+    execution_window_minutes: 720
+
   # ---- Google Calendar --------------------------------------------------
 
   - name: gcal.create_event
