@@ -110,8 +110,12 @@ mkdir -p "${CONFIG}/backups"
 # deploy as "EACCES: permission denied, mkdir '.../heartbeat'".
 mkdir -p "${CONFIG}/heartbeat"
 
-echo "==> chown'ing ${BROKER_HOME} to donna-broker:donna-bridge"
-chown -R donna-broker:donna-bridge "${BROKER_HOME}"
+echo "==> chown'ing managed dirs to donna-broker:donna-bridge"
+# Scope chown to the dirs we manage — NOT the whole home. macOS SIP protects
+# ~/Library/{Mail,Containers,...}; a recursive chown of the home fails on those
+# and aborts under `set -e`. (The home itself is created with the right owner.)
+chown donna-broker:donna-bridge "${BROKER_HOME}" 2>/dev/null || true
+chown -R donna-broker:donna-bridge "${BROKER_HOME}/broker" "${BROKER_HOME}/audit" "${CONFIG}"
 
 # 2770 on the shared dirs so donna-broker + grahamwilliamson (both in
 # donna-bridge) can read/write, but no one else. Setgid makes new
@@ -148,7 +152,7 @@ done
 mkdir -p "${CONFIG}/schemas"
 cp -n "${REPO_ROOT}/broker/manifests/schemas/"*.json "${CONFIG}/schemas/" 2>/dev/null || true
 
-chown -R donna-broker:donna-bridge "${BROKER_HOME}"
+chown -R donna-broker:donna-bridge "${BROKER_HOME}/broker" "${CONFIG}"
 
 # ---- 6. create broker venv as donna-broker ----
 # Three quirks combine to make this the gnarliest step on a fresh box:
