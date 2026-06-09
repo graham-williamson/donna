@@ -143,6 +143,74 @@ def verify(mid):
     return {"status": "verified", "id": mid}
 
 
+def archive(mid, reason=""):
+    """Retire a memory: status='archived' so recall() never returns it again.
+    NEVER deletes — the row is kept, with the reason + timestamp recorded in
+    metadata_json, so it stays auditable and reversible. Idempotent."""
+    conn = get_db()
+    row = conn.execute("SELECT metadata_json FROM memories WHERE id=?", (mid,)).fetchone()
+    if not row:
+        return {"status": "missing", "id": mid}
+    try:
+        meta = json.loads(row["metadata_json"] or "{}")
+    except Exception:
+        meta = {}
+    meta["archived_reason"] = reason
+    meta["archived_at"] = now_iso()
+    conn.execute("UPDATE memories SET status='archived', metadata_json=? WHERE id=?",
+                 (json.dumps(meta), mid))
+    conn.commit()
+    return {"status": "archived", "id": mid}
+
+
+def correct(mid, new_content, reason="", **overrides):
+    """Supersede a wrong memory with a corrected one, non-destructively: ARCHIVE
+    the old fact and ADD a new one that INHERITS the old fact's owner / kind /
+    category / confidence / topics (each overridable via **overrides), tagged
+    metadata.supersedes=mid. The old fact is retained (archived), not deleted."""
+    conn = get_db()
+    old = conn.execute("SELECT * FROM memories WHERE id=?", (mid,)).fetchone()
+    if not old:
+        return {"status": "missing", "id": mid}
+    topics = [r["topic"] for r in conn.execute(
+        "SELECT topic FROM memory_topics WHERE memory_id=?", (mid,)).fetchall()]
+    archive(mid, reason or "superseded by correction")
+    entry = {
+        "kind": overrides.get("kind", old["kind"]),
+        "owner": overrides.get("owner", old["owner"]),
+        "shared": overrides.get("shared", old["shared"]),
+        "category": overrides.get("category", old["category"]),
+        "content": new_content,
+        "confidence": overrides.get("confidence", old["confidence"]),
+        "topics": overrides.get("topics", topics),
+        "tags": overrides.get("tags", [t for t in (old["tags"] or "").split(",") if t]),
+        "metadata": {"supersedes": mid, "correction_reason": reason},
+    }
+    res = add(entry)
+    return {"status": "corrected", "archived": mid,
+            "added": res.get("id"), "add_status": res.get("status")}
+
+
+def recall_all(topic, limit=10):
+    """Like recall() but ACROSS ALL OWNERS (no shared/owner scoping) — the whole
+    brain. For Donna's in-app chat, which sees every coach's facts. Active only."""
+    conn = get_db()
+    q = ("SELECT m.* FROM memories m JOIN memory_topics t ON t.memory_id = m.id "
+         "WHERE t.topic = ? AND m.status='active' ORDER BY m.created_at DESC LIMIT ?")
+    return [dict(r) for r in conn.execute(q, (topic, limit))]
+
+
+def all_active(limit=200, kinds=("semantic", "observation", "episodic")):
+    """A bounded full-brain snapshot: all active facts (any owner) of the given
+    kinds, newest first. Single-user scale — used to give Donna's chat broad
+    context when no single topic dominates the message."""
+    conn = get_db()
+    ph = ",".join("?" for _ in kinds)
+    q = (f"SELECT * FROM memories WHERE status='active' AND kind IN ({ph}) "
+         "ORDER BY created_at DESC LIMIT ?")
+    return [dict(r) for r in conn.execute(q, (*kinds, limit))]
+
+
 def _age_days(last_verified):
     lv = datetime.strptime(last_verified, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
     return (datetime.now(timezone.utc) - lv).total_seconds() / 86400.0
