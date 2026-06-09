@@ -19,7 +19,10 @@ DB_PATH = os.environ.get(
 )
 
 VALID_KINDS = {"episodic", "observation", "semantic"}
-VALID_OWNERS = {"donna", "nike", "esme", "bodhi", "shared", "chief"}
+# Donna's owners + Daru's council coaches (so dream.py — a separate process — can
+# consolidate Daru-coach memories too; memory_bridge also adds these at runtime).
+VALID_OWNERS = {"donna", "nike", "esme", "bodhi", "shared", "chief",
+                "sage", "takumi", "reeve", "momo", "kuro", "daru"}
 DECAY_DEFAULTS = {"semantic": 30, "observation": 7, "episodic": None}
 PROMOTE_THRESHOLD = 5
 
