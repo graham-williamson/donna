@@ -28,7 +28,8 @@ shift
 VALID_MODES=(
   request policy-check execute cancel reconcile
   status status-by-code list-pending list-recent
-  audit-result rotate-hmac verify-audit verify-manifests
+  audit-result rotate-hmac verify-audit verify-manifests verify-vault
+  grant-create grant-list grant-revoke
 )
 FOUND=0
 for m in "${VALID_MODES[@]}"; do
