@@ -345,6 +345,34 @@ def issues(status="open", limit=100):
     return [dict(r) for r in rows]
 
 
+def resolve_issue(issue_id, choice):
+    """Human resolution of a flagged pair (Daru's Mind surface, 2026-06-11).
+    choice: 'a' keeps fact A (archives B) · 'b' keeps B (archives A) ·
+    'both' = both are true (flag dismissed, nothing archived).
+    Archive-only, never deletes; idempotent on non-open issues."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM memory_issues WHERE id=?",
+                       (int(issue_id),)).fetchone()
+    if not row:
+        return {"status": "missing", "id": issue_id}
+    if row["status"] != "open":
+        return {"status": row["status"], "id": issue_id}
+    archived = None
+    if choice in ("a", "b"):
+        keep = row["id_a"] if choice == "a" else row["id_b"]
+        lose = row["id_b"] if choice == "a" else row["id_a"]
+        archive(lose, reason=f"memory issue #{row['id']} resolved: kept #{keep}")
+        archived = lose
+    new_status = "resolved" if choice in ("a", "b") else "dismissed"
+    conn = get_db()
+    conn.execute("UPDATE memory_issues SET status=?, detail=? WHERE id=?",
+                 (new_status,
+                  (row["detail"] or "") + f" | choice={choice}", row["id"]))
+    conn.commit()
+    return {"status": new_status, "id": row["id"],
+            "choice": choice, "archived": archived}
+
+
 def audit(jaccard_threshold=0.6):
     """Pairwise near-duplicate scan within each (owner, kind) of active facts.
     Flags pairs into memory_issues (idempotent). Returns counts."""
