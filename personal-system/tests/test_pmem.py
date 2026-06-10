@@ -169,3 +169,90 @@ def test_cli_add_and_recall(tmp_path):
                            "--topic", "t", "--persona", "donna"],
                           capture_output=True, text=True, env=env)
     assert "cli works" in out2.stdout
+
+
+# ---------------------------------------------------------------------------
+# 2026-06-10 upgrades: scored recall, FTS search, near-dup audit, summarizer
+# ---------------------------------------------------------------------------
+def test_recall_ranks_recurrence_and_confidence_over_recency(tmp_path):
+    pmem = load_pmem(tmp_path / "memory.db")
+    # a much-recurred high-confidence fact, added FIRST (older)
+    r = pmem.add({"kind": "observation", "owner": "nike", "confidence": "high",
+                  "content": "trains best in the morning", "topics": ["training"]})
+    c = pmem.get_db()
+    c.execute("UPDATE memories SET recurrence_count=20 WHERE id=?", (r["id"],))
+    c.commit()
+    # a one-off low-confidence fact, added LAST (newest)
+    pmem.add({"kind": "observation", "owner": "nike", "confidence": "low",
+              "content": "mentioned a sore toe once", "topics": ["training"]})
+    rows = pmem.recall("training", "nike", limit=2)
+    assert rows[0]["content"] == "trains best in the morning"
+
+
+def test_search_finds_by_content_word(tmp_path):
+    pmem = load_pmem(tmp_path / "memory.db")
+    pmem.add({"kind": "episodic", "owner": "nike",
+              "content": "Graham felt exhausted after the late flight",
+              "topics": ["energy"]})
+    pmem.add({"kind": "episodic", "owner": "nike",
+              "content": "Bought new running shoes", "topics": ["kit"]})
+    rows = pmem.search("exhausted", persona="nike")
+    assert len(rows) == 1 and "exhausted" in rows[0]["content"]
+    # owner scoping: another persona without shared=0 restriction sees shared facts
+    rows2 = pmem.search("exhausted", persona="sage")
+    assert len(rows2) == 1  # shared=1 default
+
+
+def test_search_excludes_archived(tmp_path):
+    pmem = load_pmem(tmp_path / "memory.db")
+    r = pmem.add({"kind": "episodic", "owner": "nike",
+                  "content": "old fact about squats", "topics": ["t"]})
+    pmem.archive(r["id"], "outdated")
+    assert pmem.search("squats", persona="nike") == []
+
+
+def test_audit_flags_near_duplicates(tmp_path):
+    pmem = load_pmem(tmp_path / "memory.db")
+    pmem.add({"kind": "observation", "owner": "nike",
+              "content": "low energy after a late night out", "topics": ["energy"]})
+    pmem.add({"kind": "observation", "owner": "nike",
+              "content": "low energy after late nights", "topics": ["energy"]})
+    pmem.add({"kind": "observation", "owner": "nike",
+              "content": "enjoys hill sprints on Saturdays", "topics": ["energy"]})
+    res = pmem.audit()
+    assert res["near_dups"] >= 1
+    conn = pmem.get_db()
+    issues = conn.execute("SELECT * FROM memory_issues").fetchall()
+    assert any(i["kind"] == "near_dup" for i in issues)
+    # idempotent: re-running doesn't duplicate issues
+    n = len(issues)
+    pmem.audit()
+    assert len(conn.execute("SELECT * FROM memory_issues").fetchall()) == n
+
+
+def test_promote_uses_summarizer_when_given(tmp_path):
+    pmem = load_pmem(tmp_path / "memory.db")
+    for txt in ("tired monday", "tired tuesday", "tired friday",
+                "tired after travel", "tired post-lunch"):
+        pmem.add({"kind": "observation", "owner": "nike",
+                  "content": txt, "topics": ["energy"]})
+    res = pmem.promote("energy", "nike",
+                       summarizer=lambda topic, contents: "Graham is regularly tired.")
+    assert res["promoted"] is True
+    row = pmem.get_db().execute("SELECT content FROM memories WHERE id=?",
+                                (res["semantic_id"],)).fetchone()
+    assert row["content"] == "Graham is regularly tired."
+
+
+def test_promote_summarizer_failure_falls_back_to_concat(tmp_path):
+    pmem = load_pmem(tmp_path / "memory.db")
+    for txt in ("a", "b", "c", "d", "e"):
+        pmem.add({"kind": "observation", "owner": "nike",
+                  "content": txt, "topics": ["energy"]})
+    def boom(topic, contents):
+        raise RuntimeError("llm down")
+    res = pmem.promote("energy", "nike", summarizer=boom)
+    assert res["promoted"] is True
+    row = pmem.get_db().execute("SELECT content FROM memories WHERE id=?",
+                                (res["semantic_id"],)).fetchone()
+    assert "Consolidated pattern on 'energy'" in row["content"]

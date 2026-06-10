@@ -51,6 +51,16 @@ CREATE TABLE IF NOT EXISTS memory_topics (
     topic TEXT NOT NULL,
     PRIMARY KEY (memory_id, topic)
 );
+CREATE TABLE IF NOT EXISTS memory_issues (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    id_a INTEGER NOT NULL,
+    id_b INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    detail TEXT DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TEXT NOT NULL,
+    UNIQUE (id_a, id_b, kind)
+);
 CREATE INDEX IF NOT EXISTS idx_mem_kind ON memories(kind);
 CREATE INDEX IF NOT EXISTS idx_mem_owner ON memories(owner);
 CREATE INDEX IF NOT EXISTS idx_mem_status ON memories(status);
@@ -118,6 +128,30 @@ def add(entry):
     return {"status": "added", "id": mid}
 
 
+# --- relevance scoring (2026-06-10): recall is ranked, not just newest-first.
+# A 20×-recurred high-confidence pattern should outrank a one-off mention from
+# yesterday. Computed on read; no schema change; additive.
+_CONFIDENCE_W = {"high": 2.0, "medium": 1.0, "low": 0.5, "": 1.0}
+
+
+def _score(row):
+    import math
+    conf = _CONFIDENCE_W.get((row.get("confidence") or "").lower(), 1.0)
+    rec = math.log10((row.get("recurrence_count") or 1) + 1) + 1.0
+    try:
+        age = _age_days(row["last_verified"])
+    except Exception:
+        age = 0.0
+    decay = row.get("decay_days") or DECAY_DEFAULTS.get(row.get("kind"), None)
+    fresh = 1.0 if decay is None else max(0.5, 1.0 - 0.5 * min(1.0, age / max(decay, 1)))
+    return conf * rec * fresh
+
+
+def _rank(rows, limit):
+    rows.sort(key=_score, reverse=True)
+    return rows[:limit]
+
+
 def recall(topic, persona, kind=None, limit=10, include_stale=False):
     conn = get_db()
     q = ("SELECT m.* FROM memories m JOIN memory_topics t ON t.memory_id = m.id "
@@ -130,9 +164,10 @@ def recall(topic, persona, kind=None, limit=10, include_stale=False):
     if kind:
         q += "AND m.kind = ? "
         params.append(kind)
+    # over-fetch then rank by relevance (confidence × recurrence × freshness)
     q += "ORDER BY m.created_at DESC LIMIT ?"
-    params.append(limit)
-    return [dict(r) for r in conn.execute(q, params)]
+    params.append(max(limit * 4, limit))
+    return _rank([dict(r) for r in conn.execute(q, params)], limit)
 
 
 def verify(mid):
@@ -197,7 +232,142 @@ def recall_all(topic, limit=10):
     conn = get_db()
     q = ("SELECT m.* FROM memories m JOIN memory_topics t ON t.memory_id = m.id "
          "WHERE t.topic = ? AND m.status='active' ORDER BY m.created_at DESC LIMIT ?")
-    return [dict(r) for r in conn.execute(q, (topic, limit))]
+    return _rank([dict(r) for r in conn.execute(q, (topic, max(limit * 4, limit)))], limit)
+
+
+# --- full-text search (2026-06-10): topics are rigid ("tired" never finds the
+# "energy" facts). FTS5 over content, kept in sync by triggers + a lazy
+# backfill; LIKE fallback if this SQLite lacks FTS5. Additive.
+_FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(content, mem_id UNINDEXED);
+CREATE TRIGGER IF NOT EXISTS memories_fts_ins AFTER INSERT ON memories BEGIN
+    INSERT INTO memory_fts (content, mem_id) VALUES (new.content, new.id);
+END;
+"""
+
+
+def _ensure_fts(conn):
+    conn.executescript(_FTS_SCHEMA)
+    conn.execute(
+        "INSERT INTO memory_fts (content, mem_id) "
+        "SELECT m.content, m.id FROM memories m "
+        "WHERE m.id NOT IN (SELECT mem_id FROM memory_fts)")
+    conn.commit()
+
+
+def search(text, persona=None, limit=10, include_stale=False):
+    """Free-text search over memory CONTENT (not topics). Owner-scoped when a
+    persona is given (their facts + shared). Best-effort: any FTS failure falls
+    back to a LIKE scan; failures never raise."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    conn = get_db()
+    status_sql = "m.status='active'" if not include_stale else "m.status!='archived'"
+    scope_sql, scope_params = ("AND (m.shared=1 OR m.owner=?)", [persona]) if persona else ("", [])
+    try:
+        _ensure_fts(conn)
+        q = (f"SELECT m.* FROM memory_fts f JOIN memories m ON m.id=f.mem_id "
+             f"WHERE memory_fts MATCH ? AND {status_sql} {scope_sql} LIMIT ?")
+        rows = conn.execute(q, ['"%s"' % text.replace('"', " "), *scope_params,
+                                max(limit * 4, limit)]).fetchall()
+    except Exception:
+        q = (f"SELECT m.* FROM memories m WHERE m.content LIKE ? AND {status_sql} "
+             f"{scope_sql} LIMIT ?")
+        rows = conn.execute(q, [f"%{text}%", *scope_params, max(limit * 4, limit)]).fetchall()
+    return _rank([dict(r) for r in rows], limit)
+
+
+def list_facts(owner=None, topic=None, kind=None, status="active", limit=100):
+    """Browse the brain (memory-browser backend): filterable, ranked, with each
+    fact's topics attached. status='any' includes everything but archived."""
+    conn = get_db()
+    q = "SELECT DISTINCT m.* FROM memories m "
+    where, params = [], []
+    if topic:
+        q += "JOIN memory_topics t ON t.memory_id = m.id "
+        where.append("t.topic=?"); params.append(topic)
+    if status == "any":
+        where.append("m.status!='archived'")
+    elif status:
+        where.append("m.status=?"); params.append(status)
+    if owner:
+        where.append("m.owner=?"); params.append(owner)
+    if kind:
+        where.append("m.kind=?"); params.append(kind)
+    if where:
+        q += "WHERE " + " AND ".join(where) + " "
+    q += "ORDER BY m.created_at DESC LIMIT ?"
+    params.append(max(limit * 2, limit))
+    rows = _rank([dict(r) for r in conn.execute(q, params)], limit)
+    for r in rows:
+        r["topics"] = [x["topic"] for x in conn.execute(
+            "SELECT topic FROM memory_topics WHERE memory_id=?", (r["id"],))]
+    return rows
+
+
+def topics_summary():
+    """All active (owner, topic) pairs with fact counts — the brain's index."""
+    conn = get_db()
+    return [dict(r) for r in conn.execute(
+        "SELECT t.topic, m.owner, COUNT(*) AS n FROM memory_topics t "
+        "JOIN memories m ON m.id=t.memory_id WHERE m.status='active' "
+        "GROUP BY t.topic, m.owner ORDER BY n DESC")]
+
+
+# --- nightly audit (2026-06-10): proactively flag near-duplicate facts into
+# memory_issues instead of waiting for a contradiction to surface in chat.
+# Deterministic (token Jaccard); the LLM contradiction pass lives in dream.py.
+def _tokens(text):
+    import re as _re
+    # crude plural-stem (nights→night) — this is a flagging heuristic, not NLP
+    return {w.rstrip("s") for w in _re.split(r"[^a-z0-9]+", (text or "").lower())
+            if len(w) > 2}
+
+
+def flag_issue(id_a, id_b, kind, detail=""):
+    """Record one issue pair (idempotent via UNIQUE)."""
+    conn = get_db()
+    a, b = sorted((int(id_a), int(id_b)))
+    conn.execute(
+        "INSERT OR IGNORE INTO memory_issues (id_a, id_b, kind, detail, created_at) "
+        "VALUES (?,?,?,?,?)", (a, b, kind, detail, now_iso()))
+    conn.commit()
+
+
+def issues(status="open", limit=100):
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT i.*, ma.content AS content_a, mb.content AS content_b "
+        "FROM memory_issues i JOIN memories ma ON ma.id=i.id_a "
+        "JOIN memories mb ON mb.id=i.id_b WHERE i.status=? "
+        "ORDER BY i.created_at DESC LIMIT ?", (status, limit)).fetchall()
+    return [dict(r) for r in rows]
+
+
+def audit(jaccard_threshold=0.6):
+    """Pairwise near-duplicate scan within each (owner, kind) of active facts.
+    Flags pairs into memory_issues (idempotent). Returns counts."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT id, owner, kind, content FROM memories WHERE status='active'").fetchall()
+    by_group = {}
+    for r in rows:
+        by_group.setdefault((r["owner"], r["kind"]), []).append(r)
+    near = 0
+    for group in by_group.values():
+        toks = {r["id"]: _tokens(r["content"]) for r in group}
+        for i in range(len(group)):
+            for j in range(i + 1, len(group)):
+                a, b = group[i], group[j]
+                ta, tb = toks[a["id"]], toks[b["id"]]
+                if not ta or not tb:
+                    continue
+                jac = len(ta & tb) / len(ta | tb)
+                if jac >= jaccard_threshold:
+                    flag_issue(a["id"], b["id"], "near_dup", f"jaccard={jac:.2f}")
+                    near += 1
+    return {"near_dups": near, "checked": len(rows)}
 
 
 def all_active(limit=200, kinds=("semantic", "observation", "episodic")):
@@ -233,7 +403,12 @@ def sweep(promote_threshold=PROMOTE_THRESHOLD):
     return {"staled": staled, "deleted": 0}
 
 
-def promote(topic, owner, threshold=PROMOTE_THRESHOLD, confidence="medium"):
+def promote(topic, owner, threshold=PROMOTE_THRESHOLD, confidence="medium",
+            summarizer=None):
+    """Consolidate recurring observations into one semantic fact. `summarizer`
+    (optional callable (topic, [contents]) -> str, e.g. an LLM pass from
+    dream.py) turns the signals into ONE readable insight; any failure or None
+    falls back to the deterministic concatenation. Additive."""
     conn = get_db()
     obs = conn.execute(
         "SELECT m.id, m.content, m.recurrence_count FROM memories m "
@@ -244,8 +419,15 @@ def promote(topic, owner, threshold=PROMOTE_THRESHOLD, confidence="medium"):
     if weight < threshold:
         return {"promoted": False, "weight": weight}
     source_ids = [o["id"] for o in obs]
-    summary = "Consolidated pattern on '%s' (%d signals): %s" % (
-        topic, weight, "; ".join(o["content"] for o in obs[:10]))
+    summary = ""
+    if summarizer is not None:
+        try:
+            summary = (summarizer(topic, [o["content"] for o in obs[:10]]) or "").strip()
+        except Exception:
+            summary = ""
+    if not summary:
+        summary = "Consolidated pattern on '%s' (%d signals): %s" % (
+            topic, weight, "; ".join(o["content"] for o in obs[:10]))
     ts = now_iso()
     cur = conn.execute(
         "INSERT INTO memories (kind, owner, shared, content, content_hash, confidence, "
