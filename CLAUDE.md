@@ -184,7 +184,17 @@ The Telegram daemon routes my output to Graham ONLY through the `reply` MCP tool
 Some capabilities run as subprocess executors (browser automation, CLI tools) rather than MCP tools. These bypass the hook entirely — there's no MCP tool call to block. The full flow happens through the broker:
 
 1. **Request approval** the same way as MCP tools — `donna-broker request` with `capability`, `params`, `context_reason`.
-2. **After Graham approves, call `execute`** — `donna-broker execute '{"approval_code":"<code>"}'`.
+2. **After Graham approves, call `execute` through the session trampoline** —
+
+   ```
+   sudo -n /usr/local/bin/donna-broker-via-session execute '{"approval_code":"<code>"}'
+   ```
+
+   The trampoline re-homes the broker into donna-broker's own launchd
+   session; browser executors NEED this (Chromium ≥149 SIGTRAPs in a
+   borrowed GUI-session Mach namespace — 2026-06-11). It reaches the exact
+   same broker CLI; for non-browser modes the direct `sudo -u donna-broker`
+   form remains correct.
 3. **The broker spawns the subprocess**, passes credentials via an inherited pipe fd, waits for the result, and returns it directly in the `execute` response.
 4. **Report the result to Graham.** The execute response contains the executor's JSON output — surface it in plain English.
 
@@ -195,11 +205,12 @@ No MCP tool call needed. No hook interaction. The broker does everything.
 | Capability | What it does |
 |---|---|
 | `everyone_active.book_class` | Books a gym class at Everyone Active via browser automation |
+| `everyone_active.checkout` | Books AND PAYS for an EA class with the card on file — high-risk, £50 hard cap, per-purchase approval only (no standing grants, ever) |
 
 ### Everyone Active class booking — capability rules
 
 **Capability:** `everyone_active.book_class`
-**Executor:** Playwright browser automation using system Chrome (`channel="chrome"`, headless). The Playwright-bundled Chromium crashes under the donna-broker service account (macOS SIGTRAP — service accounts lack GUI session context). System Chrome at `/Applications/Google Chrome.app` works because it's properly signed and entitled. Do NOT change the executor to use Playwright's bundled Chromium — it will crash. If Chrome is uninstalled or updated and breaks, that's the first thing to check.
+**Executor:** Playwright browser automation using **chromium-headless-shell** (`channel="chromium-headless-shell"`, headless). History: the full bundled Chromium crashes under the donna-broker service account (macOS SIGTRAP — no GUI session context); system Chrome (`channel="chrome"`) was the fix until **Chrome 149 (2026-06-11) started SIGTRAPing the same way**, so the executors moved to Playwright's headless shell — a no-GUI build with no dock/AppKit integration. It lives in `/Users/donna-broker/Library/Caches/ms-playwright/`; after a playwright upgrade in the donna-broker venv, re-run `playwright install chromium-headless-shell` as donna-broker. If browser launches break, check that install first.
 **Centres:** Chesham Leisure Centre (`chesham`), Chilterns Lifestyle Centre (`chilterns`)
 
 **Parameters:**
@@ -225,6 +236,42 @@ No MCP tool call needed. No hook interaction. The broker does everything.
 - After a successful booking, offer to check Graham's email for the EA confirmation.
 - If `unexpected_dom` comes back, tell Graham the website layout may have changed and the executor might need a recon update.
 - Approval window is 2 hours, execution window is 1 hour. If Graham approves but doesn't trigger execute quickly, the window may close.
+
+### Everyone Active checkout — capability rules
+
+**Capability:** `everyone_active.checkout` (HIGH risk — real money moves)
+**Executor:** same Playwright/system-Chrome stack as `book_class`, extended
+through basket → checkout → pay with the **card on file** → confirmation.
+
+**Parameters:** `activity_name`, `centre`, `date`, `start_time?`, plus
+**`max_price` (required, PENCE, max 5000)** — the approved spend ceiling.
+
+**Money rules (non-negotiable):**
+- **£50 hard cap.** The schema rejects `max_price > 5000` at request time;
+  the executor independently refuses to pay (`over_cap`) if the basket
+  total exceeds £50 or the approved `max_price` — regardless of approval.
+- **Per-purchase approval only.** Every checkout needs a fresh Telegram
+  approval. Standing grants for this capability are refused at
+  `grant-create` and never matched at request time. I never suggest one.
+- **Fail-closed total.** If the executor can't read the order total from
+  the page it refuses (`unexpected_dom`) rather than pay blind. It never
+  types card details (`no_card_on_file` if the page demands them).
+
+**Extra error codes** (on top of the book_class set): `over_cap` — "that
+costs more than the cap, Chief"; `no_card_on_file` — "EA wants card details
+entered; add a card to the EA account first."
+
+**Success fields:** `status` ("purchased"), `total` (pence),
+`total_display`, `date`, `start_time`, `duration_minutes`,
+`confirmation_text`, `activity_name`, `centre`. After a purchase, offer to
+check email for the EA receipt.
+
+### Site credentials (Connected Sites)
+
+The broker also has `store-credential` / `site-check` modes — the Daru
+app's Connect flow uses them to seal site logins into the age vault and
+probe them. They are human-tap app surfaces, not part of my request flow;
+I never call `store-credential` (I never handle passwords at all).
 
 ### Activates later
 

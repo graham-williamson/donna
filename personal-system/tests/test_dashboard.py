@@ -192,7 +192,7 @@ def test_colour_meanings_surface():
     dash = load_dashboard()
     page = dash.render_board([{"id": 1, "title": "x", "colour": "green",
                                "owner": "nike", "daruma_state": "none"}])
-    assert "health" in page                       # green's meaning on the card
+    assert "physical wellbeing" in page           # green's meaning on the card
     assert "wealth" in page                       # gold's meaning in swatch titles
 
 
@@ -221,13 +221,13 @@ def test_daruma_belly_kanji_carries_meaning():
                                 "owner": "nike", "daruma_state": "none"}])
     purple = dash.render_board([{"id": 1, "title": "x", "colour": "purple",
                                  "owner": "esme", "daruma_state": "none"}])
-    assert "健" in green and "志" in purple
+    assert "健" in green and "寿" in purple
 
 
 def test_swatch_shows_selected_meaning():
     dash = load_dashboard()
     page = dash.render_board([])
-    assert '<em class="meaning">' in page and "love & connection" in page
+    assert '<em class="meaning">' in page and "romance / finding love" in page
 
 
 def test_burned_daruma_leave_the_board_and_won_offer_kuyo():
@@ -239,3 +239,12 @@ def test_burned_daruma_leave_the_board_and_won_offer_kuyo():
                                "owner": "shared", "daruma_state": "both",
                                "burned_at": "2026-06-06T00:00:00Z"}])
     assert "ashes" not in gone
+
+
+def test_new_colours_orange_and_peach():
+    dash = load_dashboard()
+    page = dash.render_board([
+        {"id": 1, "title": "o", "colour": "orange", "owner": "shared", "daruma_state": "none"},
+        {"id": 2, "title": "p", "colour": "peach", "owner": "esme", "daruma_state": "none"}])
+    assert "fertility" in page and "子" in page        # orange — children
+    assert "romance" in page and "縁" in page          # peach — en-musubi

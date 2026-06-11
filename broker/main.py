@@ -32,6 +32,7 @@ from typing import Any, Callable, Optional
 
 from broker import audit as audit_mod
 from broker import canonicalize
+from broker import creds as creds_mod
 from broker import executor
 from broker import grants_db
 from broker import policy
@@ -48,7 +49,20 @@ MODES = frozenset({
     "verify-vault",
     # broker-standing-grants §7: scoped approve-once autonomy.
     "grant-create", "grant-list", "grant-revoke",
+    # Connected Sites (docs/connected-sites-broker-handoff.md): the app
+    # hands a site login straight to the vault / probes a stored login.
+    "store-credential", "site-check",
 })
+
+# site-check probe binaries, keyed by site slug (= vault entry name).
+# A fixed allowlist — site input never becomes a path. Adding a site
+# means adding its probe executor here and deploying it.
+SITE_PROBES: dict[str, str] = {
+    "everyone_active": (
+        "/Users/donna-broker/broker/executors/everyone_active_site_check"
+    ),
+}
+SITE_PROBE_TIMEOUT_SECONDS = 90.0
 
 # broker-standing-grants §3.3 grant scope bounds.
 GRANT_DEFAULT_EXPIRES_DAYS = 90
@@ -89,6 +103,7 @@ def _config_from_env(env: dict[str, str] | None = None) -> dict[str, str]:
             "/Users/donna-broker/.config/donna/creds/identity.age",
         ),
         "age_binary": e.get("DONNA_AGE_BINARY", "age"),
+        "age_keygen_binary": e.get("DONNA_AGE_KEYGEN_BINARY", "age-keygen"),
     }
 
 
@@ -1213,6 +1228,133 @@ def _handle_cancel(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, An
     return {"status": "cancelled", "request_id": rid}
 
 
+# ---- Connected Sites modes (connected-sites-broker-handoff) -------------
+
+
+def _handle_store_credential(
+    payload: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """Seal a site login into the age vault at <creds_dir>/<site>.age.
+
+    The password arrives on stdin, is wrapped into the executor creds
+    JSON shape ({username, email, password} — the EA executors read
+    `email`), encrypted to the broker's own recipient, and dropped.
+    It is never echoed back, never audited, never written to disk in
+    plaintext. Replacing an existing entry is allowed (re-connect)."""
+    site = payload.get("site")
+    username = payload.get("username")
+    password = payload.get("password")
+    if not isinstance(site, str) or not site:
+        raise BrokerError("invalid_input", "site required")
+    if not isinstance(username, str) or not username.strip():
+        raise BrokerError("invalid_input", "username required")
+    if not isinstance(password, str) or not password:
+        raise BrokerError("invalid_input", "password required")
+    username = username.strip()
+
+    plaintext = json.dumps(
+        {"username": username, "email": username, "password": password},
+        ensure_ascii=False,
+    ).encode("utf-8")
+    if len(plaintext) > executor.CREDS_MAX_BYTES:
+        raise BrokerError(
+            "invalid_input",
+            f"credential exceeds {executor.CREDS_MAX_BYTES} bytes",
+        )
+
+    def audit_writer(evt: dict[str, Any]) -> None:
+        audit_mod.write_event(ctx["audit_dir"], evt)
+
+    try:
+        stored = creds_mod.store_creds(
+            site,
+            plaintext,
+            creds_dir=ctx["config"]["creds_dir"],
+            identity_path=ctx["config"]["identity_path"],
+            age_binary=ctx["config"]["age_binary"],
+            age_keygen_binary=ctx["config"]["age_keygen_binary"],
+            audit_writer=audit_writer,
+        )
+    except creds_mod.CredsError as ce:
+        # ce.message never carries the credential (store_creds contract).
+        raise BrokerError(ce.error_code, ce.message) from ce
+
+    return {
+        "status": "stored",
+        "site": site,
+        "username": username,
+        "replaced": bool(stored.get("replaced")),
+    }
+
+
+def _handle_site_check(
+    payload: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """Probe whether a stored site login still works: unlock the vault
+    entry and hand it to the site's check executor (headless login, no
+    writes). Human-tap read — no approval row. Responses are honest
+    structured statuses, not exceptions, so the app can mirror them."""
+    site = payload.get("site")
+    if not isinstance(site, str) or not site:
+        raise BrokerError("invalid_input", "site required")
+
+    probe_binary = SITE_PROBES.get(site)
+    if probe_binary is None:
+        return {
+            "status": "no_checker",
+            "site": site,
+            "note": f"no site-check executor installed for {site!r}",
+        }
+
+    def audit_writer(evt: dict[str, Any]) -> None:
+        audit_mod.write_event(ctx["audit_dir"], evt)
+
+    try:
+        cred_bytes = creds_mod.unlock_creds(
+            site,
+            creds_dir=ctx["config"]["creds_dir"],
+            identity_path=ctx["config"]["identity_path"],
+            age_binary=ctx["config"]["age_binary"],
+            audit_writer=audit_writer,
+        )
+    except creds_mod.CredsError as ce:
+        if ce.error_code == "creds_missing":
+            return {
+                "status": "not_connected",
+                "site": site,
+                "note": "no stored login for this site",
+            }
+        raise BrokerError(ce.error_code, ce.message) from ce
+
+    result = executor.run_probe(
+        probe_binary,
+        {"capability": f"{site}.site_check", "params": {"site": site}},
+        cred_bytes,
+        timeout_seconds=SITE_PROBE_TIMEOUT_SECONDS,
+        audit_writer=audit_writer,
+    )
+    del cred_bytes
+
+    audit_mod.write_event(ctx["audit_dir"], {
+        "event": "site_check",
+        "site": site,
+        "outcome": result.get("status", "error"),
+    })
+
+    if result.get("status") == "error":
+        return {
+            "status": "error",
+            "site": site,
+            "error_code": result.get("error_code"),
+            "note": str(result.get("detail") or "site check failed"),
+        }
+    return {
+        "status": str(result.get("status") or "error"),
+        "site": site,
+        "note": str(result.get("note") or ""),
+    }
+
+
 # ---- standing-grant modes (broker-standing-grants §7) -------------------
 
 
@@ -1702,6 +1844,8 @@ MODE_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, An
     "grant-create": _handle_grant_create,
     "grant-list": _handle_grant_list,
     "grant-revoke": _handle_grant_revoke,
+    "store-credential": _handle_store_credential,
+    "site-check": _handle_site_check,
 }
 
 # Modes left as explicit not-implemented so the CLI doesn't silently

@@ -154,6 +154,27 @@ def check_bash_allowlist(t):
             deny("broker payload is not valid JSON: {0}".format(e))
         allow("sudo donna-broker")
 
+    # sudo -n /usr/local/bin/donna-broker-via-session <mode> <json>
+    # Root trampoline that re-homes the broker into donna-broker's own
+    # launchd session — required for browser executors since Chromium 149
+    # SIGTRAPs in a borrowed GUI-session Mach namespace (2026-06-11). It
+    # reaches exactly the same mode-validated CLI as the direct form, so
+    # the same BROKER_MODES + JSON checks apply.
+    if (
+        len(t) == 5
+        and t[0] == "sudo"
+        and t[1] == "-n"
+        and t[2] == "/usr/local/bin/donna-broker-via-session"
+    ):
+        mode = t[3]
+        if mode not in BROKER_MODES:
+            deny("broker mode {0!r} not in §13.1 allowlist".format(mode))
+        try:
+            json.loads(t[4])
+        except Exception as e:
+            deny("broker payload is not valid JSON: {0}".format(e))
+        allow("sudo donna-broker-via-session")
+
     # ls <path>
     if len(t) == 2 and t[0] == "ls":
         path = t[1]

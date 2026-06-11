@@ -1,0 +1,441 @@
+#!/Users/donna-broker/venv/bin/python3
+"""Everyone Active paid-checkout executor.
+
+Extends the everyone_active_book flow through the paid path: find the
+class → confirm page → READ THE TOTAL → enforce the price cap → basket /
+checkout → pay with the card on file → confirmation.
+
+MONEY RULES (connected-sites-broker-handoff §2), enforced HERE regardless
+of what was approved upstream:
+  - HARD CAP £50 (5000 pence). If the order total exceeds it, refuse
+    outright with error_code "over_cap". Belt-and-braces on top of the
+    schema's request-time max_price <= 5000.
+  - The approved params carry max_price (pence); the total must also not
+    exceed it (param binding — what Graham approved is what gets spent).
+  - FAIL CLOSED: if the total cannot be determined from the page, refuse
+    to pay (unexpected_dom). No pay click ever happens before a total has
+    been read and passed both caps. Any total re-read later in the flow
+    is re-checked against the same caps.
+  - Card on file ONLY. This executor never types card details; if the
+    payment page demands card entry, it fails with "no_card_on_file".
+
+Subprocess contract: JSON {capability, params} on stdin, credentials from
+the DONNA_CREDS_FD pipe, JSON result to stdout. Exit 0 = purchased,
+exit 1 = structured {error_code, detail} failure.
+
+Browser: chromium-headless-shell (Playwright's no-GUI build). System
+Chrome broke at v149 (2026-06-11) — SIGTRAP under the GUI-less
+donna-broker account.
+
+NOTE: the flow past mrmConfirmBooking.aspx (basket → payment) was built
+from the EA page family conventions, not a live recon — a first live run
+may fail with unexpected_dom; the failure detail names the step so the
+selectors can be tightened without guessing.
+"""
+import json
+import os
+import re
+import sys
+
+from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+
+HARD_CAP_PENCE = 5000  # £50. Non-negotiable; approval does not override.
+
+CENTRES = {
+    "chesham": ("0243", "Chesham Leisure Centre"),
+    "chilterns": ("0255", "Chilterns Lifestyle Centre"),
+}
+
+SEL_CENTRE = "#ctl00_MainContent__advanceSearchUserControl_SitesAdvanced"
+SEL_ACTIVITY_TYPE = "#ctl00_MainContent__advanceSearchUserControl_ActivityGroups"
+SEL_DATE_FROM = "#ctl00_MainContent__advanceSearchUserControl_startDate"
+SEL_DATE_TO = "#ctl00_MainContent__advanceSearchUserControl_endDate"
+SEL_SEARCH_BTN = "#ctl00_MainContent__advanceSearchUserControl__searchBtn"
+SEL_CONFIRM_BOOK = "#ctl00_MainContent_btnBasket"
+
+# Elements likely to carry the order total, tried in order before the
+# body-text fallback. Total parsing is fail-closed: no parsable total →
+# no payment.
+TOTAL_SELECTORS = [
+    "[id*='lblTotal']",
+    "[id*='Total']",
+    "[class*='basket-total']",
+    "[class*='order-total']",
+    "[class*='total']",
+]
+
+# Buttons that advance basket → checkout → pay. Matched by visible text /
+# value, never by position. Card-entry fields are a hard stop.
+ADVANCE_BUTTON_RE = re.compile(
+    r"(proceed|checkout|continue|pay now|make payment|pay|complete|confirm)",
+    re.IGNORECASE,
+)
+CARD_ENTRY_SELECTOR = (
+    "input[id*='cardNumber' i], input[name*='cardnumber' i], "
+    "input[autocomplete='cc-number']"
+)
+MAX_CHECKOUT_STEPS = 5
+
+
+def fail(error_code: str, detail: str) -> None:
+    json.dump({"error_code": error_code, "detail": detail}, sys.stdout)
+    sys.stdout.flush()
+    sys.exit(1)
+
+
+def read_creds() -> dict:
+    fd_str = os.environ.get("DONNA_CREDS_FD")
+    if fd_str is None:
+        fail("login_failed", "DONNA_CREDS_FD not set")
+    fd = int(fd_str)
+    data = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        data += chunk
+    os.close(fd)
+    return json.loads(data)
+
+
+def read_params() -> dict:
+    request = json.load(sys.stdin)
+    return request["params"]
+
+
+def login(page, creds: dict) -> None:
+    """Same SPA/Cookiebot-aware login as everyone_active_book (rebuilt EA
+    front-end, ~mid-2026): dismiss consent, judge by the auth API status,
+    then land in the legacy member area."""
+    try:
+        page.goto("https://account.everyoneactive.com/login", timeout=30000)
+    except PwTimeout:
+        fail("site_unavailable", "login page did not load within 30s")
+
+    page.wait_for_timeout(1500)
+    consent = page.query_selector("#CybotCookiebotDialogBodyButtonDecline")
+    if consent:
+        consent.click()
+        page.wait_for_timeout(500)
+
+    page.fill("#emailAddress", creds.get("email") or creds.get("username") or "")
+    page.fill("#password", creds["password"])
+    try:
+        with page.expect_response(
+            lambda r: "/v1/auth/login" in r.url, timeout=30000
+        ) as resp_info:
+            page.click("button[type='submit']")
+        resp = resp_info.value
+    except PwTimeout:
+        fail("login_failed", "no auth response within 30s")
+
+    # EA's auth API returns 201 (Created) on success — accept any 2xx.
+    if not (200 <= resp.status < 300):
+        msg = ""
+        try:
+            msg = str(resp.json().get("message") or "")[:120]
+        except Exception:
+            pass
+        fail("login_failed",
+             "Everyone Active didn't accept the login"
+             + (f" — {msg}" if msg else ""))
+
+    try:
+        page.wait_for_url("**/memberHomePage.aspx", timeout=15000)
+    except PwTimeout:
+        try:
+            page.goto(
+                "https://account.everyoneactive.com/memberHomePage.aspx",
+                timeout=30000,
+            )
+        except PwTimeout:
+            fail("unexpected_dom", "could not reach member home after login")
+
+
+def expand_advanced_search(page) -> None:
+    panel_heading = page.query_selector("[data-target='#collapseAdv']")
+    if panel_heading is None:
+        fail("unexpected_dom", "advanced search panel heading not found")
+    panel = page.query_selector("#collapseAdv")
+    if panel and "in" not in (panel.get_attribute("class") or ""):
+        panel_heading.click()
+        page.wait_for_timeout(500)
+
+
+def search_classes(page, centre_code: str, activity_name: str, date: str) -> None:
+    expand_advanced_search(page)
+
+    page.select_option(SEL_CENTRE, value=centre_code)
+    page.wait_for_load_state("networkidle")
+
+    options = page.query_selector_all(f"{SEL_ACTIVITY_TYPE} option")
+    matches = []
+    for opt in options:
+        text = (opt.text_content() or "").strip()
+        val = opt.get_attribute("value") or ""
+        if val == "":
+            continue
+        if activity_name.lower() in text.lower():
+            matches.append((val, text))
+
+    if not matches:
+        available = [
+            (opt.text_content() or "").strip()
+            for opt in options
+            if (opt.get_attribute("value") or "") != ""
+        ]
+        fail("class_not_found",
+             f"activity '{activity_name}' not found in dropdown. "
+             f"Available: {', '.join(available)}")
+    if len(matches) > 1:
+        names = [m[1] for m in matches]
+        fail("class_not_found",
+             f"ambiguous activity name '{activity_name}', "
+             f"matches: {', '.join(names)}")
+
+    page.select_option(SEL_ACTIVITY_TYPE, value=matches[0][0])
+    page.wait_for_load_state("networkidle")
+
+    page.fill(SEL_DATE_FROM, date)
+    page.fill(SEL_DATE_TO, date)
+
+    page.click(SEL_SEARCH_BTN)
+    try:
+        page.wait_for_url("**/mrmClassStatus.aspx", timeout=30000)
+    except PwTimeout:
+        fail("class_not_found", "search did not navigate to results page")
+
+
+def select_class(page, start_time):
+    """Pick the target class button. Waitlist slots are skipped — you
+    can't pay your way onto a waitlist, so checkout treats full as full."""
+    buttons = page.query_selector_all("input[data-qa-id^='button-ActivityID=']")
+    if not buttons:
+        fail("class_not_found", "no bookable classes found in search results")
+
+    target = None
+    target_qa_id = ""
+    for btn in buttons:
+        qa_id = btn.get_attribute("data-qa-id") or ""
+        if "btn-wait" in (btn.get_attribute("class") or ""):
+            continue
+        if start_time:
+            time_match = re.search(r"Date=\d{2}/\d{2}/\d{4}\s+(\d{2}:\d{2})", qa_id)
+            if time_match and time_match.group(1) == start_time:
+                target = btn
+                target_qa_id = qa_id
+                break
+        else:
+            target = btn
+            target_qa_id = qa_id
+            break
+
+    if not target:
+        where = f"at {start_time}" if start_time else "on that date"
+        fail("class_full", f"no bookable (non-waitlist) class found {where}")
+
+    duration_match = re.search(r"Duration=(\d+)", target_qa_id)
+    date_match = re.search(r"Date=(\d{2}/\d{2}/\d{4})\s+(\d{2}:\d{2})", target_qa_id)
+
+    target.click()
+    try:
+        page.wait_for_url("**/mrmConfirmBooking.aspx", timeout=30000)
+    except PwTimeout:
+        fail("session_expired", "did not reach confirmation page")
+
+    iso_date = ""
+    matched_time = ""
+    if date_match:
+        d, m, y = date_match.group(1).split("/")
+        iso_date = f"{y}-{m}-{d}"
+        matched_time = date_match.group(2)
+    duration = int(duration_match.group(1)) if duration_match else None
+    return iso_date, matched_time, duration
+
+
+def parse_pence(text: str):
+    """Largest £-amount in the text, in pence; None if no amount present."""
+    amounts = re.findall(r"£\s*(\d+(?:\.\d{1,2})?)", text or "")
+    if not amounts:
+        return None
+    return max(round(float(a) * 100) for a in amounts)
+
+
+def read_total_pence(page):
+    """Read the order total from the current page. Returns pence or None.
+    Tries dedicated total elements first, then a labelled body-text
+    fallback ('Total ... £x.xx'). Never guesses from arbitrary prices."""
+    for sel in TOTAL_SELECTORS:
+        for el in page.query_selector_all(sel):
+            pence = parse_pence(el.text_content() or "")
+            if pence is not None:
+                return pence
+    body = page.text_content("body") or ""
+    m = re.search(r"total[^£]{0,40}£\s*(\d+(?:\.\d{1,2})?)", body, re.IGNORECASE)
+    if m:
+        return round(float(m.group(1)) * 100)
+    return None
+
+
+def enforce_cap(total_pence: int, max_price: int, step: str) -> None:
+    """The two price gates. Runs before EVERY pay-advancing click."""
+    if total_pence > HARD_CAP_PENCE:
+        fail("over_cap",
+             f"order total £{total_pence / 100:.2f} exceeds the hard "
+             f"£{HARD_CAP_PENCE / 100:.0f} cap (at {step}) — refusing "
+             f"regardless of approval")
+    if total_pence > max_price:
+        fail("over_cap",
+             f"order total £{total_pence / 100:.2f} exceeds the approved "
+             f"max_price £{max_price / 100:.2f} (at {step})")
+
+
+def find_advance_button(page):
+    """The checkout/pay button on the current page, matched by visible
+    text. Returns (element, label) or (None, '')."""
+    candidates = page.query_selector_all(
+        "input[type='submit'], input[type='button'], button, a.btn, a[class*='button']"
+    )
+    for el in candidates:
+        label = (el.get_attribute("value") or el.text_content() or "").strip()
+        if label and ADVANCE_BUTTON_RE.search(label):
+            return el, label
+    return None, ""
+
+
+def checkout_and_pay(page, max_price: int):
+    """From mrmConfirmBooking onwards: cap-check, basket, checkout, pay
+    with the card on file, confirmation. Returns (confirmation_text,
+    total_pence)."""
+    # Gate 1: the confirm page total, BEFORE adding to basket.
+    total = read_total_pence(page)
+    if total is None:
+        fail("unexpected_dom",
+             "could not determine the order total on the confirm page — "
+             "refusing to proceed to payment")
+    enforce_cap(total, max_price, "confirm page")
+
+    confirm_btn = page.query_selector(SEL_CONFIRM_BOOK)
+    if not confirm_btn:
+        fail("unexpected_dom", "confirm/basket button not found on confirm page")
+    confirm_btn.click()
+    page.wait_for_load_state("networkidle")
+
+    # Walk basket → checkout → payment. Re-read and re-cap the total on
+    # every page that shows one; hard-stop on card-entry forms.
+    for step in range(MAX_CHECKOUT_STEPS):
+        try:
+            page.wait_for_load_state("networkidle")
+        except PwTimeout:
+            pass
+
+        if "mrmBookingConfirmed.aspx" in page.url or re.search(
+            r"(booking|payment|order)\s+(confirmed|complete|successful)",
+            page.text_content("body") or "", re.IGNORECASE,
+        ):
+            break
+
+        if page.query_selector(CARD_ENTRY_SELECTOR):
+            fail("no_card_on_file",
+                 "payment page is asking for card details — no card on "
+                 "file; this executor never enters card numbers")
+
+        page_total = read_total_pence(page)
+        if page_total is not None:
+            total = page_total
+            enforce_cap(total, max_price, f"checkout step {step + 1}")
+
+        btn, label = find_advance_button(page)
+        if btn is None:
+            fail("unexpected_dom",
+                 f"no checkout/pay button found at step {step + 1} "
+                 f"(url: {page.url})")
+        btn.click()
+    else:
+        fail("unexpected_dom",
+             f"did not reach a confirmation page within "
+             f"{MAX_CHECKOUT_STEPS} checkout steps (url: {page.url})")
+
+    confirmation_text = ""
+    conf_el = page.query_selector(
+        "#ctl00_MainContent_lblConfirmationMessage, .confirmation-message, h1 + p strong"
+    )
+    if conf_el:
+        confirmation_text = (conf_el.text_content() or "").strip()
+    if not confirmation_text:
+        body = page.text_content("body") or ""
+        m = re.search(
+            r"[^.\n]*(?:booking|payment|order)[^.\n]*(?:confirmed|complete|successful)[^.\n]*",
+            body, re.IGNORECASE,
+        )
+        confirmation_text = m.group(0).strip() if m else "purchase completed"
+
+    return confirmation_text, total
+
+
+def main() -> None:
+    params = read_params()
+    creds = read_creds()
+
+    activity_name = params["activity_name"]
+    centre = params["centre"]
+    date = params["date"]
+    start_time = params.get("start_time")
+    max_price = int(params["max_price"])
+
+    # Defence-in-depth: even if a manifest regression let a bigger
+    # max_price through, the executor's own ceiling stands.
+    if max_price > HARD_CAP_PENCE:
+        max_price = HARD_CAP_PENCE
+
+    centre_info = CENTRES.get(centre)
+    if not centre_info:
+        fail("class_not_found", f"unknown centre: {centre}")
+    centre_code, centre_display = centre_info
+
+    try:
+        pw = sync_playwright().start()
+    except Exception as exc:
+        fail("unexpected_dom", f"playwright_init: {type(exc).__name__}: {exc}")
+
+    try:
+        # chromium-headless-shell, not system Chrome: Chrome 149
+        # (2026-06-11) SIGTRAPs under the GUI-less service account. See
+        # everyone_active_book for the full note.
+        browser = pw.chromium.launch(
+            headless=True, channel="chromium-headless-shell"
+        )
+    except Exception as exc:
+        pw.stop()
+        fail("unexpected_dom", f"browser_launch: {type(exc).__name__}: {exc}")
+
+    page = browser.new_page(viewport={"width": 1280, "height": 900})
+    try:
+        login(page, creds)
+        search_classes(page, centre_code, activity_name, date)
+        iso_date, matched_time, duration = select_class(page, start_time)
+        confirmation_text, total = checkout_and_pay(page, max_price)
+        result = {
+            "status": "purchased",
+            "total": total,
+            "total_display": f"£{total / 100:.2f}",
+            "date": iso_date or date,
+            "start_time": matched_time or (start_time or ""),
+            "duration_minutes": duration,
+            "confirmation_text": confirmation_text,
+            "activity_name": activity_name,
+            "centre": centre_display,
+        }
+        json.dump(result, sys.stdout)
+        sys.stdout.flush()
+    except SystemExit:
+        raise
+    except Exception as exc:
+        fail("unexpected_dom", f"{type(exc).__name__}: {exc}")
+    finally:
+        browser.close()
+        pw.stop()
+
+
+if __name__ == "__main__":
+    main()

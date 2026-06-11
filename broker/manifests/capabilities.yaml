@@ -143,6 +143,31 @@ capabilities:
 
   # ---- Everyone Active (Phase 2 — browser executor) ----------------------------
 
+  # everyone_active.checkout is HIGH-risk and PER-PURCHASE-ONLY: real money
+  # moves. Every run requires a fresh Telegram approval — policy.py's
+  # NO_STANDING_GRANTS set makes it un-grantable (no approve-once autonomy).
+  # Two price gates: the schema rejects max_price > 5000 pence at request
+  # time, and the executor refuses to pay (over_cap) if the basket total
+  # exceeds £50 or the approved max_price, regardless of approval.
+  - name: everyone_active.checkout
+    executor:
+      type: subprocess
+      binary: /Users/donna-broker/broker/executors/everyone_active_checkout
+      timeout_seconds: 180
+    creds:
+      delivery: fd3
+      entry: everyone_active
+    param_schema:
+      $ref: ./schemas/everyone_active_checkout.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: high
+    revalidate:
+      not_applicable: no_external_state
+    idempotency_date_from: params.date
+    approval_window_minutes: 120
+    execution_window_minutes: 60
+
   - name: everyone_active.book_class
     executor:
       type: subprocess

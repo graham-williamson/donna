@@ -63,3 +63,12 @@ def test_burn_requires_achievement_then_archives(tmp_path, monkeypatch):
     b = goals.burn_goal(g["id"], goals_path=gp)
     assert b["burned_at"]
     assert goals.list_goals(goals_path=gp)[0]["burned_at"]  # archived, never deleted
+
+
+def test_orange_and_peach_are_valid_pink_is_not(tmp_path):
+    goals = load("goals")
+    gp = str(tmp_path / "g.json")
+    assert goals.add_goal("o", "orange", goals_path=gp)["owner"]
+    assert goals.add_goal("p", "peach", goals_path=gp)["owner"] == "esme"
+    with pytest.raises(ValueError):
+        goals.add_goal("x", "pink", goals_path=gp)

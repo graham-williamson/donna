@@ -1,0 +1,128 @@
+#!/Users/donna-broker/venv/bin/python3
+"""Everyone Active site-check probe.
+
+Read-only login test for the Connected Sites surface: signs in with the
+vault credentials and reports whether the login still works. No booking,
+no basket, no writes on the EA side beyond the session itself.
+
+Subprocess contract (same as the capability executors): JSON on stdin,
+credentials from the DONNA_CREDS_FD pipe, JSON result on stdout.
+A *failed login* is a successful probe — exit 0 with
+{"status": "login_failed", "note": ...}. Exit 1 ({error_code, detail})
+is reserved for the probe itself failing (site down, DOM changed).
+
+Browser: chromium-headless-shell (Playwright's no-GUI build). System
+Chrome broke at v149 (2026-06-11) — SIGTRAP under the GUI-less
+donna-broker account.
+"""
+import json
+import os
+import sys
+
+from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout
+
+
+def fail(error_code: str, detail: str) -> None:
+    json.dump({"error_code": error_code, "detail": detail}, sys.stdout)
+    sys.stdout.flush()
+    sys.exit(1)
+
+
+def result(status: str, note: str = "") -> None:
+    json.dump({"status": status, "note": note}, sys.stdout)
+    sys.stdout.flush()
+    sys.exit(0)
+
+
+def read_creds() -> dict:
+    fd_str = os.environ.get("DONNA_CREDS_FD")
+    if fd_str is None:
+        fail("login_failed", "DONNA_CREDS_FD not set")
+    fd = int(fd_str)
+    data = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        data += chunk
+    os.close(fd)
+    return json.loads(data)
+
+
+def main() -> None:
+    json.load(sys.stdin)  # consume the stdin envelope; no params needed
+    creds = read_creds()
+    email = creds.get("email") or creds.get("username") or ""
+    password = creds.get("password") or ""
+    if not email or not password:
+        result("login_failed", "stored credential is missing email or password")
+
+    try:
+        pw = sync_playwright().start()
+    except Exception as exc:
+        fail("unexpected_dom", f"playwright_init: {type(exc).__name__}: {exc}")
+
+    try:
+        # chromium-headless-shell, not system Chrome: Chrome 149
+        # (2026-06-11) SIGTRAPs under the GUI-less service account. See
+        # everyone_active_book for the full note.
+        browser = pw.chromium.launch(
+            headless=True, channel="chromium-headless-shell"
+        )
+    except Exception as exc:
+        pw.stop()
+        fail("unexpected_dom", f"browser_launch: {type(exc).__name__}: {exc}")
+
+    page = browser.new_page(viewport={"width": 1280, "height": 900})
+    try:
+        try:
+            page.goto("https://account.everyoneactive.com/login", timeout=30000)
+        except PwTimeout:
+            fail("site_unavailable", "login page did not load within 30s")
+
+        # EA's login is an SPA backed by POST api-v2…/v1/auth/login
+        # (rebuilt ~mid-2026; the old memberHomePage.aspx redirect is
+        # gone). A Cookiebot consent wall mounts over the form — dismiss
+        # it (Deny: no marketing cookies) or the submit is swallowed.
+        page.wait_for_timeout(1500)
+        consent = page.query_selector("#CybotCookiebotDialogBodyButtonDecline")
+        if consent:
+            consent.click()
+            page.wait_for_timeout(500)
+
+        page.fill("#emailAddress", email)
+        page.fill("#password", password)
+        try:
+            with page.expect_response(
+                lambda r: "/v1/auth/login" in r.url, timeout=30000
+            ) as resp_info:
+                page.click("button[type='submit']")
+            resp = resp_info.value
+        except PwTimeout:
+            result("login_failed", "no auth response within 30s")
+
+        # EA's auth API returns 201 (Created) on success — accept any 2xx.
+        if 200 <= resp.status < 300:
+            result("ok", "Signed in — the login works.")
+        msg = ""
+        try:
+            msg = str(resp.json().get("message") or "")[:120]
+        except Exception:
+            pass
+        result(
+            "login_failed",
+            "Everyone Active didn't accept the login"
+            + (f" — {msg}" if msg else "")
+            + ". Try Update login with your current details.",
+        )
+    except SystemExit:
+        raise
+    except Exception as exc:
+        fail("unexpected_dom", f"{type(exc).__name__}: {exc}")
+    finally:
+        browser.close()
+        pw.stop()
+
+
+if __name__ == "__main__":
+    main()

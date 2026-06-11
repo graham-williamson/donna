@@ -357,6 +357,15 @@ def sanitise_context_reason(raw: str) -> tuple[str, list[str]]:
 # grants cannot grant grants (no self-escalation).
 GRANT_CREATE_CAPABILITY = "grant.create"
 
+# Per-action-only capabilities (connected-sites-broker-handoff §2): money
+# moves only with a fresh per-purchase human approval. These can never be
+# covered by a standing grant — grant-create refuses to create one and
+# check_standing_grants refuses to match one, so even a grant row smuggled
+# into the store would be inert.
+NO_STANDING_GRANTS = frozenset({
+    "everyone_active.checkout",
+})
+
 
 class GrantConstraintError(Exception):
     """Raised when a grant's constraints are structurally invalid (e.g. a
@@ -406,6 +415,11 @@ def validate_constraints(capability: str, constraints: Any) -> None:
       - A `subject` pin, if present, must be either an exact string or
         a `{"prefix": <str>}` object.
     """
+    if capability in NO_STANDING_GRANTS:
+        raise GrantConstraintError(
+            f"{capability} is per-action-only: every run requires a fresh "
+            f"human approval, so no standing grant can cover it"
+        )
     if not isinstance(constraints, dict):
         raise GrantConstraintError("constraints must be a JSON object")
     if capability == "gmail.send" and "to" not in constraints:
@@ -497,6 +511,10 @@ def check_standing_grants(
     cannot grant grants. Short-circuits before touching the store.
     """
     if capability == GRANT_CREATE_CAPABILITY:
+        return None
+    if capability in NO_STANDING_GRANTS:
+        # Per-action-only (e.g. checkout): never auto-authorised, even if
+        # a grant row for it somehow exists in the store.
         return None
     for grant in grants_db.active_grants(conn, capability, now_ms):
         if not constraints_match(_loads_constraints(grant), params):
