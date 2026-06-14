@@ -3,11 +3,23 @@ import pytest
 from broker import pack_token
 
 
-def _rec(**over):
-    base = dict(pack_id="waitrose", pack_hash="abc", approval_id="A1",
-                status="approved", approved_at_ts=100.0, consumed=False)
-    base.update(over)
-    return pack_token.ApprovalRecord(**base)
+def _rec(
+    *,
+    pack_id: str = "waitrose",
+    pack_hash: str = "abc",
+    approval_id: str = "A1",
+    status: str = "approved",
+    approved_at_ts: float = 100.0,
+    consumed: bool = False,
+) -> pack_token.ApprovalRecord:
+    return pack_token.ApprovalRecord(
+        pack_id=pack_id,
+        pack_hash=pack_hash,
+        approval_id=approval_id,
+        status=status,
+        approved_at_ts=approved_at_ts,
+        consumed=consumed,
+    )
 
 
 def test_valid_record_authorises_matching_pack():
