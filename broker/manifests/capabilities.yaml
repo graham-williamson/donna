@@ -186,3 +186,50 @@ capabilities:
     idempotency_date_from: params.date
     approval_window_minutes: 120
     execution_window_minutes: 60
+
+  # ---- Browser-goal agent (Phase 2 — general gated browser automation) ----------
+
+  # browser_goal.plan is read-only: it inspects the site and produces a
+  # plan without committing any action or spending money. Medium risk
+  # because it does require authenticated browser access.
+  - name: browser_goal.plan
+    executor:
+      type: subprocess
+      binary: /Users/donna-broker/broker/executors/browser_goal
+      timeout_seconds: 180
+    creds:
+      delivery: fd3
+      entry: everyone_active
+    param_schema:
+      $ref: ./schemas/browser_goal_plan.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: medium
+    revalidate:
+      not_applicable: read_only_plan
+    approval_window_minutes: 120
+    execution_window_minutes: 60
+
+  # browser_goal.commit is HIGH-risk and PER-USE-ONLY: it may spend money
+  # or mutate site state. Every run requires a fresh Telegram approval —
+  # policy.py's NO_STANDING_GRANTS set makes it un-grantable (no
+  # approve-once autonomy). Schema rejects max_price > 5000 pence at
+  # request time; executor independently re-enforces the cap.
+  - name: browser_goal.commit
+    executor:
+      type: subprocess
+      binary: /Users/donna-broker/broker/executors/browser_goal
+      timeout_seconds: 180
+    creds:
+      delivery: fd3
+      entry: everyone_active
+    param_schema:
+      $ref: ./schemas/browser_goal_commit.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: high
+    revalidate:
+      not_applicable: gated_by_commit_token
+    idempotency_date_from: params.date
+    approval_window_minutes: 120
+    execution_window_minutes: 60
