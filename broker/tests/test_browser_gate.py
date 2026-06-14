@@ -113,3 +113,10 @@ def test_committing_click_with_bad_token_refused():
 def test_unknown_action_kind_refused():
     d = _gate().check({"kind": "evaluate_js", "code": "fetch('/x')"}, SNAP)
     assert d.decision == "refuse"
+
+
+def test_noncommitting_click_allowed():
+    g = _gate()
+    d = g.check({"kind": "click", "ref": "r3", "expected_text": "Help"}, SNAP)
+    assert d.decision == "allow"
+    assert d.action == {"kind": "click", "ref": "r3"}

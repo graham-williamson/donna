@@ -75,3 +75,17 @@ def test_indicator_with_bad_type_rejected():
 def test_allowlist_is_lowercased():
     p = bp.load(_valid() | {"allowlist": ["EveryoneActive.COM"]})
     assert p.allowlist == ("everyoneactive.com",)
+
+
+def test_missing_site_rejected():
+    bad = _valid() | {"site": ""}
+    with pytest.raises(bp.ProfileError, match="site is required"):
+        bp.load(bad)
+
+
+def test_allowlist_all_blank_entries_rejected():
+    # allowlist is a non-empty list, but every entry is whitespace-only.
+    # After stripping, the tuple is empty → line 50 raises.
+    bad = _valid() | {"allowlist": ["  ", ""]}
+    with pytest.raises(bp.ProfileError, match="allowlist"):
+        bp.load(bad)
