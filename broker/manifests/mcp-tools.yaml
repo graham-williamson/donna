@@ -60,6 +60,19 @@ tools:
   mcp__plugin_telegram_telegram__get_history: low
   mcp__plugin_telegram_telegram__search_messages: low
 
+  # ---- Strava (claude.ai connector, 2026-06-12) — every tool the server
+  # exposes is read-only (list/get/health); no write surface to classify. ----
+  mcp__claude_ai_Strava__list_activities: low
+  mcp__claude_ai_Strava__eligibility: low
+  mcp__claude_ai_Strava__get_gear: low
+  mcp__claude_ai_Strava__get_activity_performance: low
+  mcp__claude_ai_Strava__get_activity_streams: low
+  mcp__claude_ai_Strava__get_athlete_profile: low
+  mcp__claude_ai_Strava__get_athlete_zones: low
+  mcp__claude_ai_Strava__get_club_info: low
+  mcp__claude_ai_Strava__get_training_plan: low
+  mcp__claude_ai_Strava__health: low
+
   # ---- Sentry -----------------------------------------------------------
   mcp__claude_ai_Sentry__whoami: low
   mcp__claude_ai_Sentry__analyze_issue_with_seer: low
