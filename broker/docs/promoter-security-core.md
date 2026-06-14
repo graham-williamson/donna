@@ -1,7 +1,7 @@
 # Promoter Security Core
 
 Pure, side-effect-free enforcement layer for the signed-capability promoter
-(spec: ~/daru/docs/superpowers/specs/2026-06-15-signed-capability-promoter-design.md).
+(spec: ~/daru/docs/superpowers/specs/2026-06-14-signed-capability-promoter-design.md).
 This is **Plan A**: the four modules that decide whether a capability pack is
 safe to install. They take fixtures in and return a verdict — nothing here
 mutates the system.
