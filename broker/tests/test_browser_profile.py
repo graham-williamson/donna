@@ -52,3 +52,26 @@ def test_success_indicators_required():
     bad = _valid() | {"success_indicators": []}
     with pytest.raises(bp.ProfileError, match="success_indicators"):
         bp.load(bad)
+
+
+def test_ftp_scheme_rejected():
+    bad = _valid() | {"login_url": "ftp://account.everyoneactive.com/login"}
+    with pytest.raises(bp.ProfileError, match="https"):
+        bp.load(bad)
+
+
+def test_https_without_host_rejected():
+    bad = _valid() | {"login_url": "https://"}
+    with pytest.raises(bp.ProfileError, match="https"):
+        bp.load(bad)
+
+
+def test_indicator_with_bad_type_rejected():
+    bad = _valid() | {"success_indicators": [{"type": "evil"}]}
+    with pytest.raises(bp.ProfileError, match="success_indicator"):
+        bp.load(bad)
+
+
+def test_allowlist_is_lowercased():
+    p = bp.load(_valid() | {"allowlist": ["EveryoneActive.COM"]})
+    assert p.allowlist == ("everyoneactive.com",)

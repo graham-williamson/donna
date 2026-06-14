@@ -71,7 +71,7 @@ def load(raw: dict[str, object]) -> SiteProfile:
         login_url=login_url,
         origin=origin,
         allowlist=allowlist,
-        success_indicators=tuple(dict[str, object](ind) for ind in inds),
+        success_indicators=tuple(dict(ind) for ind in inds),
         mfa_rule=mfa,
         network_strictness=strictness,
     )

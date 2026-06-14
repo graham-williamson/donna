@@ -12,6 +12,7 @@ Phase 1 skeleton. Module responsibilities (see per-module docstrings):
   - policy:        HMAC, idempotency, rate limits, cooldown (§13.2, §7.2, §7.4)
   - resolver:      mode-aware; subprocess isolation (§9, §12.5)
   - executor:      capability-bound dispatch (§8, §13.4)
+  - browser_profile: declarative site profile for the browser-goal agent (§5.1, §9)
 """
 
 __version__ = "0.0.1-pre"
