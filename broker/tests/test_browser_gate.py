@@ -120,3 +120,20 @@ def test_noncommitting_click_allowed():
     d = g.check({"kind": "click", "ref": "r3", "expected_text": "Help"}, SNAP)
     assert d.decision == "allow"
     assert d.action == {"kind": "click", "ref": "r3"}
+
+
+def test_propose_then_mint_then_commit_roundtrip():
+    """The proposal dict's fields feed mint() by name (no ** needed): summary,
+    snapshot_hash, target_ref, expected_text — proving the propose->approve->commit
+    contract actually wires up (price is display-only, not passed to mint)."""
+    g = _gate()
+    d = g.check({"kind": "propose_commit", "summary": "Book 7pm court £8", "price": 8.0,
+                 "ref": "r2", "expected_text": "Confirm booking"}, SNAP)
+    assert d.decision == "needs_approval"
+    p = d.proposal
+    tok = g.tokens.mint(summary=p["summary"], snapshot_hash=p["snapshot_hash"],
+                        target_ref=p["target_ref"], expected_text=p["expected_text"],
+                        approval_id="A1")
+    out = g.check({"kind": "click", "ref": "r2", "expected_text": "Confirm booking",
+                   "commit": True, "commit_token": tok}, SNAP)
+    assert out.decision == "allow"

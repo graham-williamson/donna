@@ -89,7 +89,7 @@ class Gate:
             return Decision("needs_approval", proposal={
                 "summary": str(action.get("summary") or ""),
                 "price": action.get("price"),
-                "ref": str(action.get("ref") or ""),
+                "target_ref": str(action.get("ref") or ""),
                 "expected_text": str(action.get("expected_text") or ""),
                 "snapshot_hash": san.snapshot_hash(snapshot),
             }, log_action=dict(action))

@@ -17,8 +17,15 @@ Pure, browser-free enforcement layer for the secure browser-goal agent
 3. d = gate.check(action, snapshot)
 4. d.decision == "allow"          -> browser executes d.action; ledger.record(action=d.log_action, gate_decision="allow")
    d.decision == "refuse"         -> ledger.record(gate_decision="refuse", ...); return refusal to the agent
-   d.decision == "needs_approval" -> surface d.proposal to Graham; on approval:
-        tok = tokens.mint(**proposal-fields, approval_id=...); re-submit the click with commit=True, commit_token=tok
+   d.decision == "needs_approval" -> surface d.proposal to Graham (show summary + price); on approval:
+        tok = tokens.mint(summary=d.proposal["summary"],
+                          snapshot_hash=d.proposal["snapshot_hash"],
+                          target_ref=d.proposal["target_ref"],
+                          expected_text=d.proposal["expected_text"],
+                          approval_id=...)
+        # NOTE: pass fields by name — do NOT splat **d.proposal (it carries `price`, for the
+        # approval card only, which mint() does not accept).
+        then re-submit the click with commit=True, commit_token=tok
 5. NEVER log d.action (it holds substituted secrets); always log d.log_action.
 
 ## Invariants (must hold; see spec §3)
