@@ -752,3 +752,19 @@ def test_check_standing_grants_is_deterministic(grant_conn):
     d1 = policy.check_standing_grants(grant_conn, "gmail.send", params, NOW, GRANT_KEY)
     d2 = policy.check_standing_grants(grant_conn, "gmail.send", params, NOW, GRANT_KEY)
     assert d1 == d2
+
+
+# ---- browser_goal.commit: NO_STANDING_GRANTS (connected-sites-broker-handoff §2) --
+
+
+def test_browser_goal_commit_is_never_grantable():
+    assert "browser_goal.commit" in policy.NO_STANDING_GRANTS
+
+
+def test_grant_constraints_refused_for_browser_goal_commit():
+    """validate_constraints must refuse to create a standing grant for
+    browser_goal.commit — money must always require a fresh approval."""
+    with pytest.raises(policy.GrantConstraintError):
+        policy.validate_constraints(
+            "browser_goal.commit", {"site": "everyone_active"}
+        )

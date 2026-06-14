@@ -364,6 +364,7 @@ GRANT_CREATE_CAPABILITY = "grant.create"
 # into the store would be inert.
 NO_STANDING_GRANTS = frozenset({
     "everyone_active.checkout",
+    "browser_goal.commit",
 })
 
 
