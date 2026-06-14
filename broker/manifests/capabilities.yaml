@@ -206,7 +206,8 @@ capabilities:
     derived_fields_allowed: []
     risk_level: medium
     revalidate:
-      not_applicable: read_only_plan
+      not_applicable: no_external_state
+    idempotency_date_from: created_utc
     approval_window_minutes: 120
     execution_window_minutes: 60
 
@@ -229,7 +230,7 @@ capabilities:
     derived_fields_allowed: []
     risk_level: high
     revalidate:
-      not_applicable: gated_by_commit_token
-    idempotency_date_from: params.date
+      not_applicable: stateless_write
+    idempotency_date_from: created_utc
     approval_window_minutes: 120
     execution_window_minutes: 60
