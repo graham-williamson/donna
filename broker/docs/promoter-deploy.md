@@ -164,3 +164,33 @@ The full set of config keys the plist passes (matching
 Allowed peer uids (`{0, donna-broker}`) are resolved by the daemon itself, not
 passed on the command line. `PYTHONPATH=/Users/donna-broker` (so `import broker`
 resolves) mirrors `ops/donna-broker.sh`.
+
+## App setup flow (what Graham sees — no terminal)
+
+Once the promoter is bootstrapped and a signed pack sits in `packs/available/`,
+enabling it is entirely app + Telegram over Tailscale:
+
+1. **Daru → Donna → Powers → Connections → "Set up new integration".** The app
+   lists each signed, not-yet-installed pack by its plain-English title (e.g.
+   "Waitrose groceries"). The broker is never named; the pack hash is computed by
+   the broker, never supplied by the app.
+2. **Tap "Set up".** The app calls `POST /api/donna/connections/packs/{id}/setup`,
+   which proposes a `promoter.install_pack` action through the normal broker path.
+   The app shows "Approve in Telegram".
+3. **Approve in Telegram.** This is the human gate. `promoter.install_pack` is in
+   `NO_STANDING_GRANTS` — every install needs a fresh per-use approval; it can never
+   be granted standing autonomy.
+4. **The broker executes the approved action** → runs the `promoter_client`
+   executor (as `donna-broker`) → connects to the root promoter socket. The promoter
+   independently re-verifies the signature, the data-only/reserved/policy-immutability
+   rules, and that a real approved/executing install request exists for this exact
+   pack + hash, then stages → `verify-manifests` → atomic-merge → re-verify →
+   ledger. **No broker restart** is issued (the per-call CLI reloads the manifest on
+   its next invocation).
+5. **The app mirrors completion** via the existing approvals poll; the pack shows
+   "Installed ✓" and its capabilities (e.g. `browser_goal.plan`/`browser_goal.commit`
+   for a new site) are live under the unchanged browser-goal gate.
+
+If anything fails verification, the install is refused, the live manifests are left
+untouched (or rolled back byte-for-byte), and the refusal is recorded in
+`/var/log/donna/promoter.jsonl`. Inspect that ledger to see every attempt.
