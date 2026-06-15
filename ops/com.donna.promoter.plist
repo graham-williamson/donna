@@ -25,18 +25,30 @@
                          executor can reach the daemon.
     --packs-dir          where signed packs are dropped.
     --trusted-keys-dir   root-owned key store (/etc/donna/promoter/...).
-    --live-manifests-dir the broker's live capability manifests.
+    --live-manifests-dir the manifests-ONLY dir the promoter merges into
+                         (safe for promoter_fs's whole-dir atomic swap —
+                         it holds capabilities.yaml/schemas/profiles and
+                         NOTHING ELSE).
+    --config-dir         the dir the broker actually READS its manifest
+                         from (/Users/donna-broker/.config/donna). After a
+                         merge the daemon PUBLISHES capabilities.yaml +
+                         schemas here per-file; it never touches the
+                         requests DB or age vault that also live there.
     --broker-db          the broker requests DB (read by the daemon to
                          re-verify an approved, unconsumed install).
     --ledger             append-only promoter install ledger.
   Allowed peer uids ({0, donna-broker}) are resolved by the daemon
   itself (pwd.getpwnam), not passed here.
 
-  RESTART NOTE: the daemon's restart hook is a deliberate NO-OP. The
-  donna broker is a per-call CLI that reloads capabilities.yaml on every
-  invocation, so a manifest merge needs no broker restart — the next
-  broker call already sees the new pack. Do NOT wire a launchctl
-  kickstart of the broker here. (See broker/docs/promoter-deploy.md.)
+  PUBLISH NOTE: after a successful merge into the manifests-only
+  --live-manifests-dir, the daemon PUBLISHES the merged manifest
+  (capabilities.yaml + mcp-tools.yaml + schemas/ + profiles/) into
+  --config-dir — the dir the broker actually reads — via a per-file
+  atomic copy that NEVER touches the requests DB or age vault that also
+  live there. There is no broker *service* to restart: the per-call CLI
+  reloads capabilities.yaml on its next invocation. Do NOT wire a
+  launchctl kickstart of the broker here. (See
+  broker/docs/promoter-deploy.md.)
 -->
 <plist version="1.0">
 <dict>
@@ -55,6 +67,8 @@
     <string>/etc/donna/promoter/trusted_keys</string>
     <string>--live-manifests-dir</string>
     <string>/Users/donna-broker/broker/manifests</string>
+    <string>--config-dir</string>
+    <string>/Users/donna-broker/.config/donna</string>
     <string>--broker-db</string>
     <string>/Users/donna-broker/.config/donna/requests.db</string>
     <string>--ledger</string>
