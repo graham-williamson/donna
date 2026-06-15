@@ -375,3 +375,27 @@ def test_real_manifest_has_capped_checkout():
         "activity_name": "Swimming Sessions", "centre": "chesham",
         "date": "2026-06-12", "max_price": 4999,
     })
+
+
+# ---- manifest: promoter.install_pack capability (Plan B Task 6) -------------
+
+
+def test_real_manifest_has_promoter_install_pack():
+    """The repo manifest carries promoter.install_pack: high risk, subprocess
+    executor, and it is un-grantable (policy.NO_STANDING_GRANTS)."""
+    from broker import validator
+
+    manifest = Path(__file__).resolve().parents[1] / "manifests" / "capabilities.yaml"
+    caps = validator.load_capabilities(str(manifest))
+    assert "promoter.install_pack" in caps
+    cap = caps["promoter.install_pack"]
+    assert cap.risk_level == "high"
+    assert cap.executor_type == "subprocess"
+    assert "promoter.install_pack" in policy.NO_STANDING_GRANTS
+    # Schema binds the pack identity the approval is keyed on.
+    assert set(cap.param_schema["required"]) == {"pack_id", "pack_hash"}
+
+    # The schema rejects a bad pack_hash and accepts a well-formed pair.
+    with pytest.raises(validator.ParamValidationError):
+        validator.validate_params(cap, {"pack_id": "site", "pack_hash": "nope"})
+    validator.validate_params(cap, {"pack_id": "site", "pack_hash": "a" * 64})

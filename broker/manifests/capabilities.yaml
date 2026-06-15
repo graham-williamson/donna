@@ -234,3 +234,27 @@ capabilities:
     idempotency_date_from: created_utc
     approval_window_minutes: 120
     execution_window_minutes: 60
+
+  # ---- Signed-capability promoter (Plan B) -------------------------------
+  # promoter.install_pack installs a SIGNED, declarative capability pack.
+  # HIGH-risk + PER-USE: every install needs a fresh Telegram approval and is
+  # un-grantable (policy.NO_STANDING_GRANTS). The broker runs the
+  # promoter_client subprocess (as donna-broker) which only relays the pack_id
+  # to the root promoter daemon over a Unix socket; the daemon re-verifies the
+  # signature AND this very approval (by pack identity) before changing
+  # anything. The client holds no authority and needs no credentials.
+  - name: promoter.install_pack
+    executor:
+      type: subprocess
+      binary: /Users/donna-broker/broker/executors/promoter_client
+      timeout_seconds: 120
+    param_schema:
+      $ref: ./schemas/promoter_install_pack.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: high
+    revalidate:
+      not_applicable: no_external_state
+    idempotency_date_from: created_utc
+    approval_window_minutes: 120
+    execution_window_minutes: 60

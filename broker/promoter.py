@@ -13,9 +13,11 @@ Sequence (fail-closed, every outcome ledgered, no secret ever ledgered):
   1. ``pack_format.load_pack``
   2. ``pack_verify.verify_pack`` against the LIVE capability names -> key_id,
      pack_hash
-  3. fetch the approval record for ``request_id`` via the injected
-     ``ApprovalSource``; ``pack_token.verify_approval(pack_id, pack_hash)``
-     -> approval_id
+  3. fetch the approval record by PACK IDENTITY (pack_id + pack_hash) via the
+     injected ``ApprovalSource``; ``pack_token.verify_approval(pack_id,
+     pack_hash)`` -> approval_id. (Resolution is by pack identity, NOT
+     request_id: the executor never receives the request_id, and the broker
+     has already moved the matching request approved -> executing.)
   4. ``promoter_fs.install`` (staged-verify -> atomic merge -> re-verify ->
      rollback on failure)
   5. ``restart()`` (injected; the daemon passes a launchctl-kickstart callable)
@@ -63,10 +65,17 @@ class PromoterError(Exception):
 
 class ApprovalSource(Protocol):
     """The promoter's view of where an install approval comes from. The real
-    implementation reads the broker requests DB; tests inject a fake."""
+    implementation reads the broker requests DB; tests inject a fake.
+
+    The approval is resolved by PACK IDENTITY (pack_id + pack_hash), NOT by
+    request_id: the broker's subprocess executor contract never passes the
+    request_id to the executor, and by the time this runs the broker has
+    already moved the matching request approved -> executing. The pack
+    identity is what the promoter independently re-verified, so it is the
+    correct join key."""
 
     def fetch(  # pragma: no cover - Protocol stub
-        self, request_id: str
+        self, *, pack_id: str, pack_hash: str
     ) -> pack_token.ApprovalRecord | None: ...
 
     def mark_consumed(self, request_id: str) -> None: ...  # pragma: no cover
@@ -82,9 +91,13 @@ class RequestsDbApprovalSource:
 
     conn: sqlite3.Connection
 
-    def fetch(self, request_id: str) -> pack_token.ApprovalRecord | None:
-        req = requests_db.get_request(self.conn, request_id)
-        if req is None or req.capability != "promoter.install_pack":
+    def fetch(
+        self, *, pack_id: str, pack_hash: str
+    ) -> pack_token.ApprovalRecord | None:
+        req = requests_db.find_install_approval(
+            self.conn, pack_id=pack_id, pack_hash=pack_hash
+        )
+        if req is None:
             return None
         params = json.loads(req.params_json)
         # State -> status mapping. By the time this runs the broker may have
@@ -99,7 +112,7 @@ class RequestsDbApprovalSource:
         return pack_token.ApprovalRecord(
             pack_id=str(params.get("pack_id", "")),
             pack_hash=str(params.get("pack_hash", "")),
-            approval_id=request_id,
+            approval_id=req.request_id,
             status=status,
             approved_at_ts=approved_at_ts,
             # Single execution is the broker's lifecycle guarantee (it executes
@@ -137,7 +150,6 @@ def _existing_capability_names(live_manifests_dir: str) -> set[str]:
 def install(
     *,
     pack_dir: str,
-    request_id: str,
     trusted_keys_dir: str,
     live_manifests_dir: str,
     approvals: ApprovalSource,
@@ -163,7 +175,10 @@ def install(
         )
         key_id, pack_hash = result.key_id, result.pack_hash
 
-        record = approvals.fetch(request_id)
+        # Resolve the approval by the pack identity we just re-verified — NOT
+        # by request_id (the executor never receives it; the broker has already
+        # moved the matching request approved -> executing).
+        record = approvals.fetch(pack_id=pack_id, pack_hash=pack_hash)
         if record is None:
             raise PromoterError("no matching install approval")
         approval_id = pack_token.verify_approval(
@@ -202,8 +217,9 @@ def install(
         restart()
     except Exception as e:
         # The merge stands; Graham restarts the broker manually. Consume the
-        # approval first so it can never drive a second install.
-        approvals.mark_consumed(request_id)
+        # approval first so it can never drive a second install. The resolved
+        # record's id is the request id (read it from the fetched approval).
+        approvals.mark_consumed(approval_id)
         ledger.record(
             pack_id=pack_id,
             pack_hash=pack_hash,
@@ -214,7 +230,7 @@ def install(
         )
         raise PromoterError(f"installed but broker restart failed: {e}") from e
 
-    approvals.mark_consumed(request_id)
+    approvals.mark_consumed(approval_id)
     ledger.record(
         pack_id=pack_id,
         pack_hash=pack_hash,

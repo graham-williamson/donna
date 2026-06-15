@@ -768,3 +768,19 @@ def test_grant_constraints_refused_for_browser_goal_commit():
         policy.validate_constraints(
             "browser_goal.commit", {"site": "everyone_active"}
         )
+
+
+# ---- promoter.install_pack: NO_STANDING_GRANTS (Plan B Task 6) -------------
+
+
+def test_promoter_install_pack_is_never_grantable():
+    assert "promoter.install_pack" in policy.NO_STANDING_GRANTS
+
+
+def test_grant_constraints_refused_for_promoter_install_pack():
+    """validate_constraints must refuse to create a standing grant for
+    promoter.install_pack — every pack install needs a fresh approval."""
+    with pytest.raises(policy.GrantConstraintError):
+        policy.validate_constraints(
+            "promoter.install_pack", {"pack_id": "site"}
+        )

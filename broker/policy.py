@@ -365,6 +365,10 @@ GRANT_CREATE_CAPABILITY = "grant.create"
 NO_STANDING_GRANTS = frozenset({
     "everyone_active.checkout",
     "browser_goal.commit",
+    # Installing a signed capability pack is irreversible privilege change —
+    # every install needs a fresh Telegram approval and can never be covered
+    # by a standing grant (Plan B Task 6).
+    "promoter.install_pack",
 })
 
 

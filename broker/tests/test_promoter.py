@@ -140,15 +140,27 @@ def _keys_dir(tmp_path: Path, priv: Ed25519PrivateKey, key_id: str = "k1") -> Pa
 
 
 class FakeApprovalSource:
-    """An in-memory ApprovalSource: hands back a pre-built record and records
-    whether mark_consumed was called."""
+    """An in-memory ApprovalSource keyed by PACK IDENTITY: hands back a
+    pre-built record when (pack_id, pack_hash) match the record it holds, and
+    records whether mark_consumed was called and with which id."""
 
     def __init__(self, record: pack_token.ApprovalRecord | None) -> None:
         self._record = record
         self.consumed: list[str] = []
+        self.fetched: list[tuple[str, str]] = []
 
-    def fetch(self, request_id: str) -> pack_token.ApprovalRecord | None:
-        return self._record
+    def fetch(
+        self, *, pack_id: str, pack_hash: str
+    ) -> pack_token.ApprovalRecord | None:
+        self.fetched.append((pack_id, pack_hash))
+        if self._record is None:
+            return None
+        if (
+            self._record.pack_id == pack_id
+            and self._record.pack_hash == pack_hash
+        ):
+            return self._record
+        return None
 
     def mark_consumed(self, request_id: str) -> None:
         self.consumed.append(request_id)
@@ -209,7 +221,6 @@ def test_install_happy_path(tmp_path: Path) -> None:
 
     result = promoter.install(
         pack_dir=str(pack_dir),
-        request_id="req-1",
         trusted_keys_dir=str(keys),
         live_manifests_dir=str(live),
         approvals=approvals,
@@ -253,7 +264,6 @@ def test_install_unsigned_pack_refused(tmp_path: Path) -> None:
     with pytest.raises(promoter.PromoterError):
         promoter.install(
             pack_dir=str(pack_dir),
-            request_id="req-1",
             trusted_keys_dir=str(keys),
             live_manifests_dir=str(live),
             approvals=approvals,
@@ -287,7 +297,6 @@ def test_install_no_approval_refused(tmp_path: Path) -> None:
     with pytest.raises(promoter.PromoterError):
         promoter.install(
             pack_dir=str(pack_dir),
-            request_id="req-1",
             trusted_keys_dir=str(keys),
             live_manifests_dir=str(live),
             approvals=approvals,
@@ -321,7 +330,6 @@ def test_install_wrong_pack_hash_refused(tmp_path: Path) -> None:
     with pytest.raises(promoter.PromoterError):
         promoter.install(
             pack_dir=str(pack_dir),
-            request_id="req-1",
             trusted_keys_dir=str(keys),
             live_manifests_dir=str(live),
             approvals=approvals,
@@ -353,7 +361,6 @@ def test_install_restart_failure_is_installed_restart_failed(tmp_path: Path) -> 
     with pytest.raises(promoter.PromoterError):
         promoter.install(
             pack_dir=str(pack_dir),
-            request_id="req-1",
             trusted_keys_dir=str(keys),
             live_manifests_dir=str(live),
             approvals=approvals,
@@ -430,7 +437,166 @@ def test_get_request_missing_returns_none(conn: sqlite3.Connection) -> None:
     assert requests_db.get_request(conn, "nope") is None
 
 
-# ---- RequestsDbApprovalSource: real DB-backed source --------------------
+# ---- requests_db.find_install_approval: lookup by PACK IDENTITY ----------
+
+
+def test_find_install_approval_match_found(conn: sqlite3.Connection) -> None:
+    req = _install_request(
+        request_id="r1", state="approved", pack_hash="c" * 64, approved_at=1_500_000
+    )
+    requests_db.insert_request(conn, req)
+    got = requests_db.find_install_approval(
+        conn, pack_id="site", pack_hash="c" * 64
+    )
+    assert got is not None
+    assert got.request_id == "r1"
+
+
+def test_find_install_approval_match_in_executing_state(
+    conn: sqlite3.Connection,
+) -> None:
+    """The broker moves the request approved -> executing before running the
+    executor, so the approval must still resolve while it is executing."""
+    req = _install_request(
+        request_id="r1", state="approved", pack_hash="c" * 64, approved_at=1_500_000
+    )
+    requests_db.insert_request(conn, req)
+    requests_db.transition(conn, "r1", "approved", "executing")
+    got = requests_db.find_install_approval(
+        conn, pack_id="site", pack_hash="c" * 64
+    )
+    assert got is not None
+    assert got.request_id == "r1"
+    assert got.state == "executing"
+
+
+def test_find_install_approval_wrong_hash_returns_none(
+    conn: sqlite3.Connection,
+) -> None:
+    req = _install_request(
+        request_id="r1", state="approved", pack_hash="c" * 64, approved_at=1_500_000
+    )
+    requests_db.insert_request(conn, req)
+    assert (
+        requests_db.find_install_approval(conn, pack_id="site", pack_hash="d" * 64)
+        is None
+    )
+
+
+def test_find_install_approval_wrong_state_returns_none(
+    conn: sqlite3.Connection,
+) -> None:
+    """A denied request must NOT resolve as an approval."""
+    req = _install_request(
+        request_id="r1",
+        state="pending_approval",
+        pack_hash="c" * 64,
+        approved_at=None,
+    )
+    requests_db.insert_request(conn, req)
+    requests_db.transition(conn, "r1", "pending_approval", "denied")
+    assert (
+        requests_db.find_install_approval(conn, pack_id="site", pack_hash="c" * 64)
+        is None
+    )
+
+
+def test_find_install_approval_wrong_capability_returns_none(
+    conn: sqlite3.Connection,
+) -> None:
+    """A non-install request with matching params_json must not resolve."""
+    req = requests_db.Request(
+        request_id="r2",
+        capability="gmail.send",  # not an install request
+        params_json=json.dumps({"pack_id": "site", "pack_hash": "c" * 64}),
+        params_hash="a" * 64,
+        idempotency_key="idem-r2",
+        resolved_summary="s",
+        context_reason=None,
+        risk_level="high",
+        state="approved",
+        approval_code="ZZZ999",
+        approval_hmac="f" * 64,
+        created_at=1_000_000,
+        approval_expires_at=2_000_000,
+        execution_expires_at=None,
+        approved_at=1_500_000,
+        executed_at=None,
+        result_json=None,
+        error_code=None,
+        error_message=None,
+        prev_audit_hash=None,
+    )
+    requests_db.insert_request(conn, req)
+    assert (
+        requests_db.find_install_approval(conn, pack_id="site", pack_hash="c" * 64)
+        is None
+    )
+
+
+def _install_request_raw_params(
+    *, request_id: str, params_json: str
+) -> requests_db.Request:
+    """An approved install request with arbitrary (possibly malformed)
+    params_json — to exercise find_install_approval's defensive branches."""
+    return requests_db.Request(
+        request_id=request_id,
+        capability="promoter.install_pack",
+        params_json=params_json,
+        params_hash="a" * 64,
+        idempotency_key=f"idem-{request_id}",
+        resolved_summary="install",
+        context_reason=None,
+        risk_level="high",
+        state="approved",
+        approval_code=None,
+        approval_hmac="f" * 64,
+        created_at=1_000_000,
+        approval_expires_at=2_000_000,
+        execution_expires_at=None,
+        approved_at=1_500_000,
+        executed_at=None,
+        result_json=None,
+        error_code=None,
+        error_message=None,
+        prev_audit_hash=None,
+    )
+
+
+def test_find_install_approval_skips_malformed_json_params(
+    conn: sqlite3.Connection,
+) -> None:
+    """A row whose params_json is not valid JSON is skipped, not crashed on."""
+    requests_db.insert_request(
+        conn, _install_request_raw_params(request_id="bad", params_json="{not json")
+    )
+    requests_db.insert_request(
+        conn,
+        _install_request_raw_params(
+            request_id="good",
+            params_json=json.dumps({"pack_id": "site", "pack_hash": "c" * 64}),
+        ),
+    )
+    got = requests_db.find_install_approval(
+        conn, pack_id="site", pack_hash="c" * 64
+    )
+    assert got is not None and got.request_id == "good"
+
+
+def test_find_install_approval_skips_non_dict_params(
+    conn: sqlite3.Connection,
+) -> None:
+    """A row whose params_json is valid JSON but not an object is skipped."""
+    requests_db.insert_request(
+        conn, _install_request_raw_params(request_id="arr", params_json="[1, 2, 3]")
+    )
+    assert (
+        requests_db.find_install_approval(conn, pack_id="site", pack_hash="c" * 64)
+        is None
+    )
+
+
+# ---- RequestsDbApprovalSource: real DB-backed source (by pack identity) --
 
 
 def test_db_approval_source_maps_approved(conn: sqlite3.Connection) -> None:
@@ -439,7 +605,7 @@ def test_db_approval_source_maps_approved(conn: sqlite3.Connection) -> None:
     )
     requests_db.insert_request(conn, req)
     src = promoter.RequestsDbApprovalSource(conn)
-    rec = src.fetch("r1")
+    rec = src.fetch(pack_id="site", pack_hash="c" * 64)
     assert rec is not None
     assert rec.status == "approved"
     assert rec.pack_id == "site"
@@ -460,42 +626,14 @@ def test_db_approval_source_maps_executing_to_approved(conn: sqlite3.Connection)
     requests_db.insert_request(conn, req)
     requests_db.transition(conn, "r1", "approved", "executing")
     src = promoter.RequestsDbApprovalSource(conn)
-    rec = src.fetch("r1")
+    rec = src.fetch(pack_id="site", pack_hash="c" * 64)
     assert rec is not None
     assert rec.status == "approved"
 
 
-def test_db_approval_source_rejects_wrong_capability(conn: sqlite3.Connection) -> None:
-    req = requests_db.Request(
-        request_id="r2",
-        capability="gmail.send",  # not an install request
-        params_json="{}",
-        params_hash="a" * 64,
-        idempotency_key="idem-r2",
-        resolved_summary="s",
-        context_reason=None,
-        risk_level="high",
-        state="approved",
-        approval_code="ZZZ999",
-        approval_hmac="f" * 64,
-        created_at=1_000_000,
-        approval_expires_at=2_000_000,
-        execution_expires_at=None,
-        approved_at=1_500_000,
-        executed_at=None,
-        result_json=None,
-        error_code=None,
-        error_message=None,
-        prev_audit_hash=None,
-    )
-    requests_db.insert_request(conn, req)
-    src = promoter.RequestsDbApprovalSource(conn)
-    assert src.fetch("r2") is None
-
-
 def test_db_approval_source_missing_returns_none(conn: sqlite3.Connection) -> None:
     src = promoter.RequestsDbApprovalSource(conn)
-    assert src.fetch("nope") is None
+    assert src.fetch(pack_id="nope", pack_hash="0" * 64) is None
 
 
 def test_db_approval_source_mark_consumed_is_best_effort(conn: sqlite3.Connection) -> None:

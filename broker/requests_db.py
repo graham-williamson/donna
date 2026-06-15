@@ -26,6 +26,7 @@ validated against an allowlist before interpolation.
 """
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from dataclasses import dataclass, fields
@@ -274,6 +275,41 @@ def get_request(conn: sqlite3.Connection, request_id: str) -> Optional[Request]:
         "SELECT * FROM requests WHERE request_id = ?", (request_id,)
     ).fetchone()
     return _row_to_request(row) if row else None
+
+
+def find_install_approval(
+    conn: sqlite3.Connection, *, pack_id: str, pack_hash: str
+) -> Optional[Request]:
+    """Resolve a `promoter.install_pack` approval by PACK IDENTITY.
+
+    The broker's subprocess executor contract does NOT pass request_id to the
+    executor (stdin is `{capability, params}` only), and by the time the
+    promoter runs the broker has already moved the matching request
+    `approved -> executing`. So the promoter cannot look the approval up by
+    request_id — it resolves it from the pack identity it independently
+    re-verified instead.
+
+    Returns the most-recent `promoter.install_pack` request whose state is
+    `approved` or `executing` and whose `params_json` parses to a dict with
+    matching `pack_id` AND `pack_hash`; else None. Double-install is naturally
+    prevented: after a successful install the pack's capabilities exist live,
+    so pack_verify rejects the collision on any re-run.
+    """
+    rows = conn.execute(
+        "SELECT * FROM requests WHERE capability = 'promoter.install_pack' "
+        "AND state IN ('approved','executing') "
+        "ORDER BY created_at DESC",
+    ).fetchall()
+    for row in rows:
+        try:
+            params = json.loads(row["params_json"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(params, dict):
+            continue
+        if params.get("pack_id") == pack_id and params.get("pack_hash") == pack_hash:
+            return _row_to_request(row)
+    return None
 
 
 def get_by_approval_code(

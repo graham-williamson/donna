@@ -51,8 +51,30 @@ BROKER_LAUNCHD_LABEL = "com.user.daru-broker"
 
 class _DoInstall(Protocol):
     def __call__(  # pragma: no cover - Protocol stub
-        self, *, pack_dir: str, request_id: str
+        self, *, pack_id: str
     ) -> dict[str, str]: ...
+
+
+def safe_pack_id(pack_id: str) -> bool:
+    """PURE: is this a SAFE bare pack directory name?
+
+    The frame carries only a ``pack_id``; ``main`` resolves the pack dir as
+    ``<packs_dir>/<pack_id>``. A pack_id must therefore be a bare directory
+    name — never a path. Reject anything containing a path separator (``/`` or
+    ``\\``), a ``..`` traversal component, a leading dot, or that is empty.
+    Defence in depth against a hostile client trying to escape the packs dir.
+    """
+    if not pack_id:
+        return False
+    if "/" in pack_id or "\\" in pack_id:
+        return False
+    if pack_id in (".", ".."):
+        return False
+    if ".." in pack_id:
+        return False
+    if pack_id.startswith("."):
+        return False
+    return True
 
 
 def _reply(obj: dict[str, Any]) -> bytes:
@@ -77,8 +99,12 @@ def handle_frame(
     PURE and total: it NEVER raises. Every malformed input, unknown op, or
     ``do_install`` exception becomes ``{"ok": false, "error": ...}``. Success is
     ``{"ok": true, ...result}``. ``do_install`` is called ONLY when the frame is
-    a well-formed ``install_pack`` request with string ``pack_dir`` +
-    ``request_id`` (defence in depth: nothing privileged runs on a bad frame).
+    a well-formed ``install_pack`` request with a string ``pack_id`` that is a
+    SAFE bare directory name (``safe_pack_id``) — a traversal pack_id is
+    rejected here WITHOUT calling do_install (defence in depth: nothing
+    privileged runs on a bad frame). The frame carries NEITHER a request_id NOR
+    a client-supplied pack_dir: the promoter resolves the pack dir from the
+    pack_id and the approval from the pack identity it re-verifies.
     """
     # 1. Length prefix.
     if len(raw) < 4:
@@ -104,16 +130,17 @@ def handle_frame(
     if op != "install_pack":
         return _error(f"unknown op: {op!r}")
 
-    pack_dir = parsed.get("pack_dir")
-    request_id = parsed.get("request_id")
-    if not isinstance(pack_dir, str) or not pack_dir:
-        return _error("missing or invalid field: pack_dir")
-    if not isinstance(request_id, str) or not request_id:
-        return _error("missing or invalid field: request_id")
+    pack_id = parsed.get("pack_id")
+    if not isinstance(pack_id, str) or not pack_id:
+        return _error("missing or invalid field: pack_id")
+    if not safe_pack_id(pack_id):
+        # Reject a traversal / path-bearing pack_id at the validation layer —
+        # do_install is NEVER called for it.
+        return _error(f"unsafe pack_id: {pack_id!r}")
 
     # 4. Run the (injected) privileged install. Any failure -> error reply.
     try:
-        result = do_install(pack_dir=pack_dir, request_id=request_id)
+        result = do_install(pack_id=pack_id)
     except Exception as e:  # noqa: BLE001 — fail-closed: every error is a reply.
         return _error(str(e))
 
@@ -188,11 +215,12 @@ def serve(
 
 
 def _kickstart_broker(label: str = BROKER_LAUNCHD_LABEL) -> None:  # pragma: no cover - launchctl subprocess, smoke-tested live
-    """Restart the broker so it reloads the freshly-merged manifests.
+    """Restart a RESIDENT broker so it reloads the freshly-merged manifests.
 
-    Runs ``launchctl kickstart -k system/<label>`` (the promoter runs as a root
-    LaunchDaemon, so the broker target lives in the ``system`` domain). The only
-    place this module touches ``subprocess`` — hence the ``.importlinter``
+    Runs ``launchctl kickstart -k system/<label>``. NOTE: this is NOT wired as
+    the default restart in ``main`` — see the rationale there. It is kept for
+    the future case where the broker runs as a long-lived launchd service. The
+    only place this module touches ``subprocess`` — hence the ``.importlinter``
     allowance. Raises ``CalledProcessError`` on failure; the orchestrator treats
     a restart failure as ``installed_restart_failed`` (merge stands)."""
     subprocess.run(
@@ -205,10 +233,11 @@ def _kickstart_broker(label: str = BROKER_LAUNCHD_LABEL) -> None:  # pragma: no 
 def main(argv: list[str]) -> int:  # pragma: no cover - privileged wiring; opens real resources
     """Wire the real ``do_install`` and serve. Config from argv/env.
 
-    Resolves ``pack_dir`` defensively: the orchestrator is given the configured
-    packs dir + the request's ``pack_id`` (read from the broker DB), NOT a
-    client-supplied absolute path — a client-supplied ``pack_dir`` is accepted
-    only if it is a direct child of the configured packs dir.
+    Resolves ``pack_dir`` defensively from the client-supplied ``pack_id``: the
+    frame carries ONLY a bare ``pack_id`` (validated by ``safe_pack_id`` in
+    handle_frame), and the orchestrator is given ``<packs_dir>/<pack_id>`` — the
+    client never supplies a path. The approval is resolved by pack identity
+    (the orchestrator reads the broker DB itself), not by a client request_id.
     """
     import argparse
 
@@ -229,21 +258,31 @@ def main(argv: list[str]) -> int:  # pragma: no cover - privileged wiring; opens
     approvals = promoter.RequestsDbApprovalSource(conn)
     ledger = promoter_ledger.Ledger(args.ledger, now=__import__("time").time)
 
-    def do_install(*, pack_dir: str, request_id: str) -> dict[str, str]:
-        # Defence in depth: never trust a client-supplied absolute path. The
-        # pack dir MUST be a direct child of the configured packs root.
-        candidate = Path(pack_dir).resolve()
+    # Restart is a NO-OP. There is NO resident broker launchd service — the
+    # broker is a per-call CLI (`/usr/local/bin/donna-broker`, sudo) that
+    # reloads capabilities.yaml on EVERY invocation. A manifest merge therefore
+    # needs no restart: the very next broker call already sees the new pack.
+    # Defaulting to a launchctl kickstart of a non-resident service would
+    # always fail and mislabel a perfectly good install `installed_restart_
+    # failed`. `_kickstart_broker` is kept (pragma-no-cover) for the future
+    # resident-broker case but is deliberately NOT wired here.
+    def _no_restart() -> None:
+        return None
+
+    def do_install(*, pack_id: str) -> dict[str, str]:
+        # handle_frame already validated pack_id is a safe bare name; resolve it
+        # under the configured packs root. Never trust a client-supplied path.
+        candidate = (packs_root / pack_id).resolve()
         if candidate.parent != packs_root:
             raise promoter.PromoterError(
-                f"pack_dir not a direct child of packs dir: {pack_dir}"
+                f"resolved pack dir escapes packs dir: {pack_id}"
             )
         return promoter.install(
             pack_dir=str(candidate),
-            request_id=request_id,
             trusted_keys_dir=args.trusted_keys_dir,
             live_manifests_dir=args.live_manifests_dir,
             approvals=approvals,
-            restart=lambda: _kickstart_broker(args.broker_label),
+            restart=_no_restart,
             ledger=ledger,
             now=__import__("time").time,
         )
