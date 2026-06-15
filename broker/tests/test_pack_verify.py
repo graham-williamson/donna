@@ -12,7 +12,14 @@ with a typed ``PackRejected``:
   4. no collision with an existing live capability;
   5. the manifest has NO top-level key other than ``capabilities``;
   6. ``meta.capabilities`` set == manifest defined-names set;
-  7. the pack defines at least one capability (an empty pack is meaningless).
+  7. the pack defines SOMETHING — at least one capability OR one site profile
+     (a truly-empty pack — no capabilities AND no profiles — is meaningless);
+  8. every site profile in the pack is well-formed (loads via
+     ``browser_profile.load``).
+
+A DATA-ONLY SITE-PROFILE pack has zero capabilities and ≥1 profile; it is
+legitimate (enabling a new browser_goal site = adding a profile, not a cap)
+and passes with ``capability_names == ()``.
 """
 from __future__ import annotations
 
@@ -34,6 +41,7 @@ def _write_pack(
     *,
     manifest: dict[str, Any],
     meta_caps: list[str],
+    profiles: dict[str, Any] | None = None,
     priv: Ed25519PrivateKey | None = None,
     sign: bool = True,
 ) -> Path:
@@ -41,6 +49,8 @@ def _write_pack(
     d = base / "p"
     (d / "schemas").mkdir(parents=True)
     (d / "profiles").mkdir()
+    for fname, body in (profiles or {}).items():
+        (d / "profiles" / fname).write_text(json.dumps(body), encoding="utf-8")
     meta = {
         "pack_id": "site",
         "version": 1,
@@ -62,6 +72,7 @@ def _signed_pack(
     *,
     manifest: dict[str, Any],
     meta_caps: list[str],
+    profiles: dict[str, Any] | None = None,
     sign: bool = True,
     key_id: str = "k1",
 ) -> tuple[pack_format.Pack, pack_keys.TrustedKeys]:
@@ -69,10 +80,31 @@ def _signed_pack(
     (tmp_path / f"{key_id}.ed25519.pub").write_text(
         priv.public_key().public_bytes_raw().hex(), encoding="utf-8"
     )
-    d = _write_pack(tmp_path, manifest=manifest, meta_caps=meta_caps, priv=priv, sign=sign)
+    d = _write_pack(
+        tmp_path,
+        manifest=manifest,
+        meta_caps=meta_caps,
+        profiles=profiles,
+        priv=priv,
+        sign=sign,
+    )
     pack = pack_format.load_pack(str(d))
     store = pack_keys.load_trusted_keys(str(tmp_path))
     return pack, store
+
+
+def _ok_profile() -> dict[str, Any]:
+    """A valid everyone_active-style SiteProfile dict (loads cleanly)."""
+    return {
+        "site": "tesco",
+        "login_url": "https://secure.tesco.com/account/login",
+        "allowlist": ["tesco.com", "secure.tesco.com"],
+        "success_indicators": [
+            {"type": "url_pattern", "value": "/groceries/"}
+        ],
+        "mfa_rule": "pause_and_ask",
+        "network_strictness": "monitor",
+    }
 
 
 def _ok_manifest() -> dict[str, Any]:
@@ -369,11 +401,12 @@ def test_meta_declaring_extra_cap_rejected(tmp_path: Path) -> None:
 
 
 def test_empty_capabilities_pack_rejected(tmp_path: Path) -> None:
-    """ADVERSARIAL (e): a pack that defines NOTHING is rejected. Installing an
-    empty pack is meaningless, and two empty sets would otherwise pass the
-    declared==defined check — so the contract rejects it explicitly."""
+    """ADVERSARIAL (e): a pack that defines NOTHING — no capabilities AND no
+    profiles — is rejected. Installing an empty pack is meaningless, and two
+    empty sets would otherwise pass the declared==defined check, so the contract
+    rejects it explicitly."""
     pack, store = _signed_pack(tmp_path, manifest={"capabilities": []}, meta_caps=[])
-    with pytest.raises(pack_verify.PackRejected, match="defines no capabilities"):
+    with pytest.raises(pack_verify.PackRejected, match="defines nothing"):
         _verify(pack, store)
 
 
@@ -401,4 +434,121 @@ def test_capability_entry_not_a_dict_rejected(tmp_path: Path) -> None:
     m = {"capabilities": ["site.browse_plan"]}
     pack, store = _signed_pack(tmp_path, manifest=m, meta_caps=["site.browse_plan"])
     with pytest.raises(pack_verify.PackRejected, match="name"):
+        _verify(pack, store)
+
+
+# --- data-only site-profile packs ----------------------------------------
+
+
+def test_profile_only_pack_passes(tmp_path: Path) -> None:
+    """A signed pack with ZERO capabilities but one valid site profile is a
+    legitimate data-only site-profile pack: it verifies, and the result carries
+    an EMPTY capability_names tuple."""
+    pack, store = _signed_pack(
+        tmp_path,
+        manifest={"capabilities": []},
+        meta_caps=[],
+        profiles={"tesco.json": _ok_profile()},
+    )
+    result = _verify(pack, store)
+    assert result.key_id == "k1"
+    assert result.pack_id == "site"
+    assert result.capability_names == ()
+    assert result.pack_hash == pack_format.pack_hash(pack)
+
+
+def test_pack_with_neither_caps_nor_profiles_rejected(tmp_path: Path) -> None:
+    """A pack that defines NOTHING — no capabilities AND no profiles — is
+    refused with a clear 'defines nothing' message."""
+    pack, store = _signed_pack(
+        tmp_path, manifest={"capabilities": []}, meta_caps=[], profiles={}
+    )
+    with pytest.raises(pack_verify.PackRejected, match="defines nothing"):
+        _verify(pack, store)
+
+
+def test_profile_only_pack_with_malformed_profile_rejected(tmp_path: Path) -> None:
+    """A profile-only pack whose profile is missing a required field (allowlist)
+    is refused — a malformed profile can never be installed."""
+    bad = _ok_profile()
+    del bad["allowlist"]
+    pack, store = _signed_pack(
+        tmp_path,
+        manifest={"capabilities": []},
+        meta_caps=[],
+        profiles={"tesco.json": bad},
+    )
+    with pytest.raises(pack_verify.PackRejected, match="invalid site profile"):
+        _verify(pack, store)
+
+
+def test_profile_only_pack_with_bad_login_url_rejected(tmp_path: Path) -> None:
+    """A profile with a non-https login_url is refused (ProfileError surfaced)."""
+    bad = _ok_profile()
+    bad["login_url"] = "http://insecure.tesco.com/login"
+    pack, store = _signed_pack(
+        tmp_path,
+        manifest={"capabilities": []},
+        meta_caps=[],
+        profiles={"tesco.json": bad},
+    )
+    with pytest.raises(pack_verify.PackRejected, match="invalid site profile"):
+        _verify(pack, store)
+
+
+def test_profile_not_a_json_object_rejected(tmp_path: Path) -> None:
+    """A profile file whose top-level JSON is not an object is refused before it
+    ever reaches browser_profile.load."""
+    pack, store = _signed_pack(
+        tmp_path,
+        manifest={"capabilities": []},
+        meta_caps=[],
+        profiles={"tesco.json": ["not", "an", "object"]},
+    )
+    with pytest.raises(pack_verify.PackRejected, match="invalid site profile"):
+        _verify(pack, store)
+
+
+def test_pack_with_both_capability_and_profile_validates_both(
+    tmp_path: Path,
+) -> None:
+    """A pack carrying BOTH a capability and a profile validates both: a valid
+    cap + valid profile passes."""
+    pack, store = _signed_pack(
+        tmp_path,
+        manifest=_ok_manifest(),
+        meta_caps=["site.browse_plan"],
+        profiles={"tesco.json": _ok_profile()},
+    )
+    result = _verify(pack, store)
+    assert result.capability_names == ("site.browse_plan",)
+
+
+def test_pack_with_good_cap_but_bad_profile_rejected(tmp_path: Path) -> None:
+    """A pack with a valid capability but a malformed profile is still refused —
+    profile validation applies even when capabilities are present."""
+    bad = _ok_profile()
+    del bad["success_indicators"]
+    pack, store = _signed_pack(
+        tmp_path,
+        manifest=_ok_manifest(),
+        meta_caps=["site.browse_plan"],
+        profiles={"tesco.json": bad},
+    )
+    with pytest.raises(pack_verify.PackRejected, match="invalid site profile"):
+        _verify(pack, store)
+
+
+def test_pack_with_bad_cap_and_good_profile_rejected(tmp_path: Path) -> None:
+    """A pack with a bad executor is still rejected even if it carries a valid
+    profile — the data-only check on capabilities still applies."""
+    m = _ok_manifest()
+    m["capabilities"][0]["executor"] = {"type": "shell", "command": "rm -rf /"}
+    pack, store = _signed_pack(
+        tmp_path,
+        manifest=m,
+        meta_caps=["site.browse_plan"],
+        profiles={"tesco.json": _ok_profile()},
+    )
+    with pytest.raises(pack_verify.PackRejected, match="executor"):
         _verify(pack, store)

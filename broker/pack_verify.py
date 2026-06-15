@@ -26,19 +26,30 @@ A pack is INSTALLED only if EVERY one of these holds (else ``PackRejected``):
   6. Declared == defined — ``meta.capabilities`` exactly equals the set of
      ``name``s defined in ``manifest.capabilities`` (no hidden capabilities,
      no phantom declarations).
-  7. The pack defines at least one capability — an empty pack is meaningless
-     and is refused explicitly (two empty sets would otherwise satisfy #6).
+  7. The pack defines SOMETHING — at least one capability OR at least one
+     browser-goal SiteProfile. A truly-empty pack (no capabilities AND no
+     profiles) is meaningless and is refused explicitly (two empty
+     capability sets would otherwise satisfy #6).
+  8. Every browser-goal SiteProfile in the pack is well-formed — each profile
+     in ``pack.profiles`` loads cleanly via ``browser_profile.load`` (a
+     malformed/garbage profile can never be installed).
+
+A DATA-ONLY SITE-PROFILE pack legitimately has ZERO capabilities and one (or
+more) profiles: ``browser_goal.plan``/``browser_goal.commit`` are generic
+capabilities that load ``manifests/profiles/<site>.json``, so enabling a new
+site is adding a profile, not a new capability. Such a pack passes with
+``capability_names == ()``.
 
 Every failure raises ``PackRejected`` with a precise reason. Fail-closed: no
 bare excepts, no silent return-None — there is no path out of this function
-that approves a pack without satisfying all seven checks.
+that approves a pack without satisfying all eight checks.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Iterable
 
-from broker import pack_format, pack_keys, policy
+from broker import browser_profile, pack_format, pack_keys, policy
 
 # Already-vetted executor binaries a pack may reference (design §3). A pack may
 # NOT introduce any other subprocess binary. Matching is byte-exact — no path
@@ -114,10 +125,29 @@ def verify_pack(
     if not isinstance(caps, list):
         raise PackRejected("manifest `capabilities` must be a list")
 
-    # 7. An empty pack defines nothing — refuse it explicitly (otherwise the
-    #    declared==defined check below would pass for two empty sets).
-    if not caps:
-        raise PackRejected("pack defines no capabilities")
+    # 7. A pack must define SOMETHING — at least one capability OR at least one
+    #    site profile. A truly-empty pack is meaningless (and two empty sets
+    #    would otherwise satisfy the declared==defined check below). A pack with
+    #    zero capabilities but ≥1 profile is a legitimate data-only site-profile
+    #    pack (enabling a new browser_goal site = adding a profile, not a cap).
+    if not caps and not pack.profiles:
+        raise PackRejected(
+            "pack defines nothing — no capabilities and no profiles"
+        )
+
+    # 8. Every site profile must be well-formed (a malformed/garbage profile can
+    #    never be installed). Validated whether or not the pack has capabilities.
+    for filename, profile in pack.profiles.items():
+        if not isinstance(profile, dict):
+            raise PackRejected(
+                f"invalid site profile {filename}: profile must be a JSON object"
+            )
+        try:
+            browser_profile.load(profile)
+        except browser_profile.ProfileError as exc:
+            raise PackRejected(
+                f"invalid site profile {filename}: {exc}"
+            ) from exc
 
     defined_names: list[str] = []
     for entry in caps:

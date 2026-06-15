@@ -60,6 +60,25 @@ def _pack(tmp_path: Path, name: str = "site.read",
     return pack_format.load_pack(str(d))
 
 
+def _profile_only_pack(tmp_path: Path) -> pack_format.Pack:
+    """A DATA-ONLY site-profile pack: zero capabilities, one profile JSON."""
+    d = tmp_path / "profpack"
+    (d / "schemas").mkdir(parents=True)
+    (d / "profiles").mkdir()
+    (d / "meta.json").write_text(json.dumps({"pack_id": "tesco", "version": 1,
+        "created_utc": "t", "description": "tesco profile", "capabilities": []}))
+    (d / "manifest.yaml").write_text(yaml.safe_dump({"capabilities": []}))
+    (d / "profiles" / "tesco.json").write_text(json.dumps({
+        "site": "tesco",
+        "login_url": "https://secure.tesco.com/account/login",
+        "allowlist": ["tesco.com"],
+        "success_indicators": [{"type": "url_pattern", "value": "/groceries/"}],
+        "mfa_rule": "pause_and_ask",
+        "network_strictness": "monitor",
+    }))
+    return pack_format.load_pack(str(d))
+
+
 def _leftover_temp_dirs(parent: Path) -> list[str]:
     return sorted(c.name for c in parent.iterdir()
                   if c.is_dir() and c.name.startswith("promoter-"))
@@ -285,6 +304,38 @@ def test_publish_copies_mcp_tools_only_if_present(tmp_path: Path) -> None:
     (live / "mcp-tools.yaml").write_text("tools: []\n", encoding="utf-8")
     promoter_fs.publish_to_config(str(live), str(cfg))
     assert (cfg / "mcp-tools.yaml").read_text() == "tools: []\n"
+
+
+def test_profile_only_pack_installs_and_publishes(tmp_path: Path) -> None:
+    """A data-only site-profile pack (zero capabilities, one profile) installs
+    into the live dir's profiles/ and publishes to the config dir's profiles/,
+    leaving capabilities.yaml UNCHANGED (an empty append is a no-op)."""
+    live = _live(tmp_path)
+    before_caps = (live / "capabilities.yaml").read_text()
+    pack = _profile_only_pack(tmp_path)
+
+    promoter_fs.install(pack, str(live))
+
+    # capabilities.yaml gained no new capability...
+    merged = yaml.safe_load((live / "capabilities.yaml").read_text())
+    assert {c["name"] for c in merged["capabilities"]} == {"gmail.send"}
+    # ...and the profile landed in the live dir.
+    assert (live / "profiles" / "tesco.json").is_file()
+    landed = json.loads((live / "profiles" / "tesco.json").read_text())
+    assert landed["site"] == "tesco"
+
+    # Now publish to the broker config dir; the profile lands there too.
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    promoter_fs.publish_to_config(str(live), str(cfg))
+    assert (cfg / "profiles" / "tesco.json").is_file()
+    assert json.loads((cfg / "profiles" / "tesco.json").read_text())["site"] == "tesco"
+    # The published capabilities.yaml is the (unchanged) single-cap set.
+    pub = yaml.safe_load((cfg / "capabilities.yaml").read_text())
+    assert {c["name"] for c in pub["capabilities"]} == {"gmail.send"}
+    assert _leftover_temp_dirs(tmp_path) == []
+    # And the live capabilities.yaml is byte-for-byte what it was (no cap append).
+    assert yaml.safe_load(before_caps) == merged
 
 
 def test_publish_copies_profiles_if_present(tmp_path: Path) -> None:

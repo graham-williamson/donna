@@ -127,6 +127,48 @@ def _write_pack(
     return d
 
 
+def _write_profile_only_pack(
+    tmp_path: Path, *, priv: Ed25519PrivateKey, pack_id: str = "tesco"
+) -> Path:
+    """A DATA-ONLY site-profile pack dir: zero capabilities, one profile."""
+    d = tmp_path / "profpack"
+    (d / "schemas").mkdir(parents=True)
+    (d / "profiles").mkdir()
+    (d / "meta.json").write_text(
+        json.dumps(
+            {
+                "pack_id": pack_id,
+                "version": 1,
+                "created_utc": "2026-06-15T00:00:00Z",
+                "description": "tesco profile",
+                "capabilities": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (d / "manifest.yaml").write_text(
+        yaml.safe_dump({"capabilities": []}), encoding="utf-8"
+    )
+    (d / "profiles" / "tesco.json").write_text(
+        json.dumps(
+            {
+                "site": "tesco",
+                "login_url": "https://secure.tesco.com/account/login",
+                "allowlist": ["tesco.com"],
+                "success_indicators": [
+                    {"type": "url_pattern", "value": "/groceries/"}
+                ],
+                "mfa_rule": "pause_and_ask",
+                "network_strictness": "monitor",
+            }
+        ),
+        encoding="utf-8",
+    )
+    pack = pack_format.load_pack(str(d))
+    (d / "pack.sig").write_bytes(priv.sign(pack_format.canonical_bytes(pack)))
+    return d
+
+
 def _keys_dir(tmp_path: Path, priv: Ed25519PrivateKey, key_id: str = "k1") -> Path:
     d = tmp_path / "keys"
     d.mkdir()
@@ -244,6 +286,46 @@ def test_install_happy_path(tmp_path: Path) -> None:
     merged = yaml.safe_load((live / "capabilities.yaml").read_text())
     names = {c["name"] for c in merged["capabilities"]}
     assert names == {"gmail.send", "site.read"}
+
+
+def test_install_profile_only_pack_happy_path(tmp_path: Path) -> None:
+    """A data-only site-profile pack (zero capabilities, one profile) installs
+    end-to-end: verified, merged (profile lands, capabilities.yaml unchanged),
+    published, approval consumed, ledger row 'installed'."""
+    priv = Ed25519PrivateKey.generate()
+    live = _live(tmp_path)
+    before_caps = (live / "capabilities.yaml").read_text()
+    pack_dir = _write_profile_only_pack(tmp_path, priv=priv)
+    keys = _keys_dir(tmp_path, priv)
+    approvals = FakeApprovalSource(
+        _approval(pack_id="tesco", pack_hash=_pack_hash_of(pack_dir))
+    )
+    publish = FakePublish()
+    ledger = _ledger(tmp_path)
+
+    result = promoter.install(
+        pack_dir=str(pack_dir),
+        trusted_keys_dir=str(keys),
+        live_manifests_dir=str(live),
+        approvals=approvals,
+        publish=publish,
+        ledger=ledger,
+        now=lambda: 1500.0,
+    )
+
+    assert result["outcome"] == "installed"
+    assert result["pack_id"] == "tesco"
+    assert publish.calls == 1
+    assert approvals.consumed == ["req-1"]
+
+    rows = promoter_ledger.read_all(str(tmp_path / "ledger.jsonl"))
+    assert len(rows) == 1
+    assert rows[0]["outcome"] == "installed"
+    assert rows[0]["pack_id"] == "tesco"
+
+    # The profile landed; capabilities.yaml is unchanged (no capability added).
+    assert (live / "profiles" / "tesco.json").is_file()
+    assert (live / "capabilities.yaml").read_text() == before_caps
 
 
 # ---- unsigned / bad pack -> refused, restart NOT called, live unchanged --
