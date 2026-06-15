@@ -75,4 +75,5 @@ ignore_imports =
     broker.resolver -> subprocess
     broker.executor -> subprocess
     broker.creds -> subprocess
+    broker.promoter_daemon -> subprocess
     broker.tests.* -> subprocess
