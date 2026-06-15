@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Launchd job: the signed-capability promoter daemon.
+
+  Spec: 2026-06-14-signed-capability-promoter-design.md §6.2/§9.5;
+  plan 2026-06-15-promoter-daemon-bootstrap.md Task 8.
+
+  Unlike com.donna.broker.verify-audit (a LaunchAgent that runs as
+  grahamwilliamson via sudo), THIS is a LaunchDaemon that runs as ROOT.
+  The promoter is the privileged install boundary: it owns the
+  root-only trusted-keys dir and atomically merges signed packs into
+  the live broker manifests. It must run as root and must live where
+  the donna-broker / daru-api users CANNOT write (this plist is
+  installed root:wheel 0644 into /Library/LaunchDaemons/ by
+  ops/install-promoter.sh).
+
+  Invocation mirrors ops/donna-broker.sh exactly: the broker venv
+  python, `-m broker.<module>`, with PYTHONPATH=/Users/donna-broker so
+  `import broker` resolves (the broker package lives at
+  /Users/donna-broker/broker/, rsynced there by setup-donna-broker.sh).
+
+  Config args/env are exactly the keys promoter_daemon.main() reads:
+    --socket             matches promoter_client's DEFAULT_SOCK
+                         (/var/run/donna/promoter.sock) so the broker
+                         executor can reach the daemon.
+    --packs-dir          where signed packs are dropped.
+    --trusted-keys-dir   root-owned key store (/etc/donna/promoter/...).
+    --live-manifests-dir the broker's live capability manifests.
+    --broker-db          the broker requests DB (read by the daemon to
+                         re-verify an approved, unconsumed install).
+    --ledger             append-only promoter install ledger.
+  Allowed peer uids ({0, donna-broker}) are resolved by the daemon
+  itself (pwd.getpwnam), not passed here.
+
+  RESTART NOTE: the daemon's restart hook is a deliberate NO-OP. The
+  donna broker is a per-call CLI that reloads capabilities.yaml on every
+  invocation, so a manifest merge needs no broker restart — the next
+  broker call already sees the new pack. Do NOT wire a launchctl
+  kickstart of the broker here. (See broker/docs/promoter-deploy.md.)
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.donna.promoter</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/donna-broker/broker/.venv/bin/python3</string>
+    <string>-m</string>
+    <string>broker.promoter_daemon</string>
+    <string>--socket</string>
+    <string>/var/run/donna/promoter.sock</string>
+    <string>--packs-dir</string>
+    <string>/Users/donna-broker/broker/packs/available</string>
+    <string>--trusted-keys-dir</string>
+    <string>/etc/donna/promoter/trusted_keys</string>
+    <string>--live-manifests-dir</string>
+    <string>/Users/donna-broker/broker/manifests</string>
+    <string>--broker-db</string>
+    <string>/Users/donna-broker/.config/donna/requests.db</string>
+    <string>--ledger</string>
+    <string>/var/log/donna/promoter.jsonl</string>
+  </array>
+  <!--
+    PYTHONPATH=/Users/donna-broker so `import broker` resolves, exactly
+    as ops/donna-broker.sh sets it (BROKER_ROOT/.. == /Users/donna-broker).
+    Minimal, no inherited secrets.
+  -->
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/usr/bin:/bin:/usr/local/bin</string>
+    <key>PYTHONPATH</key>
+    <string>/Users/donna-broker</string>
+  </dict>
+  <!-- Resident daemon: start at boot/load and keep alive. -->
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <!--
+    Logs to /var/log/donna/ (root-owned, created by install-promoter.sh).
+    The append-only install ledger is the JSONL passed as --ledger; these
+    streams are just the daemon's stdout/stderr for crash diagnostics.
+  -->
+  <key>StandardOutPath</key>
+  <string>/var/log/donna/promoter.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/var/log/donna/promoter.stderr.log</string>
+</dict>
+</plist>
