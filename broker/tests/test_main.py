@@ -1532,3 +1532,133 @@ def test_grant_create_subject_prefix_in_summary(grants_env):
     )
     assert code == 0
     assert "School roundup" in resp["summary"]
+
+
+# ---- list-packs (read-only pack summary) --------------------------------
+
+
+def _write_signed_pack(
+    pack_dir: Path, pack_id: str, capabilities: list[str], *, sign: bool
+) -> None:
+    """Write a minimal valid pack (meta.json + manifest.yaml + a schema) and,
+    if ``sign`` is set, a detached pack.sig from a freshly generated key."""
+    from broker import pack_format
+    from broker.tools import sign_pack
+
+    pack_dir.mkdir(parents=True)
+    meta = {
+        "pack_id": pack_id,
+        "version": 1,
+        "created_utc": "2026-06-15T00:00:00Z",
+        "description": f"Plain English summary for {pack_id}",
+        "capabilities": capabilities,
+    }
+    (pack_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    manifest_lines = ["capabilities:"]
+    for name in capabilities:
+        manifest_lines.append(f"  - name: {name}")
+    (pack_dir / "manifest.yaml").write_text(
+        "\n".join(manifest_lines) + "\n", encoding="utf-8"
+    )
+    schemas = pack_dir / "schemas"
+    schemas.mkdir()
+    (schemas / "params.json").write_text(
+        json.dumps({"type": "object"}), encoding="utf-8"
+    )
+
+    if sign:
+        priv_path = pack_dir.parent / f"{pack_id}.priv.hex"
+        sign_pack.keygen(str(priv_path))
+        sign_pack.sign(str(pack_dir), str(priv_path))
+        # Confirm pack_format now sees the signature.
+        assert pack_format.load_pack(str(pack_dir)).signature is not None
+
+
+def _list_packs_ctx(capabilities: list[str]) -> dict[str, Any]:
+    """Minimal ctx for _handle_list_packs: it only reads ctx['capabilities']
+    membership, so name->sentinel is enough (no requests DB)."""
+    return {"capabilities": {name: object() for name in capabilities}}
+
+
+def test_list_packs_registered_everywhere():
+    assert "list-packs" in main.MODES
+    assert "list-packs" in main.MODE_HANDLERS
+    assert "list-packs" in main.MODES_NEEDING_MANIFESTS
+    assert "list-packs" in main.MODES_WITH_STARTUP_SWEEP
+
+
+def test_list_packs_summary_shape_and_hash(tmp_path):
+    from broker import pack_format
+
+    packs_dir = tmp_path / "available"
+    packs_dir.mkdir()
+    pack_dir = packs_dir / "demo-pack"
+    _write_signed_pack(pack_dir, "demo-pack", ["demo.thing"], sign=True)
+
+    ctx = _list_packs_ctx([])  # cap absent -> not installed
+    resp = main._handle_list_packs({"packs_dir": str(packs_dir)}, ctx)
+
+    assert resp["status"] == "ok"
+    assert len(resp["packs"]) == 1
+    entry = resp["packs"][0]
+    assert entry["pack_id"] == "demo-pack"
+    assert entry["description"] == "Plain English summary for demo-pack"
+    assert entry["capabilities"] == ["demo.thing"]
+    assert entry["signed"] is True
+    assert entry["installed"] is False
+    assert "error" not in entry
+
+    expected_hash = pack_format.pack_hash(pack_format.load_pack(str(pack_dir)))
+    assert entry["pack_hash"] == expected_hash
+
+
+def test_list_packs_installed_flips_when_cap_present(tmp_path):
+    packs_dir = tmp_path / "available"
+    packs_dir.mkdir()
+    _write_signed_pack(packs_dir / "demo-pack", "demo-pack", ["demo.thing"],
+                       sign=True)
+
+    # Cap present in the live manifest -> installed True.
+    ctx = _list_packs_ctx(["demo.thing"])
+    resp = main._handle_list_packs({"packs_dir": str(packs_dir)}, ctx)
+    assert resp["packs"][0]["installed"] is True
+
+
+def test_list_packs_unsigned_pack(tmp_path):
+    packs_dir = tmp_path / "available"
+    packs_dir.mkdir()
+    _write_signed_pack(packs_dir / "bare", "bare", ["x.y"], sign=False)
+
+    resp = main._handle_list_packs(
+        {"packs_dir": str(packs_dir)}, _list_packs_ctx([])
+    )
+    assert resp["packs"][0]["signed"] is False
+
+
+def test_list_packs_malformed_pack_does_not_crash(tmp_path):
+    packs_dir = tmp_path / "available"
+    packs_dir.mkdir()
+    _write_signed_pack(packs_dir / "good", "good", ["a.b"], sign=True)
+    # Malformed: a dir with no meta.json.
+    (packs_dir / "broken").mkdir()
+    (packs_dir / "broken" / "manifest.yaml").write_text(
+        "capabilities: []\n", encoding="utf-8"
+    )
+
+    resp = main._handle_list_packs(
+        {"packs_dir": str(packs_dir)}, _list_packs_ctx([])
+    )
+    by_id = {p["pack_id"]: p for p in resp["packs"]}
+    assert by_id["good"]["signed"] is True
+    assert "error" in by_id["broken"]
+    assert by_id["broken"]["installed"] is False
+    assert "error" not in by_id["good"]
+    # Sorted by pack_id for determinism.
+    assert [p["pack_id"] for p in resp["packs"]] == ["broken", "good"]
+
+
+def test_list_packs_missing_dir_returns_empty(tmp_path):
+    resp = main._handle_list_packs(
+        {"packs_dir": str(tmp_path / "nope")}, _list_packs_ctx([])
+    )
+    assert resp == {"status": "ok", "packs": []}

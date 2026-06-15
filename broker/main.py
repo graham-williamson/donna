@@ -35,6 +35,7 @@ from broker import canonicalize
 from broker import creds as creds_mod
 from broker import executor
 from broker import grants_db
+from broker import pack_format
 from broker import policy
 from broker import requests_db as db
 from broker import resolver
@@ -46,7 +47,7 @@ MODES = frozenset({
     "request", "policy-check", "execute", "cancel", "reconcile",
     "status", "status-by-code", "list-pending", "list-recent",
     "audit-result", "rotate-hmac", "verify-audit", "verify-manifests",
-    "verify-vault",
+    "verify-vault", "list-packs",
     # broker-standing-grants §7: scoped approve-once autonomy.
     "grant-create", "grant-list", "grant-revoke",
     # Connected Sites (docs/connected-sites-broker-handoff.md): the app
@@ -1828,6 +1829,63 @@ def _handle_verify_vault(
     }
 
 
+def _handle_list_packs(
+    payload: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """Read-only summary of capability packs on disk (promoter Plan C
+    Task 1). For each child DIR under the configured packs dir, the broker
+    (the trusted side) computes a plain summary the app can surface:
+    ``{pack_id, description, capabilities, pack_hash, signed, installed}``.
+
+    ``packs_dir`` comes from ``payload["packs_dir"]`` or ``DONNA_PACKS_DIR``,
+    default ``/Users/donna-broker/broker/packs/available``. ``signed`` only
+    reports whether ``pack.sig`` exists — NO signature verification here
+    (that is install-time, ``pack_keys``/``pack_verify``). ``installed`` is
+    true iff every capability the pack declares is already present in the
+    live manifest (``ctx["capabilities"]``). ``pack_hash`` is the trusted
+    content identity (``pack_format.pack_hash``).
+
+    A malformed pack does NOT crash the list: its entry carries an ``error``
+    key instead. Packs are sorted by ``pack_id`` for determinism. Read-only,
+    no mutation, no requests DB.
+    """
+    packs_dir = Path(
+        payload.get("packs_dir")
+        or os.environ.get("DONNA_PACKS_DIR")
+        or "/Users/donna-broker/broker/packs/available"
+    )
+    capabilities: dict[str, Any] = ctx["capabilities"]
+
+    packs: list[dict[str, Any]] = []
+    if packs_dir.is_dir():
+        for child in sorted(packs_dir.iterdir()):
+            if not child.is_dir():
+                continue
+            try:
+                pack = pack_format.load_pack(str(child))
+            except pack_format.PackFormatError as exc:
+                packs.append({
+                    "pack_id": child.name,
+                    "error": str(exc),
+                    "installed": False,
+                })
+                continue
+            installed = all(
+                name in capabilities for name in pack.capability_names
+            )
+            packs.append({
+                "pack_id": pack.pack_id,
+                "description": pack.description,
+                "capabilities": list(pack.capability_names),
+                "pack_hash": pack_format.pack_hash(pack),
+                "signed": pack.signature is not None,
+                "installed": installed,
+            })
+
+    packs.sort(key=lambda p: str(p["pack_id"]))
+    return {"status": "ok", "packs": packs}
+
+
 MODE_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]]] = {
     "policy-check": _handle_policy_check,
     "request": _handle_request,
@@ -1841,6 +1899,7 @@ MODE_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, An
     "verify-audit": _handle_verify_audit,
     "verify-manifests": _handle_verify_manifests,
     "verify-vault": _handle_verify_vault,
+    "list-packs": _handle_list_packs,
     "grant-create": _handle_grant_create,
     "grant-list": _handle_grant_list,
     "grant-revoke": _handle_grant_revoke,
@@ -1857,7 +1916,7 @@ NOT_YET_IMPLEMENTED = frozenset({"reconcile", "rotate-hmac"})
 # session; running the sweep in those paths would produce duplicate
 # audit noise and unnecessary filesystem I/O on the hot path.
 MODES_WITH_STARTUP_SWEEP = frozenset({
-    "execute", "request", "verify-manifests", "verify-vault",
+    "execute", "request", "verify-manifests", "verify-vault", "list-packs",
 })
 
 
@@ -1894,7 +1953,7 @@ def _build_ctx(config: dict[str, str], need_manifests: bool) -> dict[str, Any]:
 
 MODES_NEEDING_MANIFESTS = frozenset({
     "request", "execute", "policy-check", "audit-result",
-    "verify-manifests", "verify-vault",
+    "verify-manifests", "verify-vault", "list-packs",
     # grant-create validates the target capability against the manifest
     # and needs the broker key to bind the constraints MAC. grant-list
     # and grant-revoke are deliberately manifest-free (revoke must always
