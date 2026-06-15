@@ -2,16 +2,16 @@
 
 The orchestrator ties together pack-verify (Plan A), approval-verify (read from
 the broker requests DB), the filesystem merge (promoter_fs), and the append-only
-ledger. Privileged effects (restart, the DB) are injected so the orchestration
-is unit-tested without a real daemon, launchctl, or live broker DB.
+ledger. Privileged effects (publish, the DB) are injected so the orchestration
+is unit-tested without a real daemon or live broker DB.
 
 Security contract proven here (fail-closed, ledger EVERY outcome):
-  - happy path -> "installed", ledger row, restart called once, mark_consumed;
-  - unsigned/bad pack -> PromoterError + ledger "refused" + restart NOT called
+  - happy path -> "installed", ledger row, publish called once, mark_consumed;
+  - unsigned/bad pack -> PromoterError + ledger "refused" + publish NOT called
     + live manifests byte-for-byte unchanged;
   - no approval record -> refused;
   - approval bound to a DIFFERENT pack_hash -> refused;
-  - restart raises AFTER a successful merge -> "installed_restart_failed"
+  - publish raises AFTER a successful merge -> "installed_publish_failed"
     ledgered + PromoterError (the merge stands).
 
 Plus a requests_db.get_request round-trip (insert a request, read it back;
@@ -166,8 +166,8 @@ class FakeApprovalSource:
         self.consumed.append(request_id)
 
 
-class FakeRestart:
-    """A fake restart callable that counts calls and can be made to raise."""
+class FakePublish:
+    """A fake publish callable that counts calls and can be made to raise."""
 
     def __init__(self, *, raises: bool = False) -> None:
         self.calls = 0
@@ -176,7 +176,7 @@ class FakeRestart:
     def __call__(self) -> None:
         self.calls += 1
         if self._raises:
-            raise RuntimeError("launchctl kickstart failed")
+            raise RuntimeError("publish to broker config failed")
 
 
 def _approval(
@@ -216,7 +216,7 @@ def test_install_happy_path(tmp_path: Path) -> None:
     approvals = FakeApprovalSource(
         _approval(pack_id="site", pack_hash=_pack_hash_of(pack_dir))
     )
-    restart = FakeRestart()
+    publish = FakePublish()
     ledger = _ledger(tmp_path)
 
     result = promoter.install(
@@ -224,14 +224,14 @@ def test_install_happy_path(tmp_path: Path) -> None:
         trusted_keys_dir=str(keys),
         live_manifests_dir=str(live),
         approvals=approvals,
-        restart=restart,
+        publish=publish,
         ledger=ledger,
         now=lambda: 1500.0,
     )
 
     assert result["outcome"] == "installed"
     assert result["pack_id"] == "site"
-    assert restart.calls == 1
+    assert publish.calls == 1
     assert approvals.consumed == ["req-1"]
 
     rows = promoter_ledger.read_all(str(tmp_path / "ledger.jsonl"))
@@ -258,7 +258,7 @@ def test_install_unsigned_pack_refused(tmp_path: Path) -> None:
     approvals = FakeApprovalSource(
         _approval(pack_id="site", pack_hash="deadbeef")
     )
-    restart = FakeRestart()
+    publish = FakePublish()
     ledger = _ledger(tmp_path)
 
     with pytest.raises(promoter.PromoterError):
@@ -267,12 +267,12 @@ def test_install_unsigned_pack_refused(tmp_path: Path) -> None:
             trusted_keys_dir=str(keys),
             live_manifests_dir=str(live),
             approvals=approvals,
-            restart=restart,
+            publish=publish,
             ledger=ledger,
             now=lambda: 1500.0,
         )
 
-    assert restart.calls == 0
+    assert publish.calls == 0
     assert approvals.consumed == []
     rows = promoter_ledger.read_all(str(tmp_path / "ledger.jsonl"))
     assert len(rows) == 1
@@ -291,7 +291,7 @@ def test_install_no_approval_refused(tmp_path: Path) -> None:
     pack_dir = _write_pack(tmp_path, priv=priv)
     keys = _keys_dir(tmp_path, priv)
     approvals = FakeApprovalSource(None)  # no matching install approval
-    restart = FakeRestart()
+    publish = FakePublish()
     ledger = _ledger(tmp_path)
 
     with pytest.raises(promoter.PromoterError):
@@ -300,12 +300,12 @@ def test_install_no_approval_refused(tmp_path: Path) -> None:
             trusted_keys_dir=str(keys),
             live_manifests_dir=str(live),
             approvals=approvals,
-            restart=restart,
+            publish=publish,
             ledger=ledger,
             now=lambda: 1500.0,
         )
 
-    assert restart.calls == 0
+    assert publish.calls == 0
     rows = promoter_ledger.read_all(str(tmp_path / "ledger.jsonl"))
     assert rows[0]["outcome"] == "refused"
     assert (live / "capabilities.yaml").read_text() == before
@@ -324,7 +324,7 @@ def test_install_wrong_pack_hash_refused(tmp_path: Path) -> None:
     approvals = FakeApprovalSource(
         _approval(pack_id="site", pack_hash="0" * 64)
     )
-    restart = FakeRestart()
+    publish = FakePublish()
     ledger = _ledger(tmp_path)
 
     with pytest.raises(promoter.PromoterError):
@@ -333,21 +333,21 @@ def test_install_wrong_pack_hash_refused(tmp_path: Path) -> None:
             trusted_keys_dir=str(keys),
             live_manifests_dir=str(live),
             approvals=approvals,
-            restart=restart,
+            publish=publish,
             ledger=ledger,
             now=lambda: 1500.0,
         )
 
-    assert restart.calls == 0
+    assert publish.calls == 0
     rows = promoter_ledger.read_all(str(tmp_path / "ledger.jsonl"))
     assert rows[0]["outcome"] == "refused"
     assert (live / "capabilities.yaml").read_text() == before
 
 
-# ---- restart raises AFTER merge -> installed_restart_failed --------------
+# ---- publish raises AFTER merge -> installed_publish_failed --------------
 
 
-def test_install_restart_failure_is_installed_restart_failed(tmp_path: Path) -> None:
+def test_install_publish_failure_is_installed_publish_failed(tmp_path: Path) -> None:
     priv = Ed25519PrivateKey.generate()
     live = _live(tmp_path)
     pack_dir = _write_pack(tmp_path, priv=priv)
@@ -355,7 +355,7 @@ def test_install_restart_failure_is_installed_restart_failed(tmp_path: Path) -> 
     approvals = FakeApprovalSource(
         _approval(pack_id="site", pack_hash=_pack_hash_of(pack_dir))
     )
-    restart = FakeRestart(raises=True)
+    publish = FakePublish(raises=True)
     ledger = _ledger(tmp_path)
 
     with pytest.raises(promoter.PromoterError):
@@ -364,17 +364,17 @@ def test_install_restart_failure_is_installed_restart_failed(tmp_path: Path) -> 
             trusted_keys_dir=str(keys),
             live_manifests_dir=str(live),
             approvals=approvals,
-            restart=restart,
+            publish=publish,
             ledger=ledger,
             now=lambda: 1500.0,
         )
 
-    assert restart.calls == 1
+    assert publish.calls == 1
     # The merge stands — the consume still happens so the approval can't be reused.
     assert approvals.consumed == ["req-1"]
     rows = promoter_ledger.read_all(str(tmp_path / "ledger.jsonl"))
     assert len(rows) == 1
-    assert rows[0]["outcome"] == "installed_restart_failed"
+    assert rows[0]["outcome"] == "installed_publish_failed"
     # The merge is real — live now contains the new capability.
     merged = yaml.safe_load((live / "capabilities.yaml").read_text())
     names = {c["name"] for c in merged["capabilities"]}

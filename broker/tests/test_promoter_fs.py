@@ -7,6 +7,12 @@ The two rollback contracts are non-negotiable and each has a test:
   (2) a post-merge re-verify failure -> the live dir is RESTORED
       byte-for-byte from backup.
 Plus a property: NO temp dirs (backup/staged/old) leak on success OR failure.
+
+publish_to_config copies ONLY the manifest artifacts (capabilities.yaml,
+mcp-tools.yaml, schemas/, profiles/) from the manifests-only live_dir into the
+broker config dir — the dir the broker actually reads, which ALSO holds the
+requests DB and the age vault. The security guarantee proven here: a publish
+NEVER touches requests.db / creds/ (or anything else) in config_dir.
 """
 from __future__ import annotations
 
@@ -186,3 +192,143 @@ def test_defence_in_depth_restores_from_backup(
     assert (live / "capabilities.yaml").read_text() == before
     assert (live / "schemas" / "gmail.json").exists()
     assert _leftover_temp_dirs(tmp_path) == []
+
+
+# ---- publish_to_config: publish merged manifest into the broker config dir,
+#      NEVER touching the requests DB or age vault that also live there. ------
+
+
+def _config_dir_with_secrets(tmp_path: Path) -> Path:
+    """A broker config dir holding the live secrets the publisher must NEVER
+    touch: a sentinel requests.db, an hmac.key, an age vault under creds/, and
+    an approval-queue/ entry."""
+    cfg = tmp_path / "config"
+    (cfg / "creds").mkdir(parents=True)
+    (cfg / "approval-queue").mkdir()
+    (cfg / "requests.db").write_bytes(b"SENTINEL-DB-BYTES-do-not-touch")
+    (cfg / "hmac.key").write_bytes(b"SENTINEL-HMAC-KEY")
+    (cfg / "creds" / "identity.age").write_bytes(b"SENTINEL-AGE-IDENTITY")
+    (cfg / "approval-queue" / "q1.json").write_text("{}", encoding="utf-8")
+    return cfg
+
+
+def _stat_snapshot(p: Path) -> tuple[bytes, int, int]:
+    """(bytes, inode, mtime_ns) — a strong fingerprint for 'untouched'."""
+    st = p.stat()
+    return (p.read_bytes(), st.st_ino, st.st_mtime_ns)
+
+
+def test_publish_copies_capabilities_and_schemas(tmp_path: Path) -> None:
+    live = _live(tmp_path)
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    promoter_fs.publish_to_config(str(live), str(cfg))
+    assert (cfg / "capabilities.yaml").read_text() == (
+        live / "capabilities.yaml"
+    ).read_text()
+    assert (cfg / "schemas" / "gmail.json").read_text() == (
+        live / "schemas" / "gmail.json"
+    ).read_text()
+
+
+def test_publish_never_touches_db_or_creds(tmp_path: Path) -> None:
+    """THE security guarantee: publishing into a config dir that also holds the
+    requests DB and the age vault leaves those sentinel files byte-for-byte,
+    inode-for-inode, and mtime-for-mtime UNTOUCHED."""
+    live = _live(tmp_path)
+    cfg = _config_dir_with_secrets(tmp_path)
+
+    db = cfg / "requests.db"
+    hmac_key = cfg / "hmac.key"
+    age = cfg / "creds" / "identity.age"
+    queue = cfg / "approval-queue" / "q1.json"
+    before = {p: _stat_snapshot(p) for p in (db, hmac_key, age, queue)}
+
+    promoter_fs.publish_to_config(str(live), str(cfg))
+
+    # The manifest landed...
+    assert (cfg / "capabilities.yaml").is_file()
+    assert (cfg / "schemas" / "gmail.json").is_file()
+    # ...and EVERY secret is identical: same bytes, same inode, same mtime.
+    for p, snap in before.items():
+        assert _stat_snapshot(p) == snap, f"publish modified {p.name}"
+    # The creds/ and approval-queue/ dirs were never renamed/recreated.
+    assert (cfg / "creds").is_dir()
+    assert (cfg / "approval-queue").is_dir()
+    # No stray publish temp file leaked into the secrets-bearing config dir.
+    assert [p.name for p in cfg.iterdir() if p.name.startswith(".promoter-pub-")] == []
+    # config_dir gained ONLY the manifest artifacts — nothing else appeared.
+    assert {p.name for p in cfg.iterdir()} == {
+        "requests.db", "hmac.key", "creds", "approval-queue",
+        "capabilities.yaml", "schemas",
+    }
+
+
+def test_publish_creates_schemas_dir_if_absent(tmp_path: Path) -> None:
+    live = _live(tmp_path)
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    assert not (cfg / "schemas").exists()
+    promoter_fs.publish_to_config(str(live), str(cfg))
+    assert (cfg / "schemas" / "gmail.json").is_file()
+
+
+def test_publish_copies_mcp_tools_only_if_present(tmp_path: Path) -> None:
+    live = _live(tmp_path)
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    # No mcp-tools.yaml in live -> none in config.
+    promoter_fs.publish_to_config(str(live), str(cfg))
+    assert not (cfg / "mcp-tools.yaml").exists()
+
+    # Now add one and republish -> it lands.
+    (live / "mcp-tools.yaml").write_text("tools: []\n", encoding="utf-8")
+    promoter_fs.publish_to_config(str(live), str(cfg))
+    assert (cfg / "mcp-tools.yaml").read_text() == "tools: []\n"
+
+
+def test_publish_copies_profiles_if_present(tmp_path: Path) -> None:
+    live = _live(tmp_path)
+    (live / "profiles" / "p1.json").write_text('{"a": 1}', encoding="utf-8")
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    promoter_fs.publish_to_config(str(live), str(cfg))
+    assert (cfg / "profiles" / "p1.json").read_text() == '{"a": 1}'
+
+
+def test_publish_invalid_manifest_raises(tmp_path: Path) -> None:
+    """If the merged manifest does not parse once published, publish raises
+    InstallError (the merge into live already stands; publish failed)."""
+    live = _live(tmp_path)
+    # Corrupt the live capabilities.yaml so the post-publish validate fails.
+    (live / "capabilities.yaml").write_text("capabilities: not-a-list\n", encoding="utf-8")
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    with pytest.raises(promoter_fs.InstallError):
+        promoter_fs.publish_to_config(str(live), str(cfg))
+
+
+def test_publish_missing_capabilities_raises(tmp_path: Path) -> None:
+    """publish of a live dir with no capabilities.yaml fails closed."""
+    live = tmp_path / "empty-live"
+    live.mkdir()
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    with pytest.raises(promoter_fs.InstallError):
+        promoter_fs.publish_to_config(str(live), str(cfg))
+
+
+def test_publish_oserror_raises_install_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any OSError during the copy fails closed as InstallError."""
+    live = _live(tmp_path)
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+
+    def boom_replace(src: Any, dst: Any) -> None:
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr("os.replace", boom_replace)
+    with pytest.raises(promoter_fs.InstallError):
+        promoter_fs.publish_to_config(str(live), str(cfg))

@@ -1,9 +1,10 @@
 # promoter.py
 """Promoter install orchestrator (design §6.3, §9 invariants).
 
-Privileged side effects (the filesystem merge and the broker restart) live
-behind injected callables so the orchestration is unit-tested without a real
-daemon or launchctl. The promoter independently re-verifies BOTH the pack
+Privileged side effects (the filesystem merge into the manifests-only live dir,
+and the publish of the merged manifest into the dir the broker actually reads)
+live behind injected callables so the orchestration is unit-tested without a
+real daemon. The promoter independently re-verifies BOTH the pack
 signature/safety (Plan A: ``pack_verify``) AND the approval record (read from
 the broker requests DB ITSELF, via ``RequestsDbApprovalSource`` — never the
 client's claim).
@@ -19,21 +20,24 @@ Sequence (fail-closed, every outcome ledgered, no secret ever ledgered):
      request_id: the executor never receives the request_id, and the broker
      has already moved the matching request approved -> executing.)
   4. ``promoter_fs.install`` (staged-verify -> atomic merge -> re-verify ->
-     rollback on failure)
-  5. ``restart()`` (injected; the daemon passes a launchctl-kickstart callable)
+     rollback on failure) into the manifests-only live dir.
+  5. ``publish()`` (injected; the daemon passes a
+     ``promoter_fs.publish_to_config`` closure that copies capabilities.yaml +
+     schemas into the dir the broker reads, per-file, never touching the DB or
+     age vault that also live there).
   6. ``ApprovalSource.mark_consumed`` + ledger ``installed``
 
 Failure handling:
   - ANY verification / fs error BEFORE the merge -> ledger ``refused`` and raise
-    ``PromoterError``; ``restart`` is NEVER called and the live manifests are
+    ``PromoterError``; ``publish`` is NEVER called and the live manifests are
     left valid (``promoter_fs`` guarantees this).
-  - ``restart()`` raises AFTER a successful merge -> ledger
-    ``installed_restart_failed`` and raise ``PromoterError``. The merge STANDS
-    (Graham restarts the broker manually); the approval is still consumed so it
-    cannot drive a second install.
+  - ``publish()`` raises AFTER a successful merge -> ledger
+    ``installed_publish_failed`` and raise ``PromoterError``. The merge into the
+    manifests-only dir STANDS; the approval is still consumed so it cannot drive
+    a second install.
 
-This module deliberately imports NO ``subprocess`` — the restart is injected, so
-the privileged launchctl call lives only in the daemon (Plan B, Task 5).
+This module deliberately imports NO ``subprocess`` — the publish is injected, so
+no privileged OS call lives here.
 """
 from __future__ import annotations
 
@@ -153,15 +157,16 @@ def install(
     trusted_keys_dir: str,
     live_manifests_dir: str,
     approvals: ApprovalSource,
-    restart: Callable[[], None],
+    publish: Callable[[], None],
     ledger: promoter_ledger.Ledger,
     now: Callable[[], float],
 ) -> dict[str, str]:
-    """Verify + install a signed pack, restart the broker, ledger the outcome.
+    """Verify + install a signed pack, publish it to the broker config, ledger
+    the outcome.
 
     Returns ``{"outcome": "installed", "pack_id": ..., "key_id": ...}`` on
     success. Raises ``PromoterError`` on any refusal or failure (always
-    ledgered first). ``restart`` is never called on a pre-merge failure.
+    ledgered first). ``publish`` is never called on a pre-merge failure.
     """
     pack_id = pack_hash = key_id = approval_id = ""
     try:
@@ -201,7 +206,7 @@ def install(
         PromoterError,
     ) as e:
         # Pre-merge (or merge-with-rollback) failure: live manifests are valid,
-        # restart was NOT called. Ledger the refusal and fail closed.
+        # publish was NOT called. Ledger the refusal and fail closed.
         ledger.record(
             pack_id=pack_id,
             pack_hash=pack_hash,
@@ -212,23 +217,25 @@ def install(
         )
         raise PromoterError(str(e)) from e
 
-    # The merge has landed. From here, restart failure does NOT undo the merge.
+    # The merge has landed. From here, a publish failure does NOT undo the merge.
     try:
-        restart()
+        publish()
     except Exception as e:
-        # The merge stands; Graham restarts the broker manually. Consume the
-        # approval first so it can never drive a second install. The resolved
-        # record's id is the request id (read it from the fetched approval).
+        # The merge into the manifests-only dir stands. Consume the approval
+        # first so it can never drive a second install. The resolved record's id
+        # is the request id (read it from the fetched approval).
         approvals.mark_consumed(approval_id)
         ledger.record(
             pack_id=pack_id,
             pack_hash=pack_hash,
             key_id=key_id,
             approval_id=approval_id,
-            outcome="installed_restart_failed",
+            outcome="installed_publish_failed",
             reason=str(e),
         )
-        raise PromoterError(f"installed but broker restart failed: {e}") from e
+        raise PromoterError(
+            f"installed but publish to broker config failed: {e}"
+        ) from e
 
     approvals.mark_consumed(approval_id)
     ledger.record(

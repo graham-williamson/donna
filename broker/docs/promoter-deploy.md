@@ -126,20 +126,38 @@ sudo launchctl bootstrap system /Library/LaunchDaemons/com.donna.promoter.plist
 
 ---
 
+## IMPORTANT: merge into the manifests-only dir, then publish to the config dir
+
+The promoter does its whole-directory atomic swap against the **manifests-only**
+dir `--live-manifests-dir` (`/Users/donna-broker/broker/manifests`), which holds
+`capabilities.yaml`, `schemas/`, `profiles/` and **nothing else**. That whole-dir
+swap is only safe *because* that dir contains no other state.
+
+The dir the broker actually **reads** is `--config-dir`
+(`/Users/donna-broker/.config/donna`) — and that dir **also** holds the requests
+DB, the HMAC key, the `creds/` age vault, and the approval queue. So after a
+successful merge the daemon **publishes** the merged manifest into the config dir
+via `promoter_fs.publish_to_config`: a **per-file atomic copy** of only
+`capabilities.yaml`, `mcp-tools.yaml` (if present), `schemas/*.json`, and
+`profiles/*`. It writes each file to a temp file in the same directory and
+`os.replace`s it onto the target — it **never** does a whole-dir swap of the
+config dir and **never** touches `requests.db`, `hmac.key`, `creds/`, or
+`approval-queue/`. The published `capabilities.yaml` is re-validated (schema
+`$ref`s resolved against the config dir) before publish is considered done.
+
 ## IMPORTANT: no broker restart after a pack install
 
 The donna broker is a **per-call CLI** (`/usr/local/bin/donna-broker`, invoked
 via sudo) that **reloads `capabilities.yaml` on every invocation**. A manifest
-merge therefore needs **no broker restart** — the very next broker call already
-sees the new pack.
+merge + publish therefore needs **no broker restart** — the very next broker
+call already reads the freshly-published config.
 
-Accordingly the daemon's restart hook is wired as a **deliberate no-op**
-(`_no_restart` in `promoter_daemon.main`). The module keeps a
-`_kickstart_broker` helper and a `BROKER_LAUNCHD_LABEL` constant for a *future*
-resident-broker world, but **both are intentionally unused today**. Do **not**
-wire a `launchctl kickstart` of the broker into the plist or anywhere else: there
-is no resident broker service to kick, so it would always fail and mislabel a
-perfectly good install as `installed_restart_failed`.
+Accordingly the post-merge action is the **publish**, not a launchctl kickstart.
+There is no resident broker service to restart; do **not** wire a
+`launchctl kickstart` of the broker into the plist or anywhere else (it would
+always fail and mislabel a perfectly good install). A publish failure surfaces as
+the ledger outcome `installed_publish_failed` (the merge into the manifests-only
+dir still stands).
 
 ## Config: the plist and the executor must agree on the socket
 
@@ -157,7 +175,8 @@ The full set of config keys the plist passes (matching
 | `--socket` | `/var/run/donna/promoter.sock` |
 | `--packs-dir` | `/Users/donna-broker/broker/packs/available` |
 | `--trusted-keys-dir` | `/etc/donna/promoter/trusted_keys` |
-| `--live-manifests-dir` | `/Users/donna-broker/broker/manifests` |
+| `--live-manifests-dir` | `/Users/donna-broker/broker/manifests` (manifests-only; safe to swap) |
+| `--config-dir` | `/Users/donna-broker/.config/donna` (dir the broker reads; publish target) |
 | `--broker-db` | `/Users/donna-broker/.config/donna/requests.db` |
 | `--ledger` | `/var/log/donna/promoter.jsonl` |
 

@@ -19,11 +19,20 @@ Testability split:
   * ``peer_uid_allowed`` — PURE allow-set membership.
   * ``serve`` — the accept loop. The unavoidable OS/socket calls are
     ``# pragma: no cover`` (Graham smoke-tests the live daemon).
-  * ``_kickstart_broker`` / ``main`` — privileged wiring (subprocess + real
-    resources), ``# pragma: no cover``; kept correct, not unit-tested.
+  * ``main`` — privileged wiring (real resources), ``# pragma: no cover``;
+    kept correct, not unit-tested.
+
+After a successful merge the daemon PUBLISHES the merged manifest into the
+broker's config dir (``--config-dir``, e.g. ``/Users/donna-broker/.config/donna``)
+via ``promoter_fs.publish_to_config`` — a per-file atomic copy of ONLY the
+manifest artifacts (capabilities.yaml, mcp-tools.yaml, schemas/, profiles/). It
+NEVER touches the requests DB or the age vault that also live in that dir. There
+is no broker *service* to restart: the broker is a per-call CLI that reloads
+capabilities.yaml on its next invocation, so publish (not a launchctl kickstart)
+is the real post-merge action.
 
 The daemon NEVER reads credentials or the age vault — it only re-verifies and
-merges signed packs via the orchestrator.
+merges signed packs via the orchestrator, then publishes the manifest artifacts.
 """
 from __future__ import annotations
 
@@ -31,22 +40,11 @@ import json
 import os
 import socket
 import struct
-import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 DEFAULT_MAX_FRAME = 65536
-
-# Best-known broker launchd label. There is currently NO long-running broker
-# launchd *service* — the broker is invoked per-call as the CLI
-# ``/usr/local/bin/donna-broker`` (sudo), and the only loaded ``com.donna.broker.*``
-# job is the daily ``verify-audit`` cron. This constant names the service the
-# promoter would kickstart once the broker runs as a resident daemon; it matches
-# the plan's stated best-known value. Override via the ``--broker-label`` /
-# ``DONNA_BROKER_LABEL`` config in main(). NOTE: confirm against the real
-# LaunchDaemon label before deploy.
-BROKER_LAUNCHD_LABEL = "com.user.daru-broker"
 
 
 class _DoInstall(Protocol):
@@ -214,22 +212,6 @@ def serve(
             os.unlink(sock_path)
 
 
-def _kickstart_broker(label: str = BROKER_LAUNCHD_LABEL) -> None:  # pragma: no cover - launchctl subprocess, smoke-tested live
-    """Restart a RESIDENT broker so it reloads the freshly-merged manifests.
-
-    Runs ``launchctl kickstart -k system/<label>``. NOTE: this is NOT wired as
-    the default restart in ``main`` — see the rationale there. It is kept for
-    the future case where the broker runs as a long-lived launchd service. The
-    only place this module touches ``subprocess`` — hence the ``.importlinter``
-    allowance. Raises ``CalledProcessError`` on failure; the orchestrator treats
-    a restart failure as ``installed_restart_failed`` (merge stands)."""
-    subprocess.run(
-        ["launchctl", "kickstart", "-k", f"system/{label}"],
-        check=True,
-        capture_output=True,
-    )
-
-
 def main(argv: list[str]) -> int:  # pragma: no cover - privileged wiring; opens real resources
     """Wire the real ``do_install`` and serve. Config from argv/env.
 
@@ -241,33 +223,22 @@ def main(argv: list[str]) -> int:  # pragma: no cover - privileged wiring; opens
     """
     import argparse
 
-    from broker import promoter, promoter_ledger, requests_db
+    from broker import promoter, promoter_fs, promoter_ledger, requests_db
 
     parser = argparse.ArgumentParser(prog="promoter_daemon")
     parser.add_argument("--socket", default=os.environ.get("DONNA_PROMOTER_SOCKET", "/var/run/donna/promoter.sock"))
     parser.add_argument("--packs-dir", default=os.environ.get("DONNA_PROMOTER_PACKS_DIR", "/Users/donna-broker/broker/packs/available"))
     parser.add_argument("--trusted-keys-dir", default=os.environ.get("DONNA_PROMOTER_TRUSTED_KEYS_DIR", "/etc/donna/promoter/trusted_keys"))
     parser.add_argument("--live-manifests-dir", default=os.environ.get("DONNA_PROMOTER_LIVE_MANIFESTS_DIR", "/Users/donna-broker/broker/manifests"))
+    parser.add_argument("--config-dir", default=os.environ.get("DONNA_PROMOTER_CONFIG_DIR", "/Users/donna-broker/.config/donna"))
     parser.add_argument("--broker-db", default=os.environ.get("DONNA_PROMOTER_BROKER_DB", "/Users/donna-broker/.config/donna/requests.db"))
     parser.add_argument("--ledger", default=os.environ.get("DONNA_PROMOTER_LEDGER", "/var/log/donna/promoter.jsonl"))
-    parser.add_argument("--broker-label", default=os.environ.get("DONNA_BROKER_LABEL", BROKER_LAUNCHD_LABEL))
     args = parser.parse_args(argv)
 
     packs_root = Path(args.packs_dir).resolve()
     conn = requests_db.open_db(args.broker_db)
     approvals = promoter.RequestsDbApprovalSource(conn)
     ledger = promoter_ledger.Ledger(args.ledger, now=__import__("time").time)
-
-    # Restart is a NO-OP. There is NO resident broker launchd service — the
-    # broker is a per-call CLI (`/usr/local/bin/donna-broker`, sudo) that
-    # reloads capabilities.yaml on EVERY invocation. A manifest merge therefore
-    # needs no restart: the very next broker call already sees the new pack.
-    # Defaulting to a launchctl kickstart of a non-resident service would
-    # always fail and mislabel a perfectly good install `installed_restart_
-    # failed`. `_kickstart_broker` is kept (pragma-no-cover) for the future
-    # resident-broker case but is deliberately NOT wired here.
-    def _no_restart() -> None:
-        return None
 
     def do_install(*, pack_id: str) -> dict[str, str]:
         # handle_frame already validated pack_id is a safe bare name; resolve it
@@ -277,12 +248,20 @@ def main(argv: list[str]) -> int:  # pragma: no cover - privileged wiring; opens
             raise promoter.PromoterError(
                 f"resolved pack dir escapes packs dir: {pack_id}"
             )
+        # Post-merge action: PUBLISH the merged manifest from the manifests-only
+        # live dir into the dir the broker reads (--config-dir). This is a
+        # per-file atomic copy of ONLY capabilities.yaml + mcp-tools.yaml +
+        # schemas/ + profiles/ — it never touches the requests DB or the age
+        # vault that also live in the config dir. There is no broker service to
+        # restart: the per-call CLI reloads capabilities.yaml on next invocation.
         return promoter.install(
             pack_dir=str(candidate),
             trusted_keys_dir=args.trusted_keys_dir,
             live_manifests_dir=args.live_manifests_dir,
             approvals=approvals,
-            restart=_no_restart,
+            publish=lambda: promoter_fs.publish_to_config(
+                args.live_manifests_dir, args.config_dir
+            ),
             ledger=ledger,
             now=__import__("time").time,
         )
