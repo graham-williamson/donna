@@ -30,7 +30,7 @@ VALID_MODES=(
   status status-by-code list-pending list-recent
   audit-result rotate-hmac verify-audit verify-manifests verify-vault
   grant-create grant-list grant-revoke
-  store-credential site-check
+  store-credential site-check app-approve
 )
 FOUND=0
 for m in "${VALID_MODES[@]}"; do
