@@ -178,19 +178,29 @@ class _PlaywrightBrowser:
         self._creds = creds
         # Install the network-layer allowlist filter.
         context.route("**/*", self._route_handler)
-        # Follow links that open a NEW TAB/WINDOW. Many flows (e.g. a booking
-        # site on a different subdomain) open in a new tab; without this the
-        # adapter keeps reading the original page and every click looks like a
-        # no-op to the agent, which then loops. The context.route allowlist
-        # already covers all pages in the context, so following is still gated.
-        context.on("page", self._on_new_page)
 
-    def _on_new_page(self, page) -> None:
-        """Switch the adapter's active page to a newly opened tab/window. Kept
-        minimal (no blocking wait — this runs inside a Playwright event callback):
-        the agent's next snapshot re-reads, and a still-loading page just prompts
-        one more 'read'."""
-        self._page = page
+    def _follow_new_tab(self, pages_before: set) -> None:
+        """If the last click opened a NEW tab/window, switch the adapter's active
+        page to it. Called SYNCHRONOUSLY right after a click — not via an async
+        context 'page' event, which would race the snapshot/execute boundary and
+        could switch onto a transient about:blank mid-login. Many flows (a booking
+        site on a different subdomain) open in a new tab; without following it,
+        every click looks like a no-op and the agent loops. The context.route
+        allowlist still covers the new page, so it stays network-gated."""
+        try:
+            new_pages = [p for p in self._context.pages
+                         if p not in pages_before and not p.is_closed()]
+            if not new_pages:
+                return
+            target = new_pages[-1]
+            try:
+                target.wait_for_load_state("domcontentloaded", timeout=8000)
+            except Exception:
+                pass
+            if target.url and not target.url.startswith("about:"):
+                self._page = target
+        except Exception:
+            pass
 
     def _route_handler(self, route) -> None:
         """Abort off-allowlist requests and (under hard_abort) unguarded mutations."""
@@ -334,11 +344,17 @@ class _PlaywrightBrowser:
             el = self._find_element(ref)
             if el is None:
                 fail("unexpected_dom", f"click target {ref!r} not found on page")
+            pages_before = set(self._context.pages)
             try:
                 el.click(timeout=10000)
-                self._page.wait_for_load_state("networkidle", timeout=10000)
             except Exception as exc:
                 fail("unexpected_dom", f"click {ref!r}: {type(exc).__name__}: {exc}")
+            # Follow a new tab/window the click may have opened, then settle.
+            self._follow_new_tab(pages_before)
+            try:
+                self._page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                pass
 
         elif kind == "type":
             ref = str(action.get("ref") or "")
