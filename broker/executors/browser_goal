@@ -420,11 +420,12 @@ def _check_success_indicators(page, indicators: tuple) -> bool:
 # headless claude -p complete function (UNVERIFIED until deploy)
 # ---------------------------------------------------------------------------
 
-# Model id for per-step browser action decisions. Haiku tier — fast and cheap
-# for one-action-at-a-time choices; a deliberate cost/latency pick (the API
-# default would be Opus). Bump to claude-sonnet-4-6 if navigation reasoning
-# needs more headroom — it's a one-line change.
-_MODEL = "claude-haiku-4-5"
+# Model id for per-step browser action decisions. Sonnet tier: login is
+# mechanical (type/type/click) but open-ended navigation — finding a specific
+# class on a timetable — needs real multi-step reasoning, where haiku loops on
+# read. Sonnet 4.6 supports structured outputs (used below). Drop to
+# claude-haiku-4-5 for cheaper, simpler sites; raise to opus for the hardest.
+_MODEL = "claude-sonnet-4-6"
 _API_URL = "https://api.anthropic.com/v1/messages"
 _API_VERSION = "2023-06-01"
 
@@ -712,15 +713,29 @@ def main() -> None:
             creds=creds,
             phase=phase,
         )
+        goal_instruction = (
+            f"{effective_goal}\n\n"
+            "You are now logged in. Work toward the goal PURPOSEFULLY: use "
+            "navigate/click to reach the relevant area (e.g. a bookings, "
+            "timetable, classes, or activities section — look for such links and "
+            "follow them). Do NOT keep issuing 'read' without acting — 'read' only "
+            "re-shows the current page and makes no progress; if the page has no "
+            "new useful information, navigate or click somewhere that does. When "
+            "you have found what the goal asks for, return 'done' with a concise "
+            "result (e.g. the day, time, and location). If accomplishing the goal "
+            "would book, pay, or change something, use 'propose_commit' rather than "
+            "acting directly."
+        )
         agent = browser_agent.Agent(
-            goal=effective_goal,
+            goal=goal_instruction,
             phase=phase,
             complete=_debug_tee(_make_complete(model_key),
                                  run_dir / "agent_debug.jsonl"),
         )
 
-        # Action cap: plan phase is read-only (lower), execute phase allows more.
-        max_actions = 30 if phase == "execute" else 20
+        # Action cap: navigation needs room. Plan (read-only) gets a generous
+        # budget; execute a bit more for the commit steps.
+        max_actions = 40 if phase == "execute" else 30
 
         result = browser_runner.run(
             browser=adapter,
