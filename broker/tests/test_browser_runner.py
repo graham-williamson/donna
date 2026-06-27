@@ -96,6 +96,28 @@ def test_refused_action_is_not_executed_and_is_fed_back(tmp_path):
     assert out["status"] == "gave_up"
 
 
+def test_execute_phase_propose_commit_surfaces_needs_approval(tmp_path):
+    # In the execute phase, propose_commit is NOT intercepted by the runner's
+    # plan-phase shortcut; it goes through the gate, which returns needs_approval.
+    # The runner must surface that proposal as {"status": "planned", ...} so the
+    # caller can obtain the human approval + commit token before re-submitting.
+    browser = FakeBrowser([SNAP, SNAP])
+    agent = ScriptedAgent([
+        {"kind": "propose_commit", "summary": "Book 7pm court £8", "price": 8.0,
+         "ref": "r2", "expected_text": "Confirm booking"},
+    ])
+    g = gate.Gate(profile=_profile(), tokens=bt.TokenStore(now=lambda: 0.0),
+                  creds={}, phase="execute")
+    out = runner.run(browser=browser, agent=agent, the_gate=g, ledger=_ledger(tmp_path),
+                     phase="execute", max_actions=10)
+    assert out["status"] == "planned"
+    assert out["proposal"]["summary"] == "Book 7pm court £8"
+    assert out["proposal"]["target_ref"] == "r2"
+    assert out["proposal"]["expected_text"] == "Confirm booking"
+    # the commit itself never fired: no state-changing action was dispatched
+    assert browser.executed == []
+
+
 def test_cap_exceeded_aborts(tmp_path):
     browser = FakeBrowser([SNAP])
     agent = ScriptedAgent([{"kind": "read"}] * 50)

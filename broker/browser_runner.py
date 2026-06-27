@@ -15,12 +15,12 @@ from broker import browser_sanitise as san
 
 
 class BrowserLike(Protocol):
-    def snapshot(self) -> dict[str, Any]: ...
-    def execute(self, action: dict[str, Any]) -> None: ...
+    def snapshot(self) -> dict[str, Any]: ...  # pragma: no cover - Protocol stub
+    def execute(self, action: dict[str, Any]) -> None: ...  # pragma: no cover - Protocol stub
 
 
 class AgentLike(Protocol):
-    def next(self, sanitised: dict[str, Any]) -> dict[str, Any]: ...
+    def next(self, sanitised: dict[str, Any]) -> dict[str, Any]: ...  # pragma: no cover - Protocol stub
 
 
 def run(*, browser: BrowserLike, agent: AgentLike, the_gate: gate.Gate,
@@ -61,7 +61,12 @@ def run(*, browser: BrowserLike, agent: AgentLike, the_gate: gate.Gate,
                       action=decision.log_action or action,
                       gate_decision=decision.decision, outcome="pending")
         if decision.decision == "refuse":
-            if action.get("kind") == "give_up":
+            # A refused action is fed back implicitly: the agent re-sees the same page
+            # next loop and can correct or give up. give_up is always gate-allowed and
+            # so is handled on the allow path below; this guard is defence-in-depth so
+            # an explicit give_up still terminates even under a future gate policy that
+            # refused it — give_up must always exit, never loop to the cap.
+            if action.get("kind") == "give_up":  # pragma: no cover - defensive: gate always allows give_up
                 return {"status": "gave_up", "reason": str(action.get("reason") or "")}
             continue
         if decision.decision == "needs_approval":
