@@ -248,6 +248,23 @@ class _PlaywrightBrowser:
         except Exception:
             pass
 
+        # Capture the page's visible TEXT as one element so the agent can READ
+        # content (a class timetable, an error/404 message) — the interactable
+        # elements above only let it click, not read. innerText strips scripts.
+        try:
+            body_text = self._page.evaluate(
+                "() => (document.body && document.body.innerText) || ''")
+            if body_text and body_text.strip():
+                raw_nodes.append({
+                    "ref": "_pagetext",
+                    "role": "page_text",
+                    "name": str(body_text).strip()[:8000],
+                    "tag": "text",
+                    "editable": False,
+                })
+        except Exception:
+            pass
+
         return _accessibility_to_snapshot(url, raw_nodes)
 
     @staticmethod
@@ -715,16 +732,21 @@ def main() -> None:
         )
         goal_instruction = (
             f"{effective_goal}\n\n"
-            "You are now logged in. Work toward the goal PURPOSEFULLY: use "
-            "navigate/click to reach the relevant area (e.g. a bookings, "
-            "timetable, classes, or activities section — look for such links and "
-            "follow them). Do NOT keep issuing 'read' without acting — 'read' only "
-            "re-shows the current page and makes no progress; if the page has no "
-            "new useful information, navigate or click somewhere that does. When "
-            "you have found what the goal asks for, return 'done' with a concise "
-            "result (e.g. the day, time, and location). If accomplishing the goal "
-            "would book, pay, or change something, use 'propose_commit' rather than "
-            "acting directly."
+            "You are now logged in. Work toward the goal PURPOSEFULLY.\n"
+            "MOVING AROUND: prefer CLICKING a link or button you can actually see "
+            "in the elements list (click its ref) — e.g. one labelled Book, "
+            "Timetable, Classes, Activities. Do NOT invent URL paths: only use "
+            "'navigate' with a path you have actually seen on the page, never a "
+            "guessed one.\n"
+            "READING: the element with ref '_pagetext' holds the page's visible "
+            "text — read it to find what you need (class names, times) and to "
+            "notice dead ends. If the page says 'not found' / 'error' or has no "
+            "useful content, go back and click a different real link instead of "
+            "repeating 'read'.\n"
+            "FINISHING: when you have found what the goal asks for, return 'done' "
+            "with a concise result (e.g. the day, time, and location). If the goal "
+            "would book, pay, or change something, use 'propose_commit', never act "
+            "directly."
         )
         agent = browser_agent.Agent(
             goal=goal_instruction,
