@@ -404,6 +404,29 @@ _MODEL = "claude-haiku-4-5"
 _API_URL = "https://api.anthropic.com/v1/messages"
 _API_VERSION = "2023-06-01"
 
+# Structured-output schema: one action object from the agent vocabulary. Forces
+# the model to emit exactly one valid JSON action (no prose / markdown / native
+# tool-call XML), keyed by "kind". Per-kind fields are all optional here; the
+# browser_gate is the authority on which fields each kind needs.
+_ACTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["kind"],
+    "properties": {
+        "kind": {"type": "string", "enum": [
+            "read", "navigate", "click", "type", "propose_commit", "done", "give_up"]},
+        "ref": {"type": "string"},
+        "path": {"type": "string"},
+        "expected_text": {"type": "string"},
+        "expected_label": {"type": "string"},
+        "text": {"type": "string"},
+        "result": {"type": "string"},
+        "reason": {"type": "string"},
+        "summary": {"type": "string"},
+        "price": {"type": "number"},
+    },
+}
+
 
 def _http_post(url: str, headers: dict[str, str], body: bytes) -> bytes:
     """POST `body` to `url` and return the raw response bytes. Raises on any
@@ -435,6 +458,11 @@ def _make_complete(api_key: str, *, transport=_http_post):
             "max_tokens": 1024,
             "system": system,
             "messages": [{"role": "user", "content": user}],
+            # Force exactly one valid action object — no prose, no markdown, no
+            # native tool-call XML. Haiku 4.5 supports structured outputs; this
+            # makes the agent's output deterministic across any site/model.
+            "output_config": {"format": {"type": "json_schema",
+                                         "schema": _ACTION_SCHEMA}},
         }).encode("utf-8")
         headers = {
             "x-api-key": api_key,
