@@ -178,6 +178,19 @@ class _PlaywrightBrowser:
         self._creds = creds
         # Install the network-layer allowlist filter.
         context.route("**/*", self._route_handler)
+        # Follow links that open a NEW TAB/WINDOW. Many flows (e.g. a booking
+        # site on a different subdomain) open in a new tab; without this the
+        # adapter keeps reading the original page and every click looks like a
+        # no-op to the agent, which then loops. The context.route allowlist
+        # already covers all pages in the context, so following is still gated.
+        context.on("page", self._on_new_page)
+
+    def _on_new_page(self, page) -> None:
+        """Switch the adapter's active page to a newly opened tab/window. Kept
+        minimal (no blocking wait — this runs inside a Playwright event callback):
+        the agent's next snapshot re-reads, and a still-loading page just prompts
+        one more 'read'."""
+        self._page = page
 
     def _route_handler(self, route) -> None:
         """Abort off-allowlist requests and (under hard_abort) unguarded mutations."""
