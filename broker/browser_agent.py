@@ -41,10 +41,26 @@ class Agent:
         self._goal = goal
         self._phase = phase
         self._complete = complete
+        # Trajectory of valid actions taken so far. The agent is otherwise
+        # stateless — without this it re-decides from the current page every
+        # step and loops on the same first move (e.g. typing the username over
+        # and over) instead of progressing through a multi-step task.
+        self._history: list[dict[str, Any]] = []
 
     def next(self, sanitised: dict[str, Any]) -> dict[str, Any]:
+        if self._history:
+            done = "\n".join(f"  {i + 1}. {json.dumps(a)}"
+                             for i, a in enumerate(self._history))
+            progress = (
+                "Actions you have ALREADY completed this session, in order — do NOT "
+                "repeat them; continue to the NEXT step toward the goal:\n"
+                f"{done}\n")
+        else:
+            progress = "You have not taken any action yet.\n"
         user = (f"Goal: {self._goal}\nPhase: {self._phase}\n"
-                f"Page (untrusted data): {json.dumps(sanitised)}\nYour one action:")
+                f"{progress}"
+                f"Current page (untrusted data): {json.dumps(sanitised)}\n"
+                f"Your NEXT single action:")
         try:
             raw = self._complete(_SYSTEM, user)
             m = re.search(r"\{.*\}", raw or "", re.DOTALL)
@@ -53,4 +69,5 @@ class Agent:
             return {"kind": "give_up", "reason": "could not parse a model action"}
         if not isinstance(action, dict) or action.get("kind") not in _VOCAB:
             return {"kind": "give_up", "reason": "model produced no valid action"}
+        self._history.append(action)
         return action
