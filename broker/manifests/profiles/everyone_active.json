@@ -1,7 +1,7 @@
 {
   "site": "everyone_active",
   "login_url": "https://account.everyoneactive.com/login",
-  "allowlist": ["everyoneactive.com", "account.everyoneactive.com"],
+  "allowlist": ["everyoneactive.com", "account.everyoneactive.com", "legendonlineservices.co.uk"],
   "success_indicators": [
     {"type": "url_pattern", "value": "*everyoneactive.com/memberships*"},
     {"type": "url_pattern", "value": "*everyoneactive.com/memberHomePage*"},
