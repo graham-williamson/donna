@@ -75,6 +75,59 @@ def test_executor_self_bootstraps_broker_under_spawn_env(tmp_path):
     assert "error_code" in parsed
 
 
+def test_make_complete_returns_model_text():
+    # Injected transport returns a canned Anthropic Messages API response;
+    # _complete must extract the assistant text (the agent's action JSON).
+    import json
+
+    def transport(url, headers, body):
+        assert headers["x-api-key"] == "sk-test"
+        assert headers["anthropic-version"] == "2023-06-01"
+        return json.dumps({"content": [{"type": "text",
+                                        "text": '{"kind": "click", "ref": "r1"}'}]}).encode()
+
+    complete = mod._make_complete("sk-test", transport=transport)
+    assert complete("sys", "user") == '{"kind": "click", "ref": "r1"}'
+
+
+def test_make_complete_no_key_is_give_up():
+    import json
+    out = mod._make_complete("", transport=lambda u, h, b: b"")("s", "u")
+    assert json.loads(out)["kind"] == "give_up"
+
+
+def test_make_complete_transport_error_is_give_up():
+    import json
+
+    def boom(url, headers, body):
+        raise RuntimeError("HTTP 500")
+
+    out = mod._make_complete("sk-test", transport=boom)("s", "u")
+    assert json.loads(out)["kind"] == "give_up"
+
+
+def test_make_complete_empty_response_is_give_up():
+    import json
+    out = mod._make_complete("sk-test",
+                             transport=lambda u, h, b: b'{"content": []}')("s", "u")
+    assert json.loads(out)["kind"] == "give_up"
+
+
+def test_read_model_key_absent_fd_returns_empty(monkeypatch):
+    # No DONNA_MODEL_KEY_FD → empty string (executor degrades to give_up, not crash).
+    monkeypatch.delenv("DONNA_MODEL_KEY_FD", raising=False)
+    assert mod.read_model_key() == ""
+
+
+def test_read_model_key_reads_fd(monkeypatch):
+    import os
+    r, w = os.pipe()
+    os.write(w, b"sk-ant-from-fd\n")
+    os.close(w)
+    monkeypatch.setenv("DONNA_MODEL_KEY_FD", str(r))
+    assert mod.read_model_key() == "sk-ant-from-fd"
+
+
 def test_fail_is_importable_without_playwright():
     # fail() must be importable; it should write JSON and call sys.exit(1)
     import io

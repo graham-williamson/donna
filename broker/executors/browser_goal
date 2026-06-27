@@ -37,7 +37,6 @@ import json
 import os
 import re
 import secrets
-import subprocess
 import sys
 import time
 import uuid
@@ -397,41 +396,91 @@ def _check_success_indicators(page, indicators: tuple) -> bool:
 # headless claude -p complete function (UNVERIFIED until deploy)
 # ---------------------------------------------------------------------------
 
-def _make_complete(run_id: str):
-    """Return a `complete(system, user) -> str` function backed by `claude -p`.
+# Model id for per-step browser action decisions. Haiku tier — fast and cheap
+# for one-action-at-a-time choices; a deliberate cost/latency pick (the API
+# default would be Opus). Bump to claude-sonnet-4-6 if navigation reasoning
+# needs more headroom — it's a one-line change.
+_MODEL = "claude-haiku-4-5"
+_API_URL = "https://api.anthropic.com/v1/messages"
+_API_VERSION = "2023-06-01"
 
-    Uses haiku tier (fast/cheap for browser step decisions). Falls back to a
-    safe give_up action string on ANY failure — the agent handles malformed
-    output gracefully.
 
-    UNVERIFIED: requires `claude` binary on PATH in the donna-broker env and
-    a valid Anthropic API key. Not exercised in CI.
+def _http_post(url: str, headers: dict[str, str], body: bytes) -> bytes:
+    """POST `body` to `url` and return the raw response bytes. Raises on any
+    transport/HTTP error (urllib raises HTTPError for non-2xx). Kept tiny and
+    injectable so _make_complete is testable without a network call."""
+    import urllib.request  # noqa: PLC0415 — stdlib only; no new venv dependency
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 — fixed Anthropic URL
+        return resp.read()
+
+
+def _make_complete(api_key: str, *, transport=_http_post):
+    """Return a `complete(system, user) -> str` backed by the Anthropic Messages
+    API (design §5.7). The API key is delivered to this executor by the broker
+    over DONNA_MODEL_KEY_FD — never via env, never via the CLI, never seen by
+    Donna. `transport(url, headers, body) -> bytes` is injected so this is
+    unit-testable without a network call.
+
+    On ANY failure (no key, transport error, non-200, malformed body, empty
+    text) it returns a `give_up` action string — the agent treats that as a
+    safe terminal action and never guesses. Fail-closed everywhere (§3 inv. 6).
     """
     def _complete(system: str, user: str) -> str:
-        prompt = f"{system}\n\n{user}"
+        if not api_key:
+            return json.dumps({"kind": "give_up", "reason": "no model key available"})
+        body = json.dumps({
+            "model": _MODEL,
+            "max_tokens": 1024,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        }).encode("utf-8")
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": _API_VERSION,
+            "content-type": "application/json",
+        }
         try:
-            result = subprocess.run(
-                ["claude", "-p", prompt,
-                 "--output-format", "json",
-                 "--model", "claude-haiku-4-5",
-                 "--allowedTools", ""],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                cwd="/tmp",
-            )
-            if result.returncode != 0:
-                return json.dumps({"kind": "give_up",
-                                   "reason": f"claude exit {result.returncode}"})
-            outer = json.loads(result.stdout)
-            if not isinstance(outer, dict) or outer.get("is_error"):
-                return json.dumps({"kind": "give_up", "reason": "claude error response"})
-            return str(outer.get("result") or "").strip()
+            raw = transport(_API_URL, headers, body)
+            data = json.loads(raw)
+            blocks = data.get("content") if isinstance(data, dict) else None
+            if not isinstance(blocks, list):
+                return json.dumps({"kind": "give_up", "reason": "model: no content blocks"})
+            text = "".join(
+                str(b.get("text", "")) for b in blocks
+                if isinstance(b, dict) and b.get("type") == "text"
+            ).strip()
+            if not text:
+                return json.dumps({"kind": "give_up", "reason": "model: empty response"})
+            return text
         except Exception as exc:
             return json.dumps({"kind": "give_up",
-                                "reason": f"claude invocation failed: {type(exc).__name__}: {exc}"})
+                                "reason": f"model call failed: {type(exc).__name__}: {exc}"})
 
     return _complete
+
+
+def read_model_key() -> str:
+    """Read the Anthropic API key the broker delivers over DONNA_MODEL_KEY_FD.
+
+    Mirrors read_creds (a second inherited fd, same vault→pipe path). Returns
+    "" if the fd is absent so the executor degrades to a fail-closed give_up
+    rather than crashing — the broker only sets the fd for capabilities that
+    declare creds.model_key. The key lives only here, in this subprocess.
+    """
+    fd_str = os.environ.get("DONNA_MODEL_KEY_FD")
+    if fd_str is None:
+        return ""
+    fd = int(fd_str)
+    data = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        data += chunk
+    os.close(fd)
+    return data.decode("utf-8").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -442,6 +491,7 @@ def _make_complete(run_id: str):
 def main() -> None:
     params = read_params()
     creds = read_creds()
+    model_key = read_model_key()
 
     site = str(params.get("site") or "").strip()
     goal = str(params.get("goal") or "").strip()
@@ -540,7 +590,7 @@ def main() -> None:
         login_agent = browser_agent.Agent(
             goal=login_goal,
             phase="execute",
-            complete=_make_complete(run_id),
+            complete=_make_complete(model_key),
         )
         login_tokens = browser_token.TokenStore(now=now)
         login_gate = browser_gate.Gate(
@@ -589,7 +639,7 @@ def main() -> None:
         agent = browser_agent.Agent(
             goal=effective_goal,
             phase=phase,
-            complete=_make_complete(run_id),
+            complete=_make_complete(model_key),
         )
 
         # Action cap: plan phase is read-only (lower), execute phase allows more.
