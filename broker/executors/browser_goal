@@ -461,6 +461,27 @@ def _make_complete(api_key: str, *, transport=_http_post):
     return _complete
 
 
+def _debug_tee(fn, debug_path):
+    """Wrap a complete(system, user) callable so each call appends the page the
+    model saw (the user prompt — sanitised, untrusted, no secrets) and what it
+    returned to debug_path. Run dir is donna-broker-only ephemeral tmp; the
+    agent only ever sees {{cred:*}} placeholders, so no credential is logged.
+    Best-effort: a debug-write failure never affects the agent."""
+    if debug_path is None:
+        return fn
+
+    def wrapped(system: str, user: str) -> str:
+        out = fn(system, user)
+        try:
+            with open(debug_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"user": user[:6000], "out": out[:6000]}) + "\n")
+        except Exception:
+            pass
+        return out
+
+    return wrapped
+
+
 def read_model_key() -> str:
     """Read the Anthropic API key the broker delivers over DONNA_MODEL_KEY_FD.
 
@@ -590,7 +611,8 @@ def main() -> None:
         login_agent = browser_agent.Agent(
             goal=login_goal,
             phase="execute",
-            complete=_make_complete(model_key),
+            complete=_debug_tee(_make_complete(model_key),
+                                 run_dir / "agent_debug.jsonl"),
         )
         login_tokens = browser_token.TokenStore(now=now)
         login_gate = browser_gate.Gate(
@@ -639,7 +661,8 @@ def main() -> None:
         agent = browser_agent.Agent(
             goal=effective_goal,
             phase=phase,
-            complete=_make_complete(model_key),
+            complete=_debug_tee(_make_complete(model_key),
+                                 run_dir / "agent_debug.jsonl"),
         )
 
         # Action cap: plan phase is read-only (lower), execute phase allows more.
