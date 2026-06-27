@@ -200,6 +200,7 @@ capabilities:
     creds:
       delivery: fd3
       entry: everyone_active
+      model_key: true        # second fd: broker-level Anthropic API key for the agent
     param_schema:
       $ref: ./schemas/browser_goal_plan.json
     params_exact_match_required: true
@@ -224,6 +225,7 @@ capabilities:
     creds:
       delivery: fd3
       entry: everyone_active
+      model_key: true        # second fd: broker-level Anthropic API key for the agent
     param_schema:
       $ref: ./schemas/browser_goal_commit.json
     params_exact_match_required: true

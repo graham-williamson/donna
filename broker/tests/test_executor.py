@@ -666,12 +666,14 @@ def test_spawn_error_audit_carries_no_exception_message(conn, tmp_path, monkeypa
 # ---- §3 fd-3 creds injection --------------------------------------------
 
 
-def _fake_creds_block(entry: str = "entry", delivery: str = "fd3"):
+def _fake_creds_block(entry: str = "entry", delivery: str = "fd3",
+                      model_key: bool = False):
     class _FakeCredsBlock:
-        def __init__(self, d: str, e: str) -> None:
+        def __init__(self, d: str, e: str, mk: bool) -> None:
             self.delivery = d
             self.entry = e
-    return _FakeCredsBlock(delivery, entry)
+            self.model_key = mk
+    return _FakeCredsBlock(delivery, entry, model_key)
 
 
 def _creds_config(tmp_path):
@@ -710,6 +712,97 @@ def test_creds_happy_path_child_reads_bytes_from_fd3(conn, tmp_path, monkeypatch
     )
     assert outcome.state == "succeeded", outcome.error_message
     assert outcome.result["sha256"] == hashlib.sha256(expected).hexdigest()
+
+
+def test_model_key_delivered_on_second_fd(conn, tmp_path, monkeypatch):
+    # creds.model_key=True → executor receives a SECOND inherited fd
+    # (DONNA_MODEL_KEY_FD) carrying the broker-level anthropic_api entry,
+    # alongside the site credential on DONNA_CREDS_FD.
+    r = _insert_approved(conn, "r-mk-ok", "capA")
+    body = (
+        "import os, sys, json\n"
+        "def _read(fd):\n"
+        "    data=b''\n"
+        "    while True:\n"
+        "        c=os.read(fd,65536)\n"
+        "        if not c: break\n"
+        "        data+=c\n"
+        "    return data.decode()\n"
+        "cred=_read(int(os.environ['DONNA_CREDS_FD']))\n"
+        "mk=_read(int(os.environ['DONNA_MODEL_KEY_FD']))\n"
+        "sys.stdout.write(json.dumps({'cred':cred,'mk':mk}))\n"
+    )
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target=_write_exec_script(tmp_path, body),
+        revalidate={"not_applicable": "no_external_state"},
+        creds=_fake_creds_block(entry="site_entry", model_key=True),
+    )
+
+    def fake_unlock(entry, *a, **kw):
+        # site credential vs the broker-level model key, keyed by entry name
+        return b"SITE-CRED" if entry == "site_entry" else b"sk-ant-KEY"
+
+    monkeypatch.setattr("broker.creds.unlock_creds", fake_unlock)
+    outcome = executor.execute(
+        cap, r, {}, conn, creds_config=_creds_config(tmp_path),
+    )
+    assert outcome.state == "succeeded", outcome.error_message
+    assert outcome.result["cred"] == "SITE-CRED"
+    assert outcome.result["mk"] == "sk-ant-KEY"
+
+
+def test_no_model_key_means_no_second_fd(conn, tmp_path, monkeypatch):
+    # Default (model_key=False): DONNA_MODEL_KEY_FD must NOT be in the child env.
+    r = _insert_approved(conn, "r-mk-absent", "capA")
+    body = (
+        "import os, sys, json\n"
+        "sys.stdout.write(json.dumps({'has_mk': 'DONNA_MODEL_KEY_FD' in os.environ}))\n"
+    )
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target=_write_exec_script(tmp_path, body),
+        revalidate={"not_applicable": "no_external_state"},
+        creds=_fake_creds_block(entry="site_entry"),  # model_key defaults False
+    )
+    monkeypatch.setattr("broker.creds.unlock_creds", lambda *a, **kw: b"SITE")
+    outcome = executor.execute(
+        cap, r, {}, conn, creds_config=_creds_config(tmp_path),
+    )
+    assert outcome.state == "succeeded", outcome.error_message
+    assert outcome.result["has_mk"] is False
+
+
+def test_model_key_unlock_failure_blocks_spawn(conn, tmp_path, monkeypatch):
+    # If the anthropic_api entry can't be unlocked, fail closed — no spawn,
+    # and the already-open site-creds pipe is cleaned up.
+    from broker import creds as creds_module
+    r = _insert_approved(conn, "r-mk-fail", "capA")
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target="/usr/bin/true",
+        revalidate={"not_applicable": "no_external_state"},
+        creds=_fake_creds_block(entry="site_entry", model_key=True),
+    )
+
+    def fake_unlock(entry, *a, **kw):
+        if entry == "site_entry":
+            return b"SITE-CRED"
+        raise creds_module.CredsError("creds_missing", "no anthropic_api entry")
+
+    monkeypatch.setattr("broker.creds.unlock_creds", fake_unlock)
+
+    popen_calls: list = []
+    orig_popen = subprocess.Popen
+    monkeypatch.setattr(executor.subprocess, "Popen",
+                        lambda *a, **kw: popen_calls.append(1) or orig_popen(*a, **kw))
+
+    outcome = executor.execute(
+        cap, r, {}, conn, creds_config=_creds_config(tmp_path),
+    )
+    assert outcome.state == "failed"
+    assert outcome.error_code == "creds_missing"
+    assert popen_calls == []
 
 
 def test_creds_unlock_failure_blocks_spawn(conn, tmp_path, monkeypatch):

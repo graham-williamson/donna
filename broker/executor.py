@@ -63,6 +63,15 @@ CREDS_MAX_BYTES = 16 * 1024
 # never creds.
 CREDS_FD_ENV_VAR = "DONNA_CREDS_FD"
 
+# Second inherited pipe fd, carrying the broker-level model API key for
+# capabilities whose executor runs a reasoning agent (creds.model_key: true).
+# Delivered exactly like the site credential — vault -> pipe -> child, never
+# env. The env var carries only the fd number (a small integer), never the key.
+MODEL_KEY_FD_ENV_VAR = "DONNA_MODEL_KEY_FD"
+# The broker-level vault entry holding the Anthropic API key. Distinct from the
+# per-site credential entry (capability.creds.entry).
+MODEL_KEY_ENTRY = "anthropic_api"
+
 
 # Type protocols so executor doesn't depend on concrete validator /
 # requests_db classes. Read-only @property form so frozen dataclasses
@@ -72,6 +81,8 @@ class CredsBlockLike(Protocol):
     def delivery(self) -> str: ...
     @property
     def entry(self) -> str: ...
+    @property
+    def model_key(self) -> bool: ...
 
 
 class CapabilityLike(Protocol):
@@ -133,6 +144,18 @@ class CredsConfig:
 
 
 # ---- helpers ------------------------------------------------------------
+
+
+def _close_fds(*fds: int | None) -> None:
+    """Best-effort close of each non-None fd; OSError is swallowed. Used on the
+    creds/model-key pipe cleanup paths where a failed close must not mask the
+    structured failure being returned."""
+    for fd in fds:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 
 def _sanitised_env(extras: dict[str, str] | None = None) -> dict[str, str]:
@@ -314,6 +337,10 @@ def _execute_subprocess(
     w_fd: int | None = None
     pass_fds: tuple[int, ...] = ()
     env_extras: dict[str, str] | None = None
+    # Second fd: broker-level model API key, for agent-running executors only.
+    mk_bytes: bytes | None = None
+    mk_r_fd: int | None = None
+    mk_w_fd: int | None = None
 
     if capability.creds is not None:
         # execute() guards creds_config presence, but defence-in-depth:
@@ -361,6 +388,55 @@ def _execute_subprocess(
         pass_fds = (r_fd,)
         env_extras = {CREDS_FD_ENV_VAR: str(r_fd)}
 
+        # Second inherited pipe: the broker-level model API key, delivered the
+        # same way (vault -> pipe -> child, never env). Only when the capability
+        # declares creds.model_key. If anything here fails, the already-open
+        # creds pipe is closed before bailing.
+        if capability.creds.model_key:
+            from broker import creds as _creds2
+            try:
+                mk_bytes = _creds2.unlock_creds(
+                    MODEL_KEY_ENTRY,
+                    creds_dir=str(creds_config.creds_dir),
+                    identity_path=str(creds_config.identity_path),
+                    age_binary=creds_config.age_binary,
+                    timeout_seconds=creds_config.timeout_seconds,
+                    audit_writer=audit_writer,
+                )
+            except _creds2.CredsError as ce:
+                _close_fds(r_fd, w_fd)
+                del cred_bytes
+                return _finalise_failure(
+                    state_conn, request, audit_writer, ce.error_code, ce.message,
+                )
+            if len(mk_bytes) > CREDS_MAX_BYTES:
+                del mk_bytes
+                _close_fds(r_fd, w_fd)
+                del cred_bytes
+                return _finalise_failure(
+                    state_conn, request, audit_writer,
+                    "creds_too_large",
+                    f"model key exceeds {CREDS_MAX_BYTES} bytes",
+                )
+            try:
+                mk_r_fd, mk_w_fd = os.pipe()
+                os.set_inheritable(mk_r_fd, True)
+                os.set_inheritable(mk_w_fd, False)
+            except OSError as oe:
+                _close_fds(r_fd, w_fd, mk_r_fd, mk_w_fd)
+                del cred_bytes
+                del mk_bytes
+                return _finalise_failure(
+                    state_conn, request, audit_writer,
+                    "creds_pipe_error",
+                    f"os.pipe failed: {type(oe).__name__}",
+                )
+            pass_fds = (r_fd, mk_r_fd)
+            env_extras = {
+                CREDS_FD_ENV_VAR: str(r_fd),
+                MODEL_KEY_FD_ENV_VAR: str(mk_r_fd),
+            }
+
     # Spawn + communicate block. Ephemeral workdir per §9.2.
     workdir = Path(tempfile.mkdtemp(prefix=f"donna-exec-{uuid.uuid4().hex}-"))
     proc: subprocess.Popen | None = None  # type: ignore[type-arg]
@@ -378,36 +454,22 @@ def _execute_subprocess(
             )
         except FileNotFoundError:
             # Clean up pipe fds before returning.
-            if r_fd is not None:
-                try:
-                    os.close(r_fd)
-                except OSError:
-                    pass
-            if w_fd is not None:
-                try:
-                    os.close(w_fd)
-                except OSError:
-                    pass
+            _close_fds(r_fd, w_fd, mk_r_fd, mk_w_fd)
             if cred_bytes is not None:
                 del cred_bytes
+            if mk_bytes is not None:
+                del mk_bytes
             return _finalise_failure(
                 state_conn, request, audit_writer,
                 "executor_missing",
                 f"binary {capability.executor_target!r} not found",
             )
         except Exception as e:
-            if r_fd is not None:
-                try:
-                    os.close(r_fd)
-                except OSError:
-                    pass
-            if w_fd is not None:
-                try:
-                    os.close(w_fd)
-                except OSError:
-                    pass
+            _close_fds(r_fd, w_fd, mk_r_fd, mk_w_fd)
             if cred_bytes is not None:
                 del cred_bytes
+            if mk_bytes is not None:
+                del mk_bytes
             # §7.2 — type-only detail.
             return _finalise_failure(
                 state_conn, request, audit_writer,
@@ -416,10 +478,13 @@ def _execute_subprocess(
                 extra={"exception_type": type(e).__name__},
             )
 
-        # Popen succeeded. Parent no longer needs read end.
+        # Popen succeeded. Parent no longer needs the read ends.
         if r_fd is not None:
             os.close(r_fd)
             r_fd = None
+        if mk_r_fd is not None:
+            os.close(mk_r_fd)
+            mk_r_fd = None
 
         # Write creds and close write end, so child sees EOF.
         # §3.3 — broker guarantees delivery attempt, not consumption.
@@ -437,6 +502,19 @@ def _execute_subprocess(
                 w_fd = None
                 del cred_bytes
                 cred_bytes = None
+
+        # Same delivery for the model key on its own pipe.
+        if mk_bytes is not None and mk_w_fd is not None:
+            try:
+                try:
+                    os.write(mk_w_fd, mk_bytes)
+                except BrokenPipeError:
+                    pass
+            finally:
+                os.close(mk_w_fd)
+                mk_w_fd = None
+                del mk_bytes
+                mk_bytes = None
 
         try:
             stdout, stderr = proc.communicate(
@@ -459,16 +537,7 @@ def _execute_subprocess(
         # Defensive: if we reach here with any fds still open (shouldn't
         # happen in the happy path but belt-and-braces for the control
         # flow), close them.
-        if r_fd is not None:
-            try:
-                os.close(r_fd)
-            except OSError:
-                pass
-        if w_fd is not None:
-            try:
-                os.close(w_fd)
-            except OSError:
-                pass
+        _close_fds(r_fd, w_fd, mk_r_fd, mk_w_fd)
         shutil.rmtree(workdir, ignore_errors=True)
 
     # ---- From here down: existing logic (stderr audit, exit check,
