@@ -24,6 +24,20 @@ _CRED = re.compile(r"\{\{cred:(username|password)\}\}")
 _VOCAB = frozenset({"read", "navigate", "click", "type", "propose_commit", "done", "give_up"})
 
 
+def _label_matches(want: str, live: str) -> bool:
+    """expected_text / expected_label staleness check (§6). Case-insensitive and
+    whitespace-trimmed — the agent copies a visible label that may differ only in
+    case or spacing. An EMPTY live label is un-validatable (many sites leave form
+    inputs unlabelled in the accessibility tree), so it is accepted: the hard
+    gates remain the element's existence + editability and, for commits, the
+    one-time token; the §8 network allowlist is the real off-domain exfil
+    backstop. A non-empty live label must match."""
+    live_n = live.strip().casefold()
+    if not live_n:
+        return True
+    return want.strip().casefold() == live_n
+
+
 @dataclass
 class Decision:
     decision: str
@@ -71,7 +85,7 @@ class Gate:
             el = self._elem(snapshot, ref)
             if el is None or not el["editable"]:
                 return Decision("refuse", reason=f"type target {ref!r} is not an editable field")
-            if str(action.get("expected_label") or "") != el["text"]:
+            if not _label_matches(str(action.get("expected_label") or ""), el["text"]):
                 return Decision("refuse", reason="type expected_label does not match the live field")
             raw_text = str(action.get("text") or "")
 
@@ -99,7 +113,7 @@ class Gate:
             el = self._elem(snapshot, ref)
             if el is None:
                 return Decision("refuse", reason=f"click target {ref!r} not on the page")
-            if str(action.get("expected_text") or "") != el["text"]:
+            if not _label_matches(str(action.get("expected_text") or ""), el["text"]):
                 return Decision("refuse", reason="click expected_text does not match the live element")
             if action.get("commit"):
                 token_id = str(action.get("commit_token") or "")
