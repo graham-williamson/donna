@@ -1,0 +1,8 @@
+{
+  "site": "everyone_active",
+  "login_url": "https://account.everyoneactive.com/login",
+  "allowlist": ["everyoneactive.com", "account.everyoneactive.com"],
+  "success_indicators": [{"type": "url_pattern", "value": "**/memberHomePage*"}],
+  "mfa_rule": "pause_and_ask",
+  "network_strictness": "monitor"
+}

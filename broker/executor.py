@@ -545,6 +545,152 @@ def _execute_subprocess(
     return ExecutionOutcome(state="succeeded", result=result)
 
 
+def run_probe(
+    binary: str,
+    payload: dict[str, Any],
+    cred_bytes: bytes,
+    timeout_seconds: float = DEFAULT_EXECUTOR_TIMEOUT_SECONDS,
+    audit_writer: AuditWriter | None = None,
+) -> dict[str, Any]:
+    """Run a read-only probe subprocess (e.g. a site-check login test)
+    with credentials delivered over the same DONNA_CREDS_FD pipe that
+    capability executors use. No request row, no state machine — probes
+    are human-tap reads, not broker actions.
+
+    `payload` is written to the child's stdin as
+    {"capability": <probe name>, "params": {...}} so probe binaries
+    share the capability-executor stdin contract. Returns the parsed
+    stdout object on exit 0; on failure returns a structured
+    {"status": "error", "error_code", "detail"} — it never raises for
+    child-side problems (fail-closed but reportable). The cred bytes
+    are written to the pipe and dropped; they never appear in the
+    return value or audit."""
+    if len(cred_bytes) > CREDS_MAX_BYTES:
+        return {
+            "status": "error",
+            "error_code": "creds_too_large",
+            "detail": f"creds exceed {CREDS_MAX_BYTES} bytes",
+        }
+
+    stdin_payload = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+    r_fd: int | None = None
+    w_fd: int | None = None
+    try:
+        r_fd, w_fd = os.pipe()
+        os.set_inheritable(r_fd, True)
+        os.set_inheritable(w_fd, False)
+    except OSError as oe:
+        if r_fd is not None:
+            os.close(r_fd)
+        if w_fd is not None:
+            os.close(w_fd)
+        return {
+            "status": "error",
+            "error_code": "creds_pipe_error",
+            "detail": f"os.pipe failed: {type(oe).__name__}",
+        }
+
+    workdir = Path(tempfile.mkdtemp(prefix=f"donna-probe-{uuid.uuid4().hex}-"))
+    try:
+        try:
+            proc = subprocess.Popen(
+                [binary],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_sanitised_env({CREDS_FD_ENV_VAR: str(r_fd)}),
+                cwd=str(workdir),
+                pass_fds=(r_fd,),
+                close_fds=True,
+            )
+        except FileNotFoundError:
+            return {
+                "status": "error",
+                "error_code": "probe_missing",
+                "detail": f"binary {binary!r} not found",
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "error_code": "probe_spawn_error",
+                "detail": type(e).__name__,
+            }
+
+        os.close(r_fd)
+        r_fd = None
+        try:
+            try:
+                os.write(w_fd, cred_bytes)
+            except BrokenPipeError:
+                pass
+        finally:
+            os.close(w_fd)
+            w_fd = None
+            del cred_bytes
+
+        try:
+            stdout, stderr = proc.communicate(
+                input=stdin_payload, timeout=timeout_seconds
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.communicate(timeout=1.0)
+            except Exception:
+                pass
+            return {
+                "status": "error",
+                "error_code": "probe_timeout",
+                "detail": f"timed out after {timeout_seconds}s",
+            }
+    finally:
+        if r_fd is not None:
+            try:
+                os.close(r_fd)
+            except OSError:
+                pass
+        if w_fd is not None:
+            try:
+                os.close(w_fd)
+            except OSError:
+                pass
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    if stderr:
+        # Same §7.1 posture as capability executors: stderr content may
+        # carry secrets, so the audit gets length + hash only.
+        _emit(audit_writer, {
+            "event": "probe_stderr",
+            "probe": payload.get("capability", ""),
+            "stderr_bytes": len(stderr),
+            "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        })
+
+    parsed: Any = None
+    if stdout:
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError:
+            parsed = None
+
+    if proc.returncode != 0:
+        error_code = "probe_failed"
+        detail = f"exit code {proc.returncode}"
+        if isinstance(parsed, dict):
+            error_code = str(parsed.get("error_code") or error_code)
+            detail = str(parsed.get("detail") or detail)
+        return {"status": "error", "error_code": error_code, "detail": detail}
+
+    if not isinstance(parsed, dict):
+        return {
+            "status": "error",
+            "error_code": "probe_output_invalid",
+            "detail": "probe stdout was not a JSON object",
+        }
+    return parsed
+
+
 def _execute_mcp_tool(
     capability: CapabilityLike,
     request: RequestLike,

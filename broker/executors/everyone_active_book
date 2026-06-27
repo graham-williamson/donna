@@ -54,21 +54,56 @@ def read_params() -> dict:
 
 
 def login(page, creds: dict) -> None:
+    """EA's login is an SPA backed by POST api-v2…/v1/auth/login (rebuilt
+    ~mid-2026; the old memberHomePage.aspx redirect is gone). A Cookiebot
+    consent wall mounts over the form — dismiss it or the submit is
+    swallowed. Login outcome is judged by the auth API status; afterwards
+    we land in the legacy member area for the booking flow."""
     try:
         page.goto("https://account.everyoneactive.com/login", timeout=30000)
     except PwTimeout:
         fail("site_unavailable", "login page did not load within 30s")
 
-    page.fill("#emailAddress", creds["email"])
-    page.fill("#password", creds["password"])
-    page.click("button[type='submit']")
+    page.wait_for_timeout(1500)
+    consent = page.query_selector("#CybotCookiebotDialogBodyButtonDecline")
+    if consent:
+        consent.click()
+        page.wait_for_timeout(500)
 
+    page.fill("#emailAddress", creds.get("email") or creds.get("username") or "")
+    page.fill("#password", creds["password"])
     try:
-        page.wait_for_url("**/memberHomePage.aspx", timeout=30000)
+        with page.expect_response(
+            lambda r: "/v1/auth/login" in r.url, timeout=30000
+        ) as resp_info:
+            page.click("button[type='submit']")
+        resp = resp_info.value
     except PwTimeout:
-        error_el = page.query_selector(".validation-summary-errors, .field-validation-error, .error-message")
-        detail = error_el.text_content().strip() if error_el else "login page did not redirect"
-        fail("login_failed", detail)
+        fail("login_failed", "no auth response within 30s")
+
+    # EA's auth API returns 201 (Created) on success — accept any 2xx.
+    if not (200 <= resp.status < 300):
+        msg = ""
+        try:
+            msg = str(resp.json().get("message") or "")[:120]
+        except Exception:
+            pass
+        fail("login_failed",
+             "Everyone Active didn't accept the login"
+             + (f" — {msg}" if msg else ""))
+
+    # Session established. The legacy WebForms member area hosts the
+    # booking flow; the SPA may or may not auto-redirect there.
+    try:
+        page.wait_for_url("**/memberHomePage.aspx", timeout=15000)
+    except PwTimeout:
+        try:
+            page.goto(
+                "https://account.everyoneactive.com/memberHomePage.aspx",
+                timeout=30000,
+            )
+        except PwTimeout:
+            fail("unexpected_dom", "could not reach member home after login")
 
 
 def expand_advanced_search(page) -> None:
@@ -233,7 +268,15 @@ def main() -> None:
         fail("unexpected_dom", f"playwright_init: {type(exc).__name__}: {exc}")
 
     try:
-        browser = pw.chromium.launch(headless=True, channel="chrome")
+        # chromium-headless-shell: Playwright's no-GUI build. System Chrome
+        # (channel="chrome") worked until Chrome 149 (2026-06-11), which
+        # SIGTRAPs at launch under the GUI-less donna-broker account; the
+        # headless shell has no dock/AppKit integration so it survives.
+        # Requires `playwright install chromium-headless-shell` in the
+        # donna-broker venv after playwright upgrades.
+        browser = pw.chromium.launch(
+            headless=True, channel="chromium-headless-shell"
+        )
     except Exception as exc:
         pw.stop()
         fail("unexpected_dom", f"browser_launch: {type(exc).__name__}: {exc}")

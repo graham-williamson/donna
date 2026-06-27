@@ -475,3 +475,312 @@ def test_sanitise_multiple_redactions():
 def test_sanitise_rejects_non_string():
     with pytest.raises(TypeError):
         policy.sanitise_context_reason(123)  # type: ignore[arg-type]
+
+
+# ---- standing grants (broker-standing-grants §5, §6) --------------------
+
+import json  # noqa: E402
+
+from broker import grants_db  # noqa: E402
+
+
+GRANT_KEY = b"K" * 32
+NOW = 1_700_000_000_000  # fixed epoch-ms for deterministic grant tests
+WEEK_S = 604_800
+
+
+@pytest.fixture
+def grant_conn(tmp_path):
+    conn = db.open_db(str(tmp_path / "requests.db"))
+    grants_db.ensure_grant_tables(conn)
+    yield conn
+    conn.close()
+
+
+def _make_grant(
+    conn,
+    *,
+    grant_id: str = "g-001",
+    capability: str = "gmail.send",
+    constraints: dict | None = None,
+    key: bytes = GRANT_KEY,
+    max_per_period: int = 1,
+    period_seconds: int = WEEK_S,
+    created_at: int = NOW,
+    expires_at: int = NOW + 90 * 24 * 3600 * 1000,
+    revoked_at: int | None = None,
+    approved_via: str = "AB12CD",
+) -> grants_db.StandingGrant:
+    if constraints is None:
+        constraints = {"to": "graham@example.com"}
+    canonical = json.dumps(constraints, sort_keys=True)
+    mac = policy.compute_constraints_mac(key, capability, constraints)
+    grant = grants_db.StandingGrant(
+        id=grant_id,
+        capability=capability,
+        constraints=canonical,
+        constraints_mac=mac,
+        purpose="School roundup",
+        max_per_period=max_per_period,
+        period_seconds=period_seconds,
+        created_at=created_at,
+        expires_at=expires_at,
+        approved_via=approved_via,
+        revoked_at=revoked_at,
+    )
+    grants_db.insert_grant(conn, grant)
+    return grant
+
+
+# ---- §5 constraints_match: exact + prefix + free fields -----------------
+
+
+def test_constraints_match_exact_pin():
+    c = {"to": "graham@example.com"}
+    assert policy.constraints_match(c, {"to": "graham@example.com", "body": "x"})
+    assert not policy.constraints_match(c, {"to": "someone@else.com"})
+
+
+def test_constraints_match_missing_pinned_field_fails():
+    c = {"to": "graham@example.com"}
+    assert not policy.constraints_match(c, {"body": "x"})
+
+
+def test_constraints_match_prefix_pin():
+    c = {"subject": {"prefix": "School roundup"}}
+    assert policy.constraints_match(c, {"subject": "School roundup — week 3"})
+    assert not policy.constraints_match(c, {"subject": "Dentist appt"})
+
+
+def test_constraints_match_prefix_requires_string():
+    c = {"subject": {"prefix": "School"}}
+    assert not policy.constraints_match(c, {"subject": ["School"]})
+
+
+def test_constraints_match_free_fields_vary():
+    c = {"to": "graham@example.com"}
+    # body and subject are free — any value matches as long as `to` pins.
+    assert policy.constraints_match(
+        c, {"to": "graham@example.com", "subject": "anything", "body": "free"}
+    )
+
+
+def test_constraints_match_exact_pin_list_normalised():
+    """Exact pins use canonical-JSON equality (matches params_hash)."""
+    c = {"to": ["graham@example.com"]}
+    assert policy.constraints_match(c, {"to": ["graham@example.com"]})
+    assert not policy.constraints_match(c, {"to": ["x@y.com"]})
+
+
+# ---- §5 MAC verify pass/fail --------------------------------------------
+
+
+def test_verify_constraints_mac_passes(grant_conn):
+    g = _make_grant(grant_conn)
+    assert policy.verify_constraints_mac(GRANT_KEY, g) is True
+
+
+def test_verify_constraints_mac_fails_on_wrong_key(grant_conn):
+    g = _make_grant(grant_conn)
+    assert policy.verify_constraints_mac(b"X" * 32, g) is False
+
+
+def test_verify_constraints_mac_fails_on_tampered_constraints(grant_conn):
+    g = _make_grant(grant_conn)
+    tampered = grants_db.StandingGrant(
+        **{**g.__dict__, "constraints": json.dumps({"to": "attacker@evil.com"})}
+    )
+    assert policy.verify_constraints_mac(GRANT_KEY, tampered) is False
+
+
+def test_compute_constraints_mac_binds_capability(grant_conn):
+    """Same constraints, different capability → different MAC."""
+    c = {"to": "graham@example.com"}
+    a = policy.compute_constraints_mac(GRANT_KEY, "gmail.send", c)
+    b = policy.compute_constraints_mac(GRANT_KEY, "other.cap", c)
+    assert a != b
+
+
+# ---- §5 validate_constraints --------------------------------------------
+
+
+def test_validate_constraints_gmail_send_requires_to():
+    with pytest.raises(policy.GrantConstraintError):
+        policy.validate_constraints("gmail.send", {"subject": {"prefix": "x"}})
+
+
+def test_validate_constraints_gmail_send_with_to_ok():
+    policy.validate_constraints("gmail.send", {"to": "graham@example.com"})
+
+
+def test_validate_constraints_rejects_non_object():
+    with pytest.raises(policy.GrantConstraintError):
+        policy.validate_constraints("gmail.send", ["to"])  # type: ignore[arg-type]
+
+
+def test_validate_constraints_bad_subject_pin():
+    with pytest.raises(policy.GrantConstraintError):
+        policy.validate_constraints(
+            "gmail.send", {"to": "g@x.com", "subject": {"contains": "x"}}
+        )
+
+
+# ---- §6 check_standing_grants: happy path -------------------------------
+
+
+def test_check_standing_grants_matches_and_records_use(grant_conn):
+    _make_grant(grant_conn)
+    decision = policy.check_standing_grants(
+        grant_conn, "gmail.send",
+        {"to": "graham@example.com", "subject": "hi", "body": "x"},
+        NOW, GRANT_KEY,
+    )
+    assert decision is not None
+    assert decision["decision"] == "allow"
+    assert decision["via"] == "standing_grant"
+    assert decision["grant_id"] == "g-001"
+    # A use was recorded.
+    assert grants_db.count_uses_within(grant_conn, "g-001", 0) == 1
+
+
+def test_check_standing_grants_non_matching_to_returns_none(grant_conn):
+    _make_grant(grant_conn)
+    decision = policy.check_standing_grants(
+        grant_conn, "gmail.send",
+        {"to": "someone@else.com", "subject": "hi", "body": "x"},
+        NOW, GRANT_KEY,
+    )
+    assert decision is None
+    # No use recorded on a miss.
+    assert grants_db.count_uses_within(grant_conn, "g-001", 0) == 0
+
+
+def test_check_standing_grants_bad_mac_returns_none(grant_conn):
+    _make_grant(grant_conn)
+    decision = policy.check_standing_grants(
+        grant_conn, "gmail.send",
+        {"to": "graham@example.com"},
+        NOW, b"WRONG-KEY-WRONG-KEY-WRONG-KEY-32",
+    )
+    assert decision is None
+
+
+# ---- §3.3 rate limit window: allow N, deny N+1, allow after window ------
+
+
+def test_rate_limit_allows_up_to_max_then_denies(grant_conn):
+    _make_grant(grant_conn, max_per_period=1, period_seconds=WEEK_S)
+    params = {"to": "graham@example.com", "body": "x"}
+    # First use within the window: allowed.
+    d1 = policy.check_standing_grants(grant_conn, "gmail.send", params, NOW, GRANT_KEY)
+    assert d1 is not None
+    # Second use within the same window: denied (falls through → None).
+    d2 = policy.check_standing_grants(
+        grant_conn, "gmail.send", params, NOW + 1000, GRANT_KEY
+    )
+    assert d2 is None
+
+
+def test_rate_limit_allows_again_after_window(grant_conn):
+    _make_grant(grant_conn, max_per_period=1, period_seconds=WEEK_S)
+    params = {"to": "graham@example.com", "body": "x"}
+    d1 = policy.check_standing_grants(grant_conn, "gmail.send", params, NOW, GRANT_KEY)
+    assert d1 is not None
+    # Just past the window from the first use → allowed again.
+    later = NOW + WEEK_S * 1000 + 1
+    d2 = policy.check_standing_grants(grant_conn, "gmail.send", params, later, GRANT_KEY)
+    assert d2 is not None
+
+
+def test_rate_limit_higher_cap(grant_conn):
+    _make_grant(grant_conn, max_per_period=3, period_seconds=WEEK_S)
+    params = {"to": "graham@example.com", "body": "x"}
+    for i in range(3):
+        assert policy.check_standing_grants(
+            grant_conn, "gmail.send", params, NOW + i, GRANT_KEY
+        ) is not None
+    # 4th within window → denied.
+    assert policy.check_standing_grants(
+        grant_conn, "gmail.send", params, NOW + 4, GRANT_KEY
+    ) is None
+
+
+# ---- §6 expiry & revocation: never match --------------------------------
+
+
+def test_expired_grant_never_matches(grant_conn):
+    _make_grant(grant_conn, expires_at=NOW - 1)
+    d = policy.check_standing_grants(
+        grant_conn, "gmail.send", {"to": "graham@example.com"}, NOW, GRANT_KEY
+    )
+    assert d is None
+
+
+def test_revoked_grant_never_matches(grant_conn):
+    _make_grant(grant_conn, revoked_at=NOW - 1)
+    d = policy.check_standing_grants(
+        grant_conn, "gmail.send", {"to": "graham@example.com"}, NOW, GRANT_KEY
+    )
+    assert d is None
+
+
+# ---- §3.1 NON-NEGOTIABLE: grant.create never matched by a grant ---------
+
+
+def test_grant_create_never_matched_by_grant(grant_conn):
+    """No self-escalation: even if a (forged) grant exists for
+    grant.create, check_standing_grants must NEVER authorise it."""
+    # Insert a grant whose capability is grant.create with a valid MAC.
+    _make_grant(
+        grant_conn, grant_id="g-evil", capability=policy.GRANT_CREATE_CAPABILITY,
+        constraints={"capability": "gmail.send"},
+    )
+    d = policy.check_standing_grants(
+        grant_conn, policy.GRANT_CREATE_CAPABILITY,
+        {"capability": "gmail.send"}, NOW, GRANT_KEY,
+    )
+    assert d is None
+    # And no use was recorded — it short-circuits before touching the store.
+    assert grants_db.count_uses_within(grant_conn, "g-evil", 0) == 0
+
+
+def test_check_standing_grants_is_deterministic(grant_conn):
+    """Same inputs + fixed now → same decision (purity)."""
+    _make_grant(grant_conn, max_per_period=5)
+    params = {"to": "graham@example.com", "body": "x"}
+    # Two calls at the SAME now both allowed (cap is 5, two uses < 5).
+    d1 = policy.check_standing_grants(grant_conn, "gmail.send", params, NOW, GRANT_KEY)
+    d2 = policy.check_standing_grants(grant_conn, "gmail.send", params, NOW, GRANT_KEY)
+    assert d1 == d2
+
+
+# ---- browser_goal.commit: NO_STANDING_GRANTS (connected-sites-broker-handoff §2) --
+
+
+def test_browser_goal_commit_is_never_grantable():
+    assert "browser_goal.commit" in policy.NO_STANDING_GRANTS
+
+
+def test_grant_constraints_refused_for_browser_goal_commit():
+    """validate_constraints must refuse to create a standing grant for
+    browser_goal.commit — money must always require a fresh approval."""
+    with pytest.raises(policy.GrantConstraintError):
+        policy.validate_constraints(
+            "browser_goal.commit", {"site": "everyone_active"}
+        )
+
+
+# ---- promoter.install_pack: NO_STANDING_GRANTS (Plan B Task 6) -------------
+
+
+def test_promoter_install_pack_is_never_grantable():
+    assert "promoter.install_pack" in policy.NO_STANDING_GRANTS
+
+
+def test_grant_constraints_refused_for_promoter_install_pack():
+    """validate_constraints must refuse to create a standing grant for
+    promoter.install_pack — every pack install needs a fresh approval."""
+    with pytest.raises(policy.GrantConstraintError):
+        policy.validate_constraints(
+            "promoter.install_pack", {"pack_id": "site"}
+        )

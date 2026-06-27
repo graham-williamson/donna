@@ -20,3 +20,4 @@ htmlcov/
 # Editor
 *.swp
 *.swo
+.superpowers/

@@ -1,0 +1,6 @@
+data/
+_shared/_state/
+*.db
+*.db-wal
+*.db-shm
+__pycache__/

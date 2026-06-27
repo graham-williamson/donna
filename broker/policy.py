@@ -28,7 +28,10 @@ import hmac as _hmac
 import re
 import secrets
 import time
-from typing import Any
+from typing import Any, Optional
+
+from broker import canonicalize
+from broker import grants_db
 
 
 # Unit separator (ASCII 0x1F). Never valid inside any covered field.
@@ -338,3 +341,206 @@ def sanitise_context_reason(raw: str) -> tuple[str, list[str]]:
         result = "".join(rebuilt_chars)
 
     return result, redactions
+
+
+# ---- standing grants (broker-standing-grants §5, §6) --------------------
+#
+# A standing grant lets a specific (capability + pinned params) action
+# auto-execute up to a rate limit. This block is the pure/deterministic
+# policy core: it computes/verifies the constraints MAC, matches request
+# params against a grant's pinned constraints, and (given `now` and a
+# local DB connection) decides whether an active, in-rate grant covers a
+# request. No network, no wall-clock — `now` is always an argument.
+
+# §3.1 / §7: grant.create is the meta-privilege. It is hard-coded
+# high-risk and is NEVER matched/authorised by any standing grant —
+# grants cannot grant grants (no self-escalation).
+GRANT_CREATE_CAPABILITY = "grant.create"
+
+# Per-action-only capabilities (connected-sites-broker-handoff §2): money
+# moves only with a fresh per-purchase human approval. These can never be
+# covered by a standing grant — grant-create refuses to create one and
+# check_standing_grants refuses to match one, so even a grant row smuggled
+# into the store would be inert.
+NO_STANDING_GRANTS = frozenset({
+    "everyone_active.checkout",
+    "browser_goal.commit",
+    # Installing a signed capability pack is irreversible privilege change —
+    # every install needs a fresh Telegram approval and can never be covered
+    # by a standing grant (Plan B Task 6).
+    "promoter.install_pack",
+})
+
+
+class GrantConstraintError(Exception):
+    """Raised when a grant's constraints are structurally invalid (e.g. a
+    gmail.send grant that omits the mandatory `to` pin, §5)."""
+
+
+def compute_constraints_mac(
+    key: bytes, capability: str, constraints: Any
+) -> str:
+    """§5 constraints MAC: HMAC(broker_key, capability ‖ canonical(constraints)).
+
+    Reuses broker.canonicalize (RFC 8785) for the constraints so a grant
+    stored on disk can't be tampered with out-of-band, and the SEP
+    separator from §7.3 so capability and constraints can never collide.
+    `constraints` is the in-memory object (dict); it is canonicalised
+    here so callers don't have to pre-serialise."""
+    msg = (
+        capability.encode("utf-8")
+        + SEP
+        + canonicalize.canonicalize(constraints)
+    )
+    return _hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def verify_constraints_mac(key: bytes, grant: grants_db.StandingGrant) -> bool:
+    """Recompute the constraints MAC from the grant's stored canonical
+    constraints and constant-time compare against the stored MAC. False
+    on any mismatch or malformed stored constraints — never raises on
+    attacker-influenced data at rest."""
+    try:
+        import json
+        constraints_obj = json.loads(grant.constraints)
+    except Exception:
+        return False
+    expected = compute_constraints_mac(key, grant.capability, constraints_obj)
+    return _hmac.compare_digest(expected, grant.constraints_mac)
+
+
+def validate_constraints(capability: str, constraints: Any) -> None:
+    """§5 structural validation of a grant's constraints, applied at
+    grant-create time. Raises GrantConstraintError on violation.
+
+    Rules:
+      - constraints must be a JSON object.
+      - For `gmail.send`, `to` is MANDATORY (no unpinned recipient is
+        ever auto-sendable).
+      - A `subject` pin, if present, must be either an exact string or
+        a `{"prefix": <str>}` object.
+    """
+    if capability in NO_STANDING_GRANTS:
+        raise GrantConstraintError(
+            f"{capability} is per-action-only: every run requires a fresh "
+            f"human approval, so no standing grant can cover it"
+        )
+    if not isinstance(constraints, dict):
+        raise GrantConstraintError("constraints must be a JSON object")
+    if capability == "gmail.send" and "to" not in constraints:
+        raise GrantConstraintError(
+            "gmail.send grants must pin `to` (no unpinned recipient is "
+            "auto-sendable)"
+        )
+    if "subject" in constraints:
+        subj = constraints["subject"]
+        if isinstance(subj, dict):
+            if set(subj.keys()) != {"prefix"} or not isinstance(
+                subj.get("prefix"), str
+            ):
+                raise GrantConstraintError(
+                    "subject pin object must be {\"prefix\": <string>}"
+                )
+        elif not isinstance(subj, str):
+            raise GrantConstraintError(
+                "subject pin must be a string or a {\"prefix\": ...} object"
+            )
+
+
+def constraints_match(constraints: Any, params: dict[str, Any]) -> bool:
+    """§5 matching. Returns True iff `params` satisfies every pinned
+    constraint. Fields not listed in `constraints` are free to vary.
+
+    Pin kinds:
+      - exact pin: a non-dict value. The param canonicalises identically
+        to the pinned value (canonical-JSON equality, so list/string
+        order and formatting are normalised, matching params_hash
+        semantics).
+      - prefix pin: `{"prefix": <str>}`. The param must be a string that
+        startswith the prefix.
+    """
+    if not isinstance(constraints, dict):
+        return False
+    for field, pin in constraints.items():
+        if field not in params:
+            return False
+        value = params[field]
+        if isinstance(pin, dict) and "prefix" in pin:
+            prefix = pin["prefix"]
+            if not isinstance(value, str) or not isinstance(prefix, str):
+                return False
+            if not value.startswith(prefix):
+                return False
+        else:
+            # Exact pin via canonical-JSON equality (same normalisation
+            # the broker uses for params_hash).
+            try:
+                if canonicalize.canonicalize(pin) != canonicalize.canonicalize(
+                    value
+                ):
+                    return False
+            except Exception:
+                return False
+    return True
+
+
+def within_rate(
+    conn: Any, grant: grants_db.StandingGrant, now_ms: int
+) -> bool:
+    """§3.3 rolling-window rate check. True if the grant has been used
+    fewer than `max_per_period` times within the last `period_seconds`
+    ending at `now_ms`. Deterministic given `now_ms`."""
+    window_start = now_ms - grant.period_seconds * 1000
+    used = grants_db.count_uses_within(conn, grant.id, window_start)
+    return used < grant.max_per_period
+
+
+def check_standing_grants(
+    conn: Any,
+    capability: str,
+    params: dict[str, Any],
+    now_ms: int,
+    broker_key: bytes,
+) -> Optional[dict[str, Any]]:
+    """§6 grant consultation — the pure policy step that runs BEFORE the
+    risk-tier fallthrough.
+
+    Returns an allow descriptor and records a use when an active grant
+    matches; returns None otherwise (caller falls through to the existing
+    low→allow / medium·high→approval / blocked→deny behaviour).
+
+    Pure/deterministic: `now_ms` is an argument (no wall-clock); the
+    grant store is read locally via `conn` (no network).
+
+    Invariant (§3.1): `grant.create` is NEVER matched here — grants
+    cannot grant grants. Short-circuits before touching the store.
+    """
+    if capability == GRANT_CREATE_CAPABILITY:
+        return None
+    if capability in NO_STANDING_GRANTS:
+        # Per-action-only (e.g. checkout): never auto-authorised, even if
+        # a grant row for it somehow exists in the store.
+        return None
+    for grant in grants_db.active_grants(conn, capability, now_ms):
+        if not constraints_match(_loads_constraints(grant), params):
+            continue
+        if not verify_constraints_mac(broker_key, grant):
+            continue
+        if not within_rate(conn, grant, now_ms):
+            continue
+        grants_db.record_use(conn, grant.id, now_ms)
+        return {
+            "decision": "allow",
+            "via": "standing_grant",
+            "grant_id": grant.id,
+            "risk_level": "high",
+        }
+    return None
+
+
+def _loads_constraints(grant: grants_db.StandingGrant) -> Any:
+    import json
+    try:
+        return json.loads(grant.constraints)
+    except Exception:
+        return None

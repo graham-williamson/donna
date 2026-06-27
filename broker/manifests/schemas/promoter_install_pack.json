@@ -1,0 +1,20 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "donna://schemas/promoter_install_pack.json",
+  "title": "promoter.install_pack params",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["pack_id", "pack_hash"],
+  "properties": {
+    "pack_id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]*$",
+      "description": "Bare pack directory name under the promoter packs dir"
+    },
+    "pack_hash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 hex of the signed pack's canonical bytes"
+    }
+  }
+}

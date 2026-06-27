@@ -1,0 +1,119 @@
+#!/Users/donna-broker/venv/bin/python3
+"""promoter.install_pack broker-side client executor (Plan B Task 6).
+
+The broker runs this subprocess (as donna-broker) when a
+``promoter.install_pack`` request is approved and executing. It holds NO
+authority: it reads the standard executor input (``{capability, params}`` on
+stdin), extracts ``params.pack_id``, opens the root promoter daemon's Unix
+socket, sends a single length-prefixed JSON frame ``{"op":"install_pack",
+"pack_id":<id>}``, reads the length-prefixed reply, and relays the outcome as a
+normal executor result. The daemon independently re-verifies EVERYTHING — the
+pack signature/safety AND the approval (resolved by pack identity from the
+broker DB itself) — before changing anything.
+
+Subprocess contract: JSON ``{capability, params}`` on stdin, JSON result to
+stdout. exit 0 = installed; exit 1 = structured ``{error_code, detail}``.
+
+Wire format is shared with ``broker.promoter_daemon``: a 4-byte big-endian
+uint32 length prefix then a JSON body. The pure ``encode_request`` /
+``decode_reply`` helpers carry that format and are unit-tested; the actual
+``socket.connect`` is a thin ``# pragma: no cover`` wrapper (smoke-tested live).
+"""
+import json
+import os
+import socket
+import struct
+import sys
+
+DEFAULT_SOCK = "/var/run/donna/promoter.sock"
+MAX_FRAME = 65536
+
+
+def fail(error_code: str, detail: str) -> None:
+    json.dump({"error_code": error_code, "detail": detail}, sys.stdout)
+    sys.stdout.flush()
+    sys.exit(1)
+
+
+def encode_request(pack_id: str) -> bytes:
+    """PURE: encode an install_pack request as a length-prefixed JSON frame
+    (the daemon's wire format)."""
+    body = json.dumps({"op": "install_pack", "pack_id": pack_id}).encode("utf-8")
+    return struct.pack(">I", len(body)) + body
+
+
+def decode_reply(raw: bytes) -> dict:
+    """PURE: decode a length-prefixed JSON reply frame into its object.
+
+    Raises ValueError on a short/oversized/malformed frame so the caller can
+    fail closed rather than act on a half-read reply."""
+    if len(raw) < 4:
+        raise ValueError("short reply: missing length prefix")
+    (declared,) = struct.unpack(">I", raw[:4])
+    if declared > MAX_FRAME:
+        raise ValueError(f"reply too large: {declared} > {MAX_FRAME}")
+    body = raw[4:]
+    if len(body) < declared:
+        raise ValueError("short reply: body shorter than declared length")
+    obj = json.loads(body[:declared])
+    if not isinstance(obj, dict):
+        raise ValueError("reply body is not a JSON object")
+    return obj
+
+
+def _round_trip(sock_path: str, request: bytes) -> bytes:  # pragma: no cover - real socket I/O, smoke-tested live
+    """Connect to the promoter socket, send the request frame, read the reply
+    frame (length-prefixed), and return the raw bytes. Bounded read."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.connect(sock_path)
+        s.sendall(request)
+        prefix = s.recv(4)
+        if len(prefix) < 4:
+            return prefix
+        (declared,) = struct.unpack(">I", prefix[:4])
+        if declared > MAX_FRAME:
+            return prefix
+        body = b""
+        while len(body) < declared:
+            chunk = s.recv(declared - len(body))
+            if not chunk:
+                break
+            body += chunk
+        return prefix + body
+    finally:
+        s.close()
+
+
+def main() -> None:  # pragma: no cover - stdin + real socket I/O orchestration, smoke-tested live
+    try:
+        request = json.load(sys.stdin)
+    except (ValueError, OSError) as e:
+        fail("bad_input", f"could not read executor input: {e}")
+    params = request.get("params") or {}
+    pack_id = params.get("pack_id")
+    if not isinstance(pack_id, str) or not pack_id:
+        fail("bad_input", "params.pack_id missing or not a string")
+
+    sock_path = os.environ.get("DONNA_PROMOTER_SOCK", DEFAULT_SOCK)
+    try:
+        raw = _round_trip(sock_path, encode_request(pack_id))
+    except OSError as e:
+        fail("promoter_unreachable", f"could not reach promoter socket: {e}")
+
+    try:
+        reply = decode_reply(raw)
+    except ValueError as e:
+        fail("bad_reply", str(e))
+
+    if not reply.get("ok"):
+        fail("install_refused", str(reply.get("error", "promoter refused install")))
+
+    # Success — relay the promoter's outcome verbatim.
+    result = {k: v for k, v in reply.items() if k != "ok"}
+    json.dump(result, sys.stdout)
+    sys.stdout.flush()
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

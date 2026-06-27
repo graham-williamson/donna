@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "default": ["session-handoff"],
+  "personas": {
+    "donna": ["chief-preferences", "schedule", "commitments"],
+    "nike": ["energy", "training", "fitness"],
+    "esme": ["goals", "worry", "wins", "self-worth"],
+    "bodhi": ["values", "reflections", "meaning"]
+  }
+}

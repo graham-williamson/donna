@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "donna://schemas/gmail_send.json",
+  "title": "gmail.send params",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["to", "subject", "body"],
+  "properties": {
+    "to": {
+      "type": "string",
+      "format": "email",
+      "maxLength": 254
+    },
+    "subject": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200
+    },
+    "body": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100000
+    },
+    "thread_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    }
+  }
+}

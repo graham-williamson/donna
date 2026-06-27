@@ -1,0 +1,41 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "donna://schemas/browser_goal_commit.json",
+  "title": "browser_goal.commit params",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["site", "goal", "phase", "max_price", "plan_summary"],
+  "properties": {
+    "site": {
+      "type": "string",
+      "description": "Site profile key (e.g. 'everyone_active')"
+    },
+    "goal": {
+      "type": "string",
+      "description": "Natural-language description of the goal to execute"
+    },
+    "phase": {
+      "type": "string",
+      "const": "commit",
+      "description": "Must be 'commit' — execution pass that may spend money or mutate state"
+    },
+    "max_price": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5000,
+      "description": "Approved spend ceiling in PENCE. Schema rejects > 5000 (£50) at request time; executor independently re-enforces the cap."
+    },
+    "plan_summary": {
+      "type": "string",
+      "description": "Human-readable summary of the plan produced by the preceding browser_goal.plan step"
+    },
+    "commit_token": {
+      "type": "string",
+      "description": "Optional token issued by the plan step to chain plan → commit"
+    },
+    "date": {
+      "type": "string",
+      "description": "Optional ISO date for idempotency_date_from"
+    }
+  }
+}

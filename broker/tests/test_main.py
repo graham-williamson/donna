@@ -356,6 +356,140 @@ def test_execute_unknown_code(broker_env):
     assert resp["error_code"] == "not_found"
 
 
+# ---- in-app approval (inapp-approval-broker-handoff, Option B) ----------
+
+
+def _request_pending(
+    broker_env: dict[str, str], date: str = "2026-04-21"
+) -> dict[str, Any]:
+    _, req_resp = _run(
+        "request",
+        {
+            "capability": "puregym.book_class",
+            "params": {"class_id": "hiit", "date": date},
+        },
+        broker_env,
+    )
+    return req_resp
+
+
+def test_app_approve_records_proof_then_execute_runs(broker_env):
+    """The full app flow: execute → approval_required → app-approve →
+    execute → succeeded. The in-app tap stands in for the Telegram tap."""
+    req = _request_pending(broker_env)
+
+    # execute before any proof-of-human → approval_required.
+    _, pre = _run("execute", {"approval_code": req["code"]}, broker_env)
+    assert pre["status"] == "approval_required"
+
+    # In-app human tap records the proof-of-human.
+    code, resp = _run("app-approve", {"approval_code": req["code"]}, broker_env)
+    assert code == 0, resp
+    assert resp["status"] == "approved"
+    assert resp["state"] == "approved"
+
+    # Receipt is written with channel="app".
+    receipt = Path(broker_env["DONNA_BROKER_RESPONSES_DIR"]) / f"{req['request_id']}.json"
+    assert receipt.exists()
+    body = json.loads(receipt.read_text(encoding="utf-8"))
+    assert body["decision"] == "approve"
+    assert body["channel"] == "app"
+
+    # Audit trail carries the distinct in-app event.
+    audit_text = "".join(
+        p.read_text(encoding="utf-8")
+        for p in Path(broker_env["DONNA_BROKER_AUDIT_DIR"]).glob("*")
+        if p.is_file()
+    )
+    assert "request_approved_in_app" in audit_text
+
+    # Now execute runs the capability for real.
+    code, resp = _run("execute", {"approval_code": req["code"]}, broker_env)
+    assert code == 0, resp
+    assert resp["status"] == "succeeded"
+    assert resp["result"] == {"confirmation": "PG-12345"}
+
+
+def test_app_approve_requires_code(broker_env):
+    code, resp = _run("app-approve", {}, broker_env)
+    assert code == 1
+    assert resp["error_code"] == "invalid_input"
+
+
+def test_app_approve_unknown_code(broker_env):
+    code, resp = _run("app-approve", {"approval_code": "NOSUCH"}, broker_env)
+    assert code == 1
+    assert resp["error_code"] == "not_found"
+
+
+def test_app_approve_is_idempotent_on_already_approved(broker_env):
+    req = _request_pending(broker_env)
+    _run("app-approve", {"approval_code": req["code"]}, broker_env)
+    # Second tap, now post-execute the row would be terminal, so approve
+    # again while still pre-execute: state stays approvable and returns ok.
+    code, resp = _run("app-approve", {"approval_code": req["code"]}, broker_env)
+    assert code == 0, resp
+    assert resp["status"] == "approved"
+
+
+def test_app_approve_does_not_overwrite_existing_deny(broker_env):
+    """An app tap must not flip a decision already recorded out-of-band."""
+    req = _request_pending(broker_env)
+    receipt = Path(broker_env["DONNA_BROKER_RESPONSES_DIR"]) / f"{req['request_id']}.json"
+    receipt.write_text(
+        json.dumps({"request_id": req["request_id"], "decision": "deny"}),
+        encoding="utf-8",
+    )
+    code, resp = _run("app-approve", {"approval_code": req["code"]}, broker_env)
+    assert code == 0, resp
+    assert resp["status"] == "already_recorded"
+    assert resp["decision"] == "deny"
+    # Receipt is unchanged — still a deny.
+    assert json.loads(receipt.read_text(encoding="utf-8"))["decision"] == "deny"
+
+
+def test_app_approve_refuses_expired_window(broker_env):
+    """A pending row past its approval window is refused. approval_expires_at
+    is immutable once written, so we insert a fresh already-expired pending
+    row and call the handler directly — that path bypasses main()'s lazy
+    reconcile, isolating the handler's own belt-and-braces window check."""
+    from broker import requests_db as db
+
+    config = main._config_from_env(broker_env)
+    ctx = main._build_ctx(config, need_manifests=False)
+    now_ms = int(time.time() * 1000)
+    row = db.Request(
+        request_id="req-expired0001",
+        capability="puregym.book_class",
+        params_json="{}",
+        params_hash="x" * 64,
+        idempotency_key="idem-expired",
+        resolved_summary="expired test",
+        context_reason=None,
+        risk_level="medium",
+        state="pending_approval",
+        approval_code="EXPIRE",
+        approval_hmac="y" * 64,
+        created_at=now_ms - 10_000,
+        approval_expires_at=now_ms - 1_000,
+        execution_expires_at=None,
+        approved_at=None,
+        executed_at=None,
+        result_json=None,
+        error_code=None,
+        error_message=None,
+        prev_audit_hash=None,
+    )
+    db.insert_request(ctx["conn"], row)
+
+    with pytest.raises(main.BrokerError) as exc:
+        main._handle_app_approve({"approval_code": "EXPIRE"}, ctx)
+    assert exc.value.error_code == "expired"
+    # No receipt written for a refused approval.
+    receipt = Path(broker_env["DONNA_BROKER_RESPONSES_DIR"]) / "req-expired0001.json"
+    assert not receipt.exists()
+
+
 def test_execute_detects_params_hash_mismatch(broker_env):
     """Mutate params_json in SQLite directly → execute refuses + quarantines."""
     import sqlite3
@@ -1153,3 +1287,512 @@ def test_execute_reentry_from_executing_returns_handoff(broker_env):
         "status", {"request_id": req["request_id"]}, broker_env,
     )
     assert st["state"] == "executing"
+
+
+# ---- standing grants (broker-standing-grants §7) ------------------------
+
+
+@pytest.fixture
+def grants_env(tmp_path, broker_env):
+    """Extend broker_env with a high-risk gmail.send capability so grant
+    flows have a real capability to grant + auto-execute against."""
+    home = Path(broker_env["DONNA_BROKER_HOME"])
+
+    gmail_send_schema = {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "required": ["to", "subject", "body"],
+        "additionalProperties": False,
+        "properties": {
+            "to": {"type": "string"},
+            "subject": {"type": "string"},
+            "body": {"type": "string"},
+            "thread_id": {"type": "string"},
+        },
+    }
+    (home / "gmail_send.json").write_text(
+        json.dumps(gmail_send_schema), encoding="utf-8"
+    )
+
+    capabilities_yaml = home / "capabilities.yaml"
+    capabilities_yaml.write_text(f"""
+capabilities:
+  - name: gmail.create_draft
+    executor:
+      type: mcp_tool
+      tool: mcp__claude_ai_Gmail__create_draft
+    param_schema:
+      type: object
+      required: [to, subject, body]
+      additionalProperties: false
+      properties:
+        to: {{type: array, items: {{type: string}}, minItems: 1}}
+        subject: {{type: string}}
+        body: {{type: string}}
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: medium
+    revalidate:
+      not_applicable: stateless_write
+    idempotency_date_from: created_utc
+    approval_window_minutes: 60
+    execution_window_minutes: 30
+  - name: gmail.send
+    executor:
+      type: mcp_tool
+      tool: mcp__claude_ai_Gmail__send_message
+    param_schema:
+      $ref: ./gmail_send.json
+    params_exact_match_required: true
+    derived_fields_allowed: []
+    risk_level: high
+    revalidate:
+      not_applicable: stateless_write
+    idempotency_date_from: created_utc
+    approval_window_minutes: 1440
+    execution_window_minutes: 720
+""", encoding="utf-8")
+
+    mcp_yaml = home / "mcp-tools.yaml"
+    mcp_yaml.write_text("""
+tools:
+  mcp__claude_ai_Gmail__gmail_search_messages: low
+  mcp__claude_ai_Gmail__create_draft: medium
+  mcp__claude_ai_Gmail__send_message: high
+  mcp__plugin_playwright_playwright__browser_navigate: blocked
+""", encoding="utf-8")
+
+    return broker_env
+
+
+def _approve(env: dict[str, str], request_id: str, decision: str = "approve") -> None:
+    rf = Path(env["DONNA_BROKER_RESPONSES_DIR"]) / f"{request_id}.json"
+    rf.write_text(
+        json.dumps({"request_id": request_id, "decision": decision}),
+        encoding="utf-8",
+    )
+
+
+def _create_grant(
+    env: dict[str, str],
+    *,
+    to: str = "graham@example.com",
+    max_per_period: int = 1,
+    period_seconds: int = 604_800,
+    expires_in_days: int = 90,
+) -> str:
+    """grant-create → approve → execute; returns the grant_id."""
+    _, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {"to": to},
+            "purpose": "School roundup",
+            "max_per_period": max_per_period,
+            "period_seconds": period_seconds,
+            "expires_in_days": expires_in_days,
+        },
+        env,
+    )
+    assert resp["status"] == "approval_required", resp
+    _approve(env, resp["request_id"])
+    _, fin = _run("execute", {"approval_code": resp["code"]}, env)
+    assert fin["status"] == "succeeded", fin
+    return fin["grant_id"]
+
+
+def test_grant_create_returns_approval_required_not_persisted(grants_env):
+    """grant-create raises approval_required and does NOT persist a grant."""
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {"to": "graham@example.com"},
+            "purpose": "School roundup",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+            "expires_in_days": 90,
+        },
+        grants_env,
+    )
+    assert code == 0, resp
+    assert resp["status"] == "approval_required"
+    assert len(resp["code"]) == 6
+    assert resp["risk_level"] == "high"
+    assert resp["is_grant"] is True
+    # Full scope spelled out in the human summary.
+    assert "graham@example.com" in resp["summary"]
+    assert "90d" in resp["summary"]
+    assert "School roundup" in resp["summary"]
+    # No grant persisted yet.
+    _, listing = _run("grant-list", {}, grants_env)
+    assert listing["grants"] == []
+
+
+def test_grant_create_persists_only_on_execute(grants_env):
+    grant_id = _create_grant(grants_env)
+    _, listing = _run("grant-list", {}, grants_env)
+    assert len(listing["grants"]) == 1
+    g = listing["grants"][0]
+    assert g["grant_id"] == grant_id
+    assert g["capability"] == "gmail.send"
+    assert g["status"] == "active"
+    assert g["constraints"] == {"to": "graham@example.com"}
+
+
+def test_grant_create_gmail_send_requires_to(grants_env):
+    """§5: a gmail.send grant whose constraints omit `to` is rejected."""
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {"subject": {"prefix": "School"}},
+            "purpose": "x",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+        },
+        grants_env,
+    )
+    assert code == 1
+    assert resp["error_code"] == "invalid_constraints"
+
+
+def test_grant_create_rejects_overlong_expiry(grants_env):
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {"to": "g@x.com"},
+            "purpose": "x",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+            "expires_in_days": 400,
+        },
+        grants_env,
+    )
+    assert code == 1
+    assert resp["error_code"] == "invalid_input"
+
+
+def test_grant_create_unknown_capability(grants_env):
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "not.real",
+            "constraints": {"to": "g@x.com"},
+            "purpose": "x",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+        },
+        grants_env,
+    )
+    assert code == 1
+    assert resp["error_code"] == "unknown_capability"
+
+
+def test_gmail_send_matching_grant_auto_executes(grants_env):
+    """A gmail.send request matching an active grant auto-executes (no
+    approval) — returns executing + the mcp_tool handoff + via grant."""
+    grant_id = _create_grant(grants_env)
+    code, resp = _run(
+        "request",
+        {
+            "capability": "gmail.send",
+            "params": {
+                "to": "graham@example.com",
+                "subject": "School roundup — week 3",
+                "body": "the news",
+            },
+        },
+        grants_env,
+    )
+    assert code == 0, resp
+    assert resp["status"] == "executing"
+    assert resp["via"] == "standing_grant"
+    assert resp["grant_id"] == grant_id
+    assert resp["result"]["tool"] == "mcp__claude_ai_Gmail__send_message"
+
+
+def test_gmail_send_non_matching_to_falls_through_to_approval(grants_env):
+    """NON-NEGOTIABLE: a gmail.send whose `to` doesn't match the grant
+    falls through to approval_required — never auto-sent."""
+    _create_grant(grants_env, to="graham@example.com")
+    code, resp = _run(
+        "request",
+        {
+            "capability": "gmail.send",
+            "params": {
+                "to": "stranger@elsewhere.com",
+                "subject": "hi",
+                "body": "x",
+            },
+        },
+        grants_env,
+    )
+    assert code == 0, resp
+    assert resp["status"] == "approval_required"
+    assert resp.get("via") != "standing_grant"
+
+
+def test_gmail_send_rate_limit_second_within_window_needs_approval(grants_env):
+    """Rate limit: with max_per_period=1, the first send auto-executes,
+    the second within the window falls through to approval."""
+    _create_grant(grants_env, max_per_period=1)
+    p1 = {"to": "graham@example.com", "subject": "roundup 1", "body": "a"}
+    code1, r1 = _run("request", {"capability": "gmail.send", "params": p1}, grants_env)
+    assert r1["status"] == "executing", r1
+    # Different body so idempotency key differs (fresh request).
+    p2 = {"to": "graham@example.com", "subject": "roundup 2", "body": "b"}
+    code2, r2 = _run("request", {"capability": "gmail.send", "params": p2}, grants_env)
+    assert r2["status"] == "approval_required", r2
+
+
+def test_grant_revoke_always_allowed_and_audited(grants_env):
+    grant_id = _create_grant(grants_env)
+    code, resp = _run("grant-revoke", {"grant_id": grant_id}, grants_env)
+    assert code == 0, resp
+    assert resp["status"] == "revoked"
+    assert resp["grant_id"] == grant_id
+    # Audit recorded.
+    log = Path(grants_env["DONNA_BROKER_AUDIT_DIR"]) / "audit.log"
+    assert "grant.revoked" in log.read_text(encoding="utf-8")
+    # grant-list shows it revoked.
+    _, listing = _run("grant-list", {}, grants_env)
+    assert listing["grants"][0]["status"] == "revoked"
+
+
+def test_grant_revoke_no_manifest_needed(grants_env, tmp_path):
+    """Revoke must always work — even if the capabilities manifest is
+    broken (revocation only reduces privilege, §3.6)."""
+    grant_id = _create_grant(grants_env)
+    env = dict(grants_env)
+    env["DONNA_BROKER_CAPABILITIES"] = str(tmp_path / "nope.yaml")
+    code, resp = _run("grant-revoke", {"grant_id": grant_id}, env)
+    assert code == 0, resp
+    assert resp["status"] == "revoked"
+
+
+def test_revoked_grant_no_longer_auto_executes(grants_env):
+    grant_id = _create_grant(grants_env)
+    _run("grant-revoke", {"grant_id": grant_id}, grants_env)
+    code, resp = _run(
+        "request",
+        {
+            "capability": "gmail.send",
+            "params": {"to": "graham@example.com", "subject": "x", "body": "y"},
+        },
+        grants_env,
+    )
+    assert resp["status"] == "approval_required"
+
+
+def test_grant_revoke_unknown_grant(grants_env):
+    code, resp = _run("grant-revoke", {"grant_id": "nope"}, grants_env)
+    assert code == 1
+    assert resp["error_code"] == "not_found"
+
+
+def test_grant_create_never_authorised_by_a_grant(grants_env):
+    """NON-NEGOTIABLE §3.1: grant.create is never matched by any standing
+    grant. There is no manifest capability `grant.create`, and the policy
+    layer short-circuits it — so a grant-create always requires the human
+    approval code, never an auto-execute."""
+    # Even after a grant exists, grant-create still raises approval_required.
+    _create_grant(grants_env)
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {"to": "other@example.com"},
+            "purpose": "another",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+        },
+        grants_env,
+    )
+    assert resp["status"] == "approval_required"
+    assert resp["is_grant"] is True
+
+
+def test_grant_create_audits_proposed_and_created(grants_env):
+    _create_grant(grants_env)
+    log = (Path(grants_env["DONNA_BROKER_AUDIT_DIR"]) / "audit.log").read_text()
+    assert "grant.create.proposed" in log
+    assert "grant.created" in log
+
+
+def test_auto_exec_audits_policy_allow_standing_grant(grants_env):
+    _create_grant(grants_env)
+    _run(
+        "request",
+        {
+            "capability": "gmail.send",
+            "params": {"to": "graham@example.com", "subject": "r", "body": "b"},
+        },
+        grants_env,
+    )
+    log = (Path(grants_env["DONNA_BROKER_AUDIT_DIR"]) / "audit.log").read_text()
+    assert "policy.allow.standing_grant" in log
+
+
+def test_grant_modes_in_frozen_sets():
+    for m in ("grant-create", "grant-list", "grant-revoke"):
+        assert m in main.MODES
+        assert m in main.MODE_HANDLERS
+    assert "grant-create" in main.MODES_NEEDING_MANIFESTS
+
+
+def test_grant_list_empty(grants_env):
+    code, resp = _run("grant-list", {}, grants_env)
+    assert code == 0
+    assert resp["status"] == "ok"
+    assert resp["grants"] == []
+
+
+def test_grant_create_subject_prefix_in_summary(grants_env):
+    code, resp = _run(
+        "grant-create",
+        {
+            "capability": "gmail.send",
+            "constraints": {
+                "to": "graham@example.com",
+                "subject": {"prefix": "School roundup"},
+            },
+            "purpose": "weekly",
+            "max_per_period": 1,
+            "period_seconds": 604_800,
+        },
+        grants_env,
+    )
+    assert code == 0
+    assert "School roundup" in resp["summary"]
+
+
+# ---- list-packs (read-only pack summary) --------------------------------
+
+
+def _write_signed_pack(
+    pack_dir: Path, pack_id: str, capabilities: list[str], *, sign: bool
+) -> None:
+    """Write a minimal valid pack (meta.json + manifest.yaml + a schema) and,
+    if ``sign`` is set, a detached pack.sig from a freshly generated key."""
+    from broker import pack_format
+    from broker.tools import sign_pack
+
+    pack_dir.mkdir(parents=True)
+    meta = {
+        "pack_id": pack_id,
+        "version": 1,
+        "created_utc": "2026-06-15T00:00:00Z",
+        "description": f"Plain English summary for {pack_id}",
+        "capabilities": capabilities,
+    }
+    (pack_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    manifest_lines = ["capabilities:"]
+    for name in capabilities:
+        manifest_lines.append(f"  - name: {name}")
+    (pack_dir / "manifest.yaml").write_text(
+        "\n".join(manifest_lines) + "\n", encoding="utf-8"
+    )
+    schemas = pack_dir / "schemas"
+    schemas.mkdir()
+    (schemas / "params.json").write_text(
+        json.dumps({"type": "object"}), encoding="utf-8"
+    )
+
+    if sign:
+        priv_path = pack_dir.parent / f"{pack_id}.priv.hex"
+        sign_pack.keygen(str(priv_path))
+        sign_pack.sign(str(pack_dir), str(priv_path))
+        # Confirm pack_format now sees the signature.
+        assert pack_format.load_pack(str(pack_dir)).signature is not None
+
+
+def _list_packs_ctx(capabilities: list[str]) -> dict[str, Any]:
+    """Minimal ctx for _handle_list_packs: it only reads ctx['capabilities']
+    membership, so name->sentinel is enough (no requests DB)."""
+    return {"capabilities": {name: object() for name in capabilities}}
+
+
+def test_list_packs_registered_everywhere():
+    assert "list-packs" in main.MODES
+    assert "list-packs" in main.MODE_HANDLERS
+    assert "list-packs" in main.MODES_NEEDING_MANIFESTS
+    assert "list-packs" in main.MODES_WITH_STARTUP_SWEEP
+
+
+def test_list_packs_summary_shape_and_hash(tmp_path):
+    from broker import pack_format
+
+    packs_dir = tmp_path / "available"
+    packs_dir.mkdir()
+    pack_dir = packs_dir / "demo-pack"
+    _write_signed_pack(pack_dir, "demo-pack", ["demo.thing"], sign=True)
+
+    ctx = _list_packs_ctx([])  # cap absent -> not installed
+    resp = main._handle_list_packs({"packs_dir": str(packs_dir)}, ctx)
+
+    assert resp["status"] == "ok"
+    assert len(resp["packs"]) == 1
+    entry = resp["packs"][0]
+    assert entry["pack_id"] == "demo-pack"
+    assert entry["description"] == "Plain English summary for demo-pack"
+    assert entry["capabilities"] == ["demo.thing"]
+    assert entry["signed"] is True
+    assert entry["installed"] is False
+    assert "error" not in entry
+
+    expected_hash = pack_format.pack_hash(pack_format.load_pack(str(pack_dir)))
+    assert entry["pack_hash"] == expected_hash
+
+
+def test_list_packs_installed_flips_when_cap_present(tmp_path):
+    packs_dir = tmp_path / "available"
+    packs_dir.mkdir()
+    _write_signed_pack(packs_dir / "demo-pack", "demo-pack", ["demo.thing"],
+                       sign=True)
+
+    # Cap present in the live manifest -> installed True.
+    ctx = _list_packs_ctx(["demo.thing"])
+    resp = main._handle_list_packs({"packs_dir": str(packs_dir)}, ctx)
+    assert resp["packs"][0]["installed"] is True
+
+
+def test_list_packs_unsigned_pack(tmp_path):
+    packs_dir = tmp_path / "available"
+    packs_dir.mkdir()
+    _write_signed_pack(packs_dir / "bare", "bare", ["x.y"], sign=False)
+
+    resp = main._handle_list_packs(
+        {"packs_dir": str(packs_dir)}, _list_packs_ctx([])
+    )
+    assert resp["packs"][0]["signed"] is False
+
+
+def test_list_packs_malformed_pack_does_not_crash(tmp_path):
+    packs_dir = tmp_path / "available"
+    packs_dir.mkdir()
+    _write_signed_pack(packs_dir / "good", "good", ["a.b"], sign=True)
+    # Malformed: a dir with no meta.json.
+    (packs_dir / "broken").mkdir()
+    (packs_dir / "broken" / "manifest.yaml").write_text(
+        "capabilities: []\n", encoding="utf-8"
+    )
+
+    resp = main._handle_list_packs(
+        {"packs_dir": str(packs_dir)}, _list_packs_ctx([])
+    )
+    by_id = {p["pack_id"]: p for p in resp["packs"]}
+    assert by_id["good"]["signed"] is True
+    assert "error" in by_id["broken"]
+    assert by_id["broken"]["installed"] is False
+    assert "error" not in by_id["good"]
+    # Sorted by pack_id for determinism.
+    assert [p["pack_id"] for p in resp["packs"]] == ["broken", "good"]
+
+
+def test_list_packs_missing_dir_returns_empty(tmp_path):
+    resp = main._handle_list_packs(
+        {"packs_dir": str(tmp_path / "nope")}, _list_packs_ctx([])
+    )
+    assert resp == {"status": "ok", "packs": []}

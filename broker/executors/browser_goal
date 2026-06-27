@@ -1,0 +1,623 @@
+#!/Users/donna-broker/venv/bin/python3
+"""General, site-agnostic browser-goal executor.
+
+# UNVERIFIED in CI — live Playwright/login only runs in the donna-broker
+# browser env. Pure helpers are unit-tested.
+
+Subprocess contract: reads JSON {capability, params} from stdin, credentials
+from the DONNA_CREDS_FD pipe, writes JSON result to stdout.
+Exit 0 = success/done/planned, exit 1 = failure {error_code, detail}.
+
+Params schema:
+  site           — profile key, e.g. "everyoneactive"
+  goal           — plain-English goal string
+  phase          — "plan" or "execute"
+  max_price      — optional int (pence) for pricing gate
+  commit_token   — optional str, live human-approved commit token
+  plan_summary   — optional str, context from a prior plan phase
+
+Security invariants enforced here:
+  - Site credentials are read from the broker fd and stored only in the
+    _PlaywrightBrowser adapter. They are NEVER passed to the model; the
+    agent receives {{cred:username}} / {{cred:password}} placeholders
+    which the adapter substitutes at execute time.
+  - The network-layer route handler (context.route) enforces the
+    allowlist from the site profile (invariant 5).
+  - The gate (browser_gate.Gate) is the commit-token authority; the
+    runner consults it before every action.
+  - Secrets never enter the ledger (browser_ledger.Ledger scrubs
+    credential placeholders before writing).
+
+Design: docs/superpowers/specs/browser-goal-agent-plan2.md
+Spec: security-v1.1 §8 (capability executor), §17 (Phase 2 browser executor).
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+import time
+import uuid
+from pathlib import Path
+
+# Broker pure modules — no Playwright, no browser; safe to import at top level.
+from broker import browser_agent
+from broker import browser_gate
+from broker import browser_ledger
+from broker import browser_nav
+from broker import browser_profile
+from broker import browser_runner
+from broker import browser_sanitise
+from broker import browser_token
+
+# NOTE: mypy on this file (an executable without .py extension) is awkward; it
+# is excluded from the mypy gate by convention (same as the other executors).
+# The pure helpers below are covered by tests/test_browser_goal_executor.py.
+
+# ---------------------------------------------------------------------------
+# Pure helpers — importable and testable WITHOUT Playwright installed.
+# ---------------------------------------------------------------------------
+
+def fail(error_code: str, detail: str) -> None:
+    """Write a structured failure envelope to stdout and exit 1."""
+    json.dump({"error_code": error_code, "detail": detail}, sys.stdout)
+    sys.stdout.flush()
+    sys.exit(1)
+
+
+def _accessibility_to_snapshot(url: str, raw_nodes: list) -> dict:
+    """Convert a list of accessibility/DOM node dicts to a normalised snapshot dict.
+
+    Pure — no browser interaction. Used by _PlaywrightBrowser.snapshot() and
+    directly unit-tested in tests/test_browser_goal_executor.py.
+
+    Each node in raw_nodes may contain: ref, role, name, tag, editable.
+    Missing refs are assigned stable enumerated ids.
+    """
+    nodes = []
+    for i, node in enumerate(raw_nodes or []):
+        ref = str(node.get("ref") or "").strip() or f"n{i}"
+        nodes.append({
+            "ref": ref,
+            "role": str(node.get("role") or "generic"),
+            "name": str(node.get("name") or ""),
+            "tag": str(node.get("tag") or ""),
+            "editable": bool(node.get("editable")),
+        })
+    return {"url": url, "nodes": nodes}
+
+
+def read_params() -> dict:
+    """Read JSON {capability, params} from stdin; return the inner params dict."""
+    request = json.load(sys.stdin)
+    return request["params"]
+
+
+def read_creds() -> dict:
+    """Read decrypted credential bytes from the DONNA_CREDS_FD pipe.
+
+    The fd number is in the DONNA_CREDS_FD env var, set by the broker before
+    exec. Credentials never touch Donna's context — they live only here, in the
+    executor subprocess, from this read until the fd is closed.
+    """
+    fd_str = os.environ.get("DONNA_CREDS_FD")
+    if fd_str is None:
+        fail("login_failed", "DONNA_CREDS_FD not set")
+    fd = int(fd_str)
+    data = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        data += chunk
+    os.close(fd)
+    return json.loads(data)
+
+
+def _load_profile(site: str) -> browser_profile.SiteProfile:
+    """Load and validate the site profile JSON from manifests/profiles/<site>.json.
+
+    Raises SystemExit (via fail()) if the file is missing or the profile is
+    malformed (fail-closed).
+    """
+    profiles_dir = Path(__file__).resolve().parents[1] / "manifests" / "profiles"
+    profile_path = profiles_dir / f"{site}.json"
+    if not profile_path.exists():
+        fail("profile_not_found",
+             f"no profile at manifests/profiles/{site}.json — "
+             f"add the site profile before running this executor")
+    try:
+        raw = json.loads(profile_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        fail("profile_not_found", f"could not parse site profile: {exc}")
+    try:
+        return browser_profile.load(raw)
+    except browser_profile.ProfileError as exc:
+        fail("profile_not_found", f"site profile validation failed: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# _PlaywrightBrowser — the live adapter. Playwright import is INSIDE this class
+# so the module can be imported without Playwright for the pure-helper tests.
+# ---------------------------------------------------------------------------
+
+class _PlaywrightBrowser:
+    """Playwright adapter implementing the BrowserLike protocol (browser_runner).
+
+    Invariants:
+      - context.route handler aborts any request whose URL fails the allowlist
+        (invariant 5, network layer).
+      - Under network_strictness == "hard_abort", also aborts non-idempotent
+        requests (POST/PUT/PATCH/DELETE) unless a commit token is live.
+        Under "monitor", those requests are allowed (best-effort; the gate is
+        the primary commit-token authority).
+      - Credential substitution for {{cred:*}} placeholders happens HERE in
+        execute(), not in the agent. The agent receives placeholder strings and
+        never sees the real secret.
+    """
+
+    _CRED = re.compile(r"\{\{cred:(username|password)\}\}")
+    _MUTATING_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+
+    def __init__(self, page, context, allowlist: tuple, strictness: str,
+                 creds: dict) -> None:
+        self._page = page
+        self._context = context
+        self._allowlist = allowlist
+        self._strictness = strictness
+        self._creds = creds
+        # Install the network-layer allowlist filter.
+        context.route("**/*", self._route_handler)
+
+    def _route_handler(self, route) -> None:
+        """Abort off-allowlist requests and (under hard_abort) unguarded mutations."""
+        try:
+            url = route.request.url
+            method = (route.request.method or "GET").upper()
+
+            if not browser_nav.is_allowed(url, self._allowlist):
+                route.abort()
+                return
+
+            if (self._strictness == "hard_abort"
+                    and method in self._MUTATING_METHODS):
+                # No commit-token tracking here — the gate is the authority.
+                # Under hard_abort we are conservative: abort mutations that
+                # weren't preceded by an explicit gate-approved execute().
+                # This is best-effort; the gate already refuses committing
+                # actions without a token before execute() is called.
+                route.abort()
+                return
+
+            route.continue_()
+        except Exception:
+            # Playwright aborts automatically if we don't respond; play safe.
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    def snapshot(self) -> dict:
+        """Return a normalised snapshot of the current page's accessibility tree."""
+        url = self._page.url
+        try:
+            # Playwright's accessibility snapshot returns a tree; we flatten it.
+            raw_tree = self._page.accessibility.snapshot()
+            raw_nodes = self._flatten_tree(raw_tree or {})
+        except Exception:
+            raw_nodes = []
+
+        # Augment with interactable elements for fuller coverage.
+        try:
+            interactable = self._page.query_selector_all(
+                "a[href], button, input, select, textarea, [role='button'], "
+                "[role='link'], [role='textbox'], [role='checkbox']"
+            )
+            seen_refs = {n.get("ref") for n in raw_nodes if n.get("ref")}
+            for i, el in enumerate(interactable):
+                role = (el.get_attribute("role") or el.evaluate(
+                    "el => el.tagName.toLowerCase()") or "element")
+                name = (el.get_attribute("aria-label")
+                        or el.get_attribute("placeholder")
+                        or el.text_content()
+                        or el.get_attribute("value")
+                        or "")
+                tag = el.evaluate("el => el.tagName.toLowerCase()") or ""
+                editable = tag in ("input", "textarea", "select") or bool(
+                    el.get_attribute("contenteditable"))
+                ref = f"el{i}"
+                if ref not in seen_refs:
+                    raw_nodes.append({
+                        "ref": ref,
+                        "role": str(role),
+                        "name": str(name).strip()[:200],
+                        "tag": str(tag),
+                        "editable": editable,
+                    })
+                    seen_refs.add(ref)
+        except Exception:
+            pass
+
+        return _accessibility_to_snapshot(url, raw_nodes)
+
+    @staticmethod
+    def _flatten_tree(node: dict, depth: int = 0, out: list | None = None,
+                      counter: list | None = None) -> list:
+        """Recursively flatten an accessibility tree into a list of node dicts."""
+        if out is None:
+            out = []
+        if counter is None:
+            counter = [0]
+        if not isinstance(node, dict):
+            return out
+        role = str(node.get("role") or "")
+        name = str(node.get("name") or "")
+        if role and role not in ("RootWebArea", "WebArea", "none", "generic"):
+            ref = f"a{counter[0]}"
+            counter[0] += 1
+            out.append({
+                "ref": ref,
+                "role": role,
+                "name": name,
+                "tag": "",
+                "editable": role.lower() in ("textbox", "searchbox", "spinbutton",
+                                              "combobox"),
+            })
+        for child in node.get("children") or []:
+            _PlaywrightBrowser._flatten_tree(child, depth + 1, out, counter)
+        return out
+
+    def execute(self, action: dict) -> None:
+        """Execute a gate-approved action on the live page.
+
+        Dispatches:
+          navigate — page.goto the resolved URL (gate already validated it)
+          click    — click the element for action["ref"]
+          type     — fill the element; {{cred:*}} is substituted HERE from
+                     the fd creds — the ONLY place the real secret exists.
+
+        read/done/give_up actions are no-ops for the browser layer (handled
+        by the runner's state machine).
+        """
+        kind = action.get("kind")
+
+        if kind == "navigate":
+            url = str(action.get("url") or "")
+            try:
+                self._page.goto(url, timeout=30000)
+                self._page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception as exc:
+                fail("navigation_failed", f"navigate to {url!r}: {type(exc).__name__}: {exc}")
+
+        elif kind == "click":
+            ref = str(action.get("ref") or "")
+            el = self._find_element(ref)
+            if el is None:
+                fail("unexpected_dom", f"click target {ref!r} not found on page")
+            try:
+                el.click(timeout=10000)
+                self._page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception as exc:
+                fail("unexpected_dom", f"click {ref!r}: {type(exc).__name__}: {exc}")
+
+        elif kind == "type":
+            ref = str(action.get("ref") or "")
+            raw_text = str(action.get("text") or "")
+            # Substitute credential placeholders — real secret lives ONLY here.
+            real_text = self._CRED.sub(
+                lambda m: self._creds.get(m.group(1), ""), raw_text
+            )
+            el = self._find_element(ref)
+            if el is None:
+                fail("unexpected_dom", f"type target {ref!r} not found on page")
+            try:
+                el.fill(real_text, timeout=10000)
+            except Exception as exc:
+                fail("unexpected_dom", f"type {ref!r}: {type(exc).__name__}: {exc}")
+
+        # read / done / give_up — no browser action needed; runner handles them.
+
+    def _find_element(self, ref: str):
+        """Locate the live page element matching a ref from our last snapshot.
+
+        Accessibility-tree refs (a0, a1, …) are matched by position via a
+        fresh flatten; element refs (el0, el1, …) are matched by index in the
+        interactable query. Returns None if not found.
+        """
+        try:
+            if ref.startswith("a"):
+                idx = int(ref[1:])
+                raw_tree = self._page.accessibility.snapshot()
+                flat = self._flatten_tree(raw_tree or {})
+                if idx < len(flat):
+                    # Best-effort: locate by name/role using Playwright's
+                    # getBy helpers; fall back to CSS selector.
+                    node = flat[idx]
+                    name = node.get("name", "")
+                    role = node.get("role", "")
+                    if name:
+                        try:
+                            return self._page.get_by_role(
+                                role.lower(), name=name).first
+                        except Exception:
+                            pass
+            elif ref.startswith("el"):
+                idx = int(ref[2:])
+                els = self._page.query_selector_all(
+                    "a[href], button, input, select, textarea, [role='button'], "
+                    "[role='link'], [role='textbox'], [role='checkbox']"
+                )
+                if idx < len(els):
+                    return els[idx]
+        except Exception:
+            pass
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Success indicator checking (login gate)
+# ---------------------------------------------------------------------------
+
+def _check_success_indicators(page, indicators: tuple) -> bool:
+    """Return True iff at least one success indicator from the profile holds."""
+    for ind in indicators:
+        try:
+            kind = ind.get("type")
+            if kind == "url_pattern":
+                pattern = str(ind.get("value") or "")
+                import fnmatch
+                if fnmatch.fnmatch(page.url, pattern):
+                    return True
+            elif kind == "element":
+                selector = str(ind.get("value") or "")
+                if selector and page.query_selector(selector):
+                    return True
+            elif kind == "cookie":
+                name = str(ind.get("value") or "")
+                cookies = page.context.cookies()
+                if any(c.get("name") == name for c in cookies):
+                    return True
+        except Exception:
+            continue
+    return False
+
+
+# ---------------------------------------------------------------------------
+# headless claude -p complete function (UNVERIFIED until deploy)
+# ---------------------------------------------------------------------------
+
+def _make_complete(run_id: str):
+    """Return a `complete(system, user) -> str` function backed by `claude -p`.
+
+    Uses haiku tier (fast/cheap for browser step decisions). Falls back to a
+    safe give_up action string on ANY failure — the agent handles malformed
+    output gracefully.
+
+    UNVERIFIED: requires `claude` binary on PATH in the donna-broker env and
+    a valid Anthropic API key. Not exercised in CI.
+    """
+    def _complete(system: str, user: str) -> str:
+        prompt = f"{system}\n\n{user}"
+        try:
+            result = subprocess.run(
+                ["claude", "-p", prompt,
+                 "--output-format", "json",
+                 "--model", "claude-haiku-4-5",
+                 "--allowedTools", ""],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                cwd="/tmp",
+            )
+            if result.returncode != 0:
+                return json.dumps({"kind": "give_up",
+                                   "reason": f"claude exit {result.returncode}"})
+            outer = json.loads(result.stdout)
+            if not isinstance(outer, dict) or outer.get("is_error"):
+                return json.dumps({"kind": "give_up", "reason": "claude error response"})
+            return str(outer.get("result") or "").strip()
+        except Exception as exc:
+            return json.dumps({"kind": "give_up",
+                                "reason": f"claude invocation failed: {type(exc).__name__}: {exc}"})
+
+    return _complete
+
+
+# ---------------------------------------------------------------------------
+# main — the live path. Playwright import lives HERE so module-level import
+# never requires Playwright (enabling the pure-helper tests).
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    params = read_params()
+    creds = read_creds()
+
+    site = str(params.get("site") or "").strip()
+    goal = str(params.get("goal") or "").strip()
+    phase = str(params.get("phase") or "plan").strip()
+    max_price = params.get("max_price")          # optional int (pence)
+    commit_token = params.get("commit_token")    # optional str
+    # plan_summary is available for context but the agent sees it via goal.
+    plan_summary = params.get("plan_summary", "")
+
+    if not site:
+        fail("bad_params", "params.site is required")
+    if not goal:
+        fail("bad_params", "params.goal is required")
+    if phase not in ("plan", "execute"):
+        fail("bad_params", f"params.phase must be 'plan' or 'execute', got {phase!r}")
+
+    # If a plan summary exists, prepend it to the goal so the execute phase
+    # has the context from the recon phase.
+    effective_goal = goal
+    if plan_summary:
+        effective_goal = f"{goal}\n\n[Plan context: {plan_summary}]"
+
+    # Load site profile (fail-closed: exits if missing/malformed).
+    profile = _load_profile(site)
+
+    # Import Playwright HERE — not at module top-level.
+    from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout  # noqa: PLC0415
+
+    run_id = str(uuid.uuid4())
+    run_dir = Path(os.environ.get("DONNA_RUN_DIR", "/tmp")) / f"browser_goal_{run_id}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ledger_path = run_dir / "ledger.jsonl"
+
+    now = time.monotonic
+
+    ledger = browser_ledger.Ledger(ledger_path, run_id, now)
+    ledger.run_header(
+        site=site,
+        goal=effective_goal,
+        caps={"phase": phase,
+              "max_price": max_price,
+              "commit_token_provided": bool(commit_token)},
+    )
+
+    try:
+        pw = sync_playwright().start()
+    except Exception as exc:
+        fail("browser_launch", f"playwright_init: {type(exc).__name__}: {exc}")
+
+    try:
+        browser = pw.chromium.launch(
+            headless=True, channel="chromium-headless-shell"
+        )
+    except Exception as exc:
+        pw.stop()
+        fail("browser_launch", f"browser_launch: {type(exc).__name__}: {exc}")
+
+    context = browser.new_context(viewport={"width": 1280, "height": 900})
+    page = context.new_page()
+
+    try:
+        # Build the adapter. The allowlist and creds live inside it.
+        adapter = _PlaywrightBrowser(
+            page=page,
+            context=context,
+            allowlist=profile.allowlist,
+            strictness=profile.network_strictness,
+            creds=creds,
+        )
+
+        # --- Login ---
+        try:
+            page.goto(profile.login_url, timeout=30000)
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception as exc:
+            fail("site_unavailable",
+                 f"login page {profile.login_url!r} did not load: "
+                 f"{type(exc).__name__}: {exc}")
+
+        # Credential injection: the agent will navigate to the login page and
+        # issue type actions with {{cred:username}}/{{cred:password}}.
+        # The adapter's execute() substitutes the real values.
+        # Here we check success_indicators to know when login has succeeded;
+        # the agent drives the actual login steps.
+        #
+        # Run a short "login" phase first — max 15 actions, goal = "log in".
+        login_goal = (
+            f"Log in to {profile.login_url}. "
+            f"You are already on the login page. "
+            f"Find the username/email field and fill it with {{{{cred:username}}}}. "
+            f"Find the password field and fill it with {{{{cred:password}}}}. "
+            f"Submit the form. "
+            f"Stop (done) when you see evidence of a successful login."
+        )
+
+        login_agent = browser_agent.Agent(
+            goal=login_goal,
+            phase="execute",
+            complete=_make_complete(run_id),
+        )
+        login_tokens = browser_token.TokenStore(now=now)
+        login_gate = browser_gate.Gate(
+            profile=profile,
+            tokens=login_tokens,
+            creds=creds,
+            phase="execute",
+        )
+        login_ledger = browser_ledger.Ledger(
+            run_dir / "login_ledger.jsonl", run_id + "_login", now
+        )
+        login_ledger.run_header(site=site, goal=login_goal,
+                                caps={"phase": "execute", "login": True})
+
+        login_result = browser_runner.run(
+            browser=adapter,
+            agent=login_agent,
+            the_gate=login_gate,
+            ledger=login_ledger,
+            phase="execute",
+            max_actions=20,
+            commit_token=None,
+        )
+
+        # Verify success indicators regardless of agent's self-report.
+        if not _check_success_indicators(page, profile.success_indicators):
+            # Agent thinks it's done but indicators don't hold.
+            login_status = login_result.get("status", "")
+            if login_status not in ("done",):
+                fail("login_failed",
+                     f"login agent ended with status={login_status!r}; "
+                     f"no success indicator matched on {page.url!r}")
+            # Even if agent said "done", check page state.
+            fail("login_failed",
+                 f"login completed but no success indicator matched on {page.url!r} "
+                 f"— credentials may be wrong or the site changed")
+
+        # --- Goal phase (plan or execute) ---
+        tokens = browser_token.TokenStore(now=now)
+        gate = browser_gate.Gate(
+            profile=profile,
+            tokens=tokens,
+            creds=creds,
+            phase=phase,
+        )
+        agent = browser_agent.Agent(
+            goal=effective_goal,
+            phase=phase,
+            complete=_make_complete(run_id),
+        )
+
+        # Action cap: plan phase is read-only (lower), execute phase allows more.
+        max_actions = 30 if phase == "execute" else 20
+
+        result = browser_runner.run(
+            browser=adapter,
+            agent=agent,
+            the_gate=gate,
+            ledger=ledger,
+            phase=phase,
+            max_actions=max_actions,
+            commit_token=commit_token,
+        )
+
+        json.dump(result, sys.stdout)
+        sys.stdout.flush()
+
+    except SystemExit:
+        raise
+    except Exception as exc:
+        fail("unexpected_error", f"{type(exc).__name__}: {exc}")
+    finally:
+        try:
+            context.close()
+        except Exception:
+            pass
+        try:
+            browser.close()
+        except Exception:
+            pass
+        try:
+            pw.stop()
+        except Exception:
+            pass
+
+
+if __name__ == "__main__":
+    main()
