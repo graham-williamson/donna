@@ -356,6 +356,140 @@ def test_execute_unknown_code(broker_env):
     assert resp["error_code"] == "not_found"
 
 
+# ---- in-app approval (inapp-approval-broker-handoff, Option B) ----------
+
+
+def _request_pending(
+    broker_env: dict[str, str], date: str = "2026-04-21"
+) -> dict[str, Any]:
+    _, req_resp = _run(
+        "request",
+        {
+            "capability": "puregym.book_class",
+            "params": {"class_id": "hiit", "date": date},
+        },
+        broker_env,
+    )
+    return req_resp
+
+
+def test_app_approve_records_proof_then_execute_runs(broker_env):
+    """The full app flow: execute → approval_required → app-approve →
+    execute → succeeded. The in-app tap stands in for the Telegram tap."""
+    req = _request_pending(broker_env)
+
+    # execute before any proof-of-human → approval_required.
+    _, pre = _run("execute", {"approval_code": req["code"]}, broker_env)
+    assert pre["status"] == "approval_required"
+
+    # In-app human tap records the proof-of-human.
+    code, resp = _run("app-approve", {"approval_code": req["code"]}, broker_env)
+    assert code == 0, resp
+    assert resp["status"] == "approved"
+    assert resp["state"] == "approved"
+
+    # Receipt is written with channel="app".
+    receipt = Path(broker_env["DONNA_BROKER_RESPONSES_DIR"]) / f"{req['request_id']}.json"
+    assert receipt.exists()
+    body = json.loads(receipt.read_text(encoding="utf-8"))
+    assert body["decision"] == "approve"
+    assert body["channel"] == "app"
+
+    # Audit trail carries the distinct in-app event.
+    audit_text = "".join(
+        p.read_text(encoding="utf-8")
+        for p in Path(broker_env["DONNA_BROKER_AUDIT_DIR"]).glob("*")
+        if p.is_file()
+    )
+    assert "request_approved_in_app" in audit_text
+
+    # Now execute runs the capability for real.
+    code, resp = _run("execute", {"approval_code": req["code"]}, broker_env)
+    assert code == 0, resp
+    assert resp["status"] == "succeeded"
+    assert resp["result"] == {"confirmation": "PG-12345"}
+
+
+def test_app_approve_requires_code(broker_env):
+    code, resp = _run("app-approve", {}, broker_env)
+    assert code == 1
+    assert resp["error_code"] == "invalid_input"
+
+
+def test_app_approve_unknown_code(broker_env):
+    code, resp = _run("app-approve", {"approval_code": "NOSUCH"}, broker_env)
+    assert code == 1
+    assert resp["error_code"] == "not_found"
+
+
+def test_app_approve_is_idempotent_on_already_approved(broker_env):
+    req = _request_pending(broker_env)
+    _run("app-approve", {"approval_code": req["code"]}, broker_env)
+    # Second tap, now post-execute the row would be terminal, so approve
+    # again while still pre-execute: state stays approvable and returns ok.
+    code, resp = _run("app-approve", {"approval_code": req["code"]}, broker_env)
+    assert code == 0, resp
+    assert resp["status"] == "approved"
+
+
+def test_app_approve_does_not_overwrite_existing_deny(broker_env):
+    """An app tap must not flip a decision already recorded out-of-band."""
+    req = _request_pending(broker_env)
+    receipt = Path(broker_env["DONNA_BROKER_RESPONSES_DIR"]) / f"{req['request_id']}.json"
+    receipt.write_text(
+        json.dumps({"request_id": req["request_id"], "decision": "deny"}),
+        encoding="utf-8",
+    )
+    code, resp = _run("app-approve", {"approval_code": req["code"]}, broker_env)
+    assert code == 0, resp
+    assert resp["status"] == "already_recorded"
+    assert resp["decision"] == "deny"
+    # Receipt is unchanged — still a deny.
+    assert json.loads(receipt.read_text(encoding="utf-8"))["decision"] == "deny"
+
+
+def test_app_approve_refuses_expired_window(broker_env):
+    """A pending row past its approval window is refused. approval_expires_at
+    is immutable once written, so we insert a fresh already-expired pending
+    row and call the handler directly — that path bypasses main()'s lazy
+    reconcile, isolating the handler's own belt-and-braces window check."""
+    from broker import requests_db as db
+
+    config = main._config_from_env(broker_env)
+    ctx = main._build_ctx(config, need_manifests=False)
+    now_ms = int(time.time() * 1000)
+    row = db.Request(
+        request_id="req-expired0001",
+        capability="puregym.book_class",
+        params_json="{}",
+        params_hash="x" * 64,
+        idempotency_key="idem-expired",
+        resolved_summary="expired test",
+        context_reason=None,
+        risk_level="medium",
+        state="pending_approval",
+        approval_code="EXPIRE",
+        approval_hmac="y" * 64,
+        created_at=now_ms - 10_000,
+        approval_expires_at=now_ms - 1_000,
+        execution_expires_at=None,
+        approved_at=None,
+        executed_at=None,
+        result_json=None,
+        error_code=None,
+        error_message=None,
+        prev_audit_hash=None,
+    )
+    db.insert_request(ctx["conn"], row)
+
+    with pytest.raises(main.BrokerError) as exc:
+        main._handle_app_approve({"approval_code": "EXPIRE"}, ctx)
+    assert exc.value.error_code == "expired"
+    # No receipt written for a refused approval.
+    receipt = Path(broker_env["DONNA_BROKER_RESPONSES_DIR"]) / "req-expired0001.json"
+    assert not receipt.exists()
+
+
 def test_execute_detects_params_hash_mismatch(broker_env):
     """Mutate params_json in SQLite directly → execute refuses + quarantines."""
     import sqlite3

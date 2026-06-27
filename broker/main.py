@@ -53,6 +53,9 @@ MODES = frozenset({
     # Connected Sites (docs/connected-sites-broker-handoff.md): the app
     # hands a site login straight to the vault / probes a stored login.
     "store-credential", "site-check",
+    # In-app approval (docs/inapp-approval-broker-handoff.md, master-design
+    # Option B): the app's human-tap records a proof-of-human approval.
+    "app-approve",
 })
 
 # site-check probe binaries, keyed by site slug (= vault entry name).
@@ -1356,6 +1359,129 @@ def _handle_site_check(
     }
 
 
+# ---- in-app approval mode (inapp-approval-broker-handoff, Option B) ------
+
+
+def _write_approval_response(
+    responses_dir: str, request_id: str, channel: str, approved_by: str
+) -> str:
+    """Record a proof-of-human approval receipt — byte-for-byte the same
+    receipt the Telegram daemon writes (claude-telegram-hardened
+    donna_broker.ts `writeApprovalResponse`), so the existing `execute`
+    path consumes it unchanged. The extra `channel` field marks the
+    proof-of-human source ("app" vs "telegram") for the audit trail;
+    `execute` only reads `decision`, so the superset is harmless.
+
+    Atomic .tmp → rename so `execute` never reads a half-written file."""
+    Path(responses_dir).mkdir(parents=True, exist_ok=True)
+    receipt = {
+        "request_id": request_id,
+        "decision": "approve",
+        "approved_by": approved_by,
+        "channel": channel,
+        "responded_at": int(time.time() * 1000),
+    }
+    tmp = Path(responses_dir) / f"{request_id}.json.tmp"
+    final = Path(responses_dir) / f"{request_id}.json"
+    tmp.write_text(json.dumps(receipt), encoding="utf-8")
+    os.replace(tmp, final)
+    return str(final)
+
+
+def _handle_app_approve(
+    payload: dict[str, Any], ctx: dict[str, Any]
+) -> dict[str, Any]:
+    """Record an IN-APP proof-of-human approval (master-design Option B,
+    docs/inapp-approval-broker-handoff.md).
+
+    The Daru app's human-tap endpoint calls this when `execute` reports
+    `approval_required`. It records the SAME proof-of-human receipt the
+    Telegram daemon would write — just sourced from the app — and the app
+    then retries `execute`, which owns the HMAC-bound
+    pending_approval → approved → executing transition. We deliberately do
+    NOT duplicate that transition (or its HMAC) here: `execute` stays the
+    single source of truth for state changes, exactly as on the Telegram
+    path. This handler's only effect is the receipt + a distinct audit
+    line, so it needs neither the manifest nor the HMAC key.
+
+    SECURITY — this is the proof-of-human gate (see CLAUDE.md §Security):
+      - The broker CANNOT distinguish the app caller from Donna (the LLM):
+        both reach the donna-broker CLI as the same OS user. What keeps the
+        LLM from self-approving is that `app-approve` is DELIBERATELY absent
+        from the PreToolUse hook's BROKER_MODES allowlist
+        (hooks/capability-guard-phase1.py) — the same defence-by-omission
+        that protects store-credential / site-check / grant-*. If this mode
+        is ever added to that allowlist the proof-of-human gate collapses.
+        Do not add it.
+      - Only active rows within the approval window are addressable:
+        terminal/expired codes already return None from
+        get_by_approval_code (and lazy reconcile sweeps expired pending
+        rows before dispatch); we re-check the window here belt-and-braces.
+      - An existing receipt is never overwritten — an app tap cannot flip a
+        decision already recorded (e.g. a Telegram deny).
+      - Each in-app approval is audited as `request_approved_in_app` with
+        channel="app", distinct from the Telegram trail.
+    """
+    code = payload.get("approval_code")
+    if not isinstance(code, str) or not code:
+        raise BrokerError("invalid_input", "approval_code required")
+
+    conn = ctx["conn"]
+    row = db.get_by_approval_code(conn, code)
+    if row is None:
+        # Unknown, expired, or terminal codes are not addressable by code.
+        raise BrokerError(
+            "not_found", f"no active request with code {code!r}",
+            status="not_found",
+        )
+
+    # The proof-of-human is already recorded once the row has moved past
+    # pending_approval (a prior tap, or a Telegram approval). Report the
+    # current state idempotently rather than re-writing the receipt.
+    if row.state in {"approved", "executing"}:
+        return {"status": "approved", "state": row.state}
+
+    # Honour the approval window explicitly (defence in depth — lazy
+    # reconcile already expires stale pending rows before dispatch).
+    now_ms = int(time.time() * 1000)
+    if row.approval_expires_at < now_ms:
+        raise BrokerError(
+            "expired",
+            f"approval window for code {code!r} has closed",
+            status="expired",
+        )
+
+    # Never overwrite an existing receipt: an app tap must not be able to
+    # flip a decision already recorded out-of-band (e.g. a Telegram deny).
+    existing = Path(ctx["responses_dir"]) / f"{row.request_id}.json"
+    if existing.exists():
+        try:
+            prior_decision = json.loads(
+                existing.read_text(encoding="utf-8")
+            ).get("decision")
+        except Exception:
+            prior_decision = None
+        if prior_decision == "approve":
+            return {"status": "approved", "state": row.state}
+        return {
+            "status": "already_recorded",
+            "state": row.state,
+            "decision": prior_decision,
+        }
+
+    _write_approval_response(
+        ctx["responses_dir"], row.request_id,
+        channel="app", approved_by="app",
+    )
+    audit_mod.write_event(ctx["audit_dir"], {
+        "event": "request_approved_in_app",
+        "request_id": row.request_id,
+        "capability": row.capability,
+        "channel": "app",
+    })
+    return {"status": "approved", "state": "approved"}
+
+
 # ---- standing-grant modes (broker-standing-grants §7) -------------------
 
 
@@ -1905,6 +2031,7 @@ MODE_HANDLERS: dict[str, Callable[[dict[str, Any], dict[str, Any]], dict[str, An
     "grant-revoke": _handle_grant_revoke,
     "store-credential": _handle_store_credential,
     "site-check": _handle_site_check,
+    "app-approve": _handle_app_approve,
 }
 
 # Modes left as explicit not-implemented so the CLI doesn't silently
