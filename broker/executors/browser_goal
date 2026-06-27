@@ -43,6 +43,14 @@ import time
 import uuid
 from pathlib import Path
 
+# The broker spawns executors with a sanitised env (no PYTHONPATH) and an ephemeral
+# cwd; Python only puts this script's own dir (executors/) on sys.path. Add the
+# broker package's PARENT (…/broker/executors/browser_goal -> parents[2]) so the
+# `from broker import ...` lines below resolve both in the deployed donna-broker
+# account and in the repo. Without this the executor dies at import (ModuleNotFound)
+# before its own fail() handler — see test_executor_self_bootstraps_broker_under_spawn_env.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
 # Broker pure modules — no Playwright, no browser; safe to import at top level.
 from broker import browser_agent
 from broker import browser_gate

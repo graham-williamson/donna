@@ -39,6 +39,42 @@ def test_accessibility_to_snapshot_assigns_refs_when_missing():
     assert out["nodes"][1]["editable"] is True
 
 
+def test_executor_self_bootstraps_broker_under_spawn_env(tmp_path):
+    """Regression (deploy crash 2026-06-27): the broker spawns executors with a
+    sanitised env (PATH only — NO PYTHONPATH) and an ephemeral cwd, so Python puts
+    only the script's own dir (executors/) on sys.path. The executor imports
+    `from broker import ...`, which is NOT resolvable from there — it must bootstrap
+    the broker package's parent onto sys.path itself, or it dies at import with
+    ModuleNotFoundError before reaching its own fail() handler (surfacing only as a
+    bare `executor_crashed`).
+
+    Reproduce the real spawn condition exactly: a fresh subprocess, PATH-only env,
+    a temp cwd, valid stdin, and NO DONNA_CREDS_FD. The executor must reach its own
+    error handling (graceful structured JSON — here `login_failed` for the missing
+    creds fd), never a Python traceback.
+    """
+    import json
+    import subprocess
+
+    exe = Path(__file__).resolve().parents[1] / "executors" / "browser_goal"
+    req = json.dumps({"capability": "browser_goal.plan",
+                      "params": {"site": "everyone_active", "goal": "x", "phase": "plan"}})
+    proc = subprocess.run(
+        [sys.executable, str(exe)],
+        input=req,
+        env={"PATH": "/usr/bin:/bin"},   # mirror executor._sanitised_env: no PYTHONPATH
+        cwd=str(tmp_path),               # ephemeral cwd, like the broker's mkdtemp
+        capture_output=True,
+        text=True,
+    )
+    assert "ModuleNotFoundError" not in proc.stderr, (
+        "executor failed to bootstrap the broker package under the broker spawn "
+        f"env:\n{proc.stderr}")
+    # It reached its own fail() handler → structured JSON, not a crash.
+    parsed = json.loads(proc.stdout)
+    assert "error_code" in parsed
+
+
 def test_fail_is_importable_without_playwright():
     # fail() must be importable; it should write JSON and call sys.exit(1)
     import io
