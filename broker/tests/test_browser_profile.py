@@ -48,10 +48,18 @@ def test_unknown_mfa_rule_rejected():
         bp.load(bad)
 
 
-def test_success_indicators_required():
-    bad = _valid() | {"success_indicators": []}
-    with pytest.raises(bp.ProfileError, match="success_indicators"):
-        bp.load(bad)
+def test_empty_success_indicators_allowed():
+    # Optional now: a recon-drafted profile may carry no explicit indicator; the
+    # live engine falls back to the general "left the login page" proof.
+    p = bp.load(_valid() | {"success_indicators": []})
+    assert p.success_indicators == ()
+
+
+def test_missing_success_indicators_allowed():
+    raw = _valid()
+    raw.pop("success_indicators", None)
+    p = bp.load(raw)
+    assert p.success_indicators == ()
 
 
 def test_ftp_scheme_rejected():
@@ -69,6 +77,12 @@ def test_https_without_host_rejected():
 def test_indicator_with_bad_type_rejected():
     bad = _valid() | {"success_indicators": [{"type": "evil"}]}
     with pytest.raises(bp.ProfileError, match="success_indicator"):
+        bp.load(bad)
+
+
+def test_success_indicators_non_list_rejected():
+    bad = _valid() | {"success_indicators": "notalist"}
+    with pytest.raises(bp.ProfileError, match="must be a list"):
         bp.load(bad)
 
 

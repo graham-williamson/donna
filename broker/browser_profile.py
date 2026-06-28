@@ -49,9 +49,14 @@ def load(raw: dict[str, object]) -> SiteProfile:
     if not allowlist:
         raise ProfileError("allowlist must contain at least one domain")
 
+    # success_indicators are OPTIONAL: a recon-drafted profile may carry none,
+    # in which case the live engine falls back to the general "navigated off the
+    # login page onto an allowlisted page" proof (see executors/browser_goal
+    # _logged_in). Explicit indicators, when present, are stricter overrides and
+    # are still type-validated.
     inds = raw.get("success_indicators") or []
-    if not isinstance(inds, list) or not inds:
-        raise ProfileError("success_indicators must be a non-empty list")
+    if not isinstance(inds, list):
+        raise ProfileError("success_indicators must be a list")
     for ind in inds:
         if not isinstance(ind, dict) or ind.get("type") not in _INDICATOR_TYPES:
             raise ProfileError(
