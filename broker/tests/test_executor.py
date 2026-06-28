@@ -29,6 +29,7 @@ class FakeCapability:
     executor_target: str
     revalidate: dict[str, Any]
     creds: Any = None
+    requires_session: bool = False
 
 
 @pytest.fixture
@@ -712,6 +713,43 @@ def test_creds_happy_path_child_reads_bytes_from_fd3(conn, tmp_path, monkeypatch
     )
     assert outcome.state == "succeeded", outcome.error_message
     assert outcome.result["sha256"] == hashlib.sha256(expected).hexdigest()
+
+
+def test_requires_session_refused_without_marker(conn, tmp_path, monkeypatch):
+    # A browser/session capability must NOT be spawned outside the launchd
+    # session (would SIGTRAP). Refused fail-closed, no spawn, row stays approved
+    # so the caller can retry through the trampoline.
+    monkeypatch.delenv("DONNA_VIA_SESSION", raising=False)
+    r = _insert_approved(conn, "r-sess-no", "capA")
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target=_write_exec_script(tmp_path, "import sys; sys.stdout.write('{}')\n"),
+        revalidate={"not_applicable": "no_external_state"},
+        requires_session=True,
+    )
+    popen_calls: list = []
+    monkeypatch.setattr(executor.subprocess, "Popen",
+                        lambda *a, **k: popen_calls.append(1))
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.error_code == "session_required"
+    assert popen_calls == []                       # never spawned
+    assert db.get_request(conn, "r-sess-no").state == "approved"  # retryable
+
+
+def test_requires_session_runs_with_marker(conn, tmp_path, monkeypatch):
+    # Inside the session (trampoline sets DONNA_VIA_SESSION=1) it runs normally.
+    monkeypatch.setenv("DONNA_VIA_SESSION", "1")
+    r = _insert_approved(conn, "r-sess-yes", "capA")
+    cap = FakeCapability(
+        name="capA", executor_type="subprocess",
+        executor_target=_write_exec_script(
+            tmp_path, "import sys,json; sys.stdout.write(json.dumps({'ran': True}))\n"),
+        revalidate={"not_applicable": "no_external_state"},
+        requires_session=True,
+    )
+    outcome = executor.execute(cap, r, {}, conn)
+    assert outcome.state == "succeeded", outcome.error_message
+    assert outcome.result["ran"] is True
 
 
 def test_model_key_delivered_on_second_fd(conn, tmp_path, monkeypatch):

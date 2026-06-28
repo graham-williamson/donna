@@ -33,5 +33,11 @@ fi
 
 DONNA_UID="$(/usr/bin/id -u donna-broker)"
 
+# Mark that we are inside the donna-broker launchd session. The broker refuses
+# to spawn a `requires_session` (browser) executor unless this is set, so it can
+# never SIGTRAP by being run outside the session (e.g. a standing-grant inline
+# execute or a plain `sudo -u donna-broker execute`). `/usr/bin/env` sets it
+# after the sudo drop, avoiding sudoers env-passing rules.
 exec /bin/launchctl asuser "${DONNA_UID}" \
-  /usr/bin/sudo -n -u donna-broker /usr/local/bin/donna-broker "$@"
+  /usr/bin/sudo -n -u donna-broker /usr/bin/env DONNA_VIA_SESSION=1 \
+  /usr/local/bin/donna-broker "$@"

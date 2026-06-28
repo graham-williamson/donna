@@ -63,6 +63,14 @@ CREDS_MAX_BYTES = 16 * 1024
 # never creds.
 CREDS_FD_ENV_VAR = "DONNA_CREDS_FD"
 
+# Set by the session trampoline (donna-broker-via-session) once it has re-homed
+# into the donna-broker launchd session. A capability with requires_session=True
+# (browser executors) is only safe to spawn when this is present — otherwise the
+# browser SIGTRAPs in a borrowed GUI-session Mach namespace. The broker runs as
+# donna-broker (non-root) and cannot trampoline itself (launchctl asuser needs
+# root), so the requirement is enforced fail-closed, not worked around.
+SESSION_MARKER_ENV = "DONNA_VIA_SESSION"
+
 # Second inherited pipe fd, carrying the broker-level model API key for
 # capabilities whose executor runs a reasoning agent (creds.model_key: true).
 # Delivered exactly like the site credential — vault -> pipe -> child, never
@@ -96,6 +104,8 @@ class CapabilityLike(Protocol):
     def revalidate(self) -> dict[str, Any]: ...
     @property
     def creds(self) -> CredsBlockLike | None: ...
+    @property
+    def requires_session(self) -> bool: ...
 
 
 class RequestLike(Protocol):
@@ -268,6 +278,22 @@ def execute(
 
     if revalidate_handlers is None:
         revalidate_handlers = {}
+
+    # 1b. Session-trampoline guard (fail-closed). A capability that requires the
+    # donna-broker launchd session (browser executors) is refused here unless we
+    # are actually inside that session — never spawned blind, which would SIGTRAP.
+    # Refuse BEFORE durable start so the row stays `approved` and the caller can
+    # retry through donna-broker-via-session. Applies on every execute path
+    # (direct, grant, app) — the constraint is enforced once, centrally.
+    if capability.requires_session and os.environ.get(SESSION_MARKER_ENV) != "1":
+        return ExecutionOutcome(
+            state=request.state,
+            error_code="session_required",
+            error_message=(
+                f"capability {capability.name!r} requires the session trampoline; "
+                "run via donna-broker-via-session (refusing to spawn outside the "
+                "donna-broker launchd session)"),
+        )
 
     # 2. Durable start. Flip approved → executing + audit before any
     # further work. PID is capability-specific (subprocess only) and is

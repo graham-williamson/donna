@@ -99,6 +99,12 @@ class Capability:
     approval_window_minutes: int
     execution_window_minutes: int
     creds: CredsBlock | None = None
+    # When true, the executor must be spawned through the session trampoline
+    # (donna-broker-via-session) — e.g. browser executors that SIGTRAP in a
+    # borrowed GUI-session Mach namespace. A standing grant may auto-APPROVE such
+    # a capability but must NOT inline-execute it (the broker can't trampoline
+    # itself); execute is left to a trampolined call. See _auto_execute_via_grant.
+    requires_session: bool = False
 
 
 # ---- capabilities.yaml --------------------------------------------------
@@ -358,6 +364,7 @@ def _parse_one_capability(
         approval_window_minutes=raw["approval_window_minutes"],
         execution_window_minutes=raw["execution_window_minutes"],
         creds=creds_block,
+        requires_session=bool(raw.get("requires_session", False)),
     )
 
 

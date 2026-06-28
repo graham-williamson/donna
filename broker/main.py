@@ -823,6 +823,23 @@ def _auto_execute_via_grant(
     approved_row = db.get_request(conn, request_id)
     assert approved_row is not None
 
+    # Browser/session executors cannot be inline-executed here: they SIGTRAP
+    # outside the donna-broker launchd session, and the broker cannot trampoline
+    # itself. The grant has done its job (skipped the human approval); leave the
+    # row `approved` and hand back the code so the caller runs `execute` through
+    # donna-broker-via-session. (mcp_tool and other inline-safe caps fall through
+    # to direct execution below, unchanged.)
+    if cap.requires_session:
+        return {
+            "status": "approved",
+            "request_id": request_id,
+            "approval_code": approval_code,
+            "via": "standing_grant",
+            "grant_id": grant_id,
+            "next": "execute_via_session_trampoline",
+            "resolved_summary": resolved_summary,
+        }
+
     def audit_writer(evt: dict[str, Any]) -> None:
         audit_mod.write_event(audit_dir, evt)
 

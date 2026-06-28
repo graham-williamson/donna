@@ -160,6 +160,7 @@ capabilities:
     param_schema:
       $ref: ./schemas/everyone_active_checkout.json
     params_exact_match_required: true
+    requires_session: true   # browser executor — session trampoline required
     derived_fields_allowed: []
     risk_level: high
     revalidate:
@@ -179,6 +180,7 @@ capabilities:
     param_schema:
       $ref: ./schemas/everyone_active_book.json
     params_exact_match_required: true
+    requires_session: true   # browser executor — session trampoline required
     derived_fields_allowed: []
     risk_level: medium
     revalidate:
@@ -204,6 +206,9 @@ capabilities:
     param_schema:
       $ref: ./schemas/browser_goal_plan.json
     params_exact_match_required: true
+    # Browser executor — must run through the session trampoline. A standing
+    # grant may auto-approve but never inline-execute (would SIGTRAP).
+    requires_session: true
     derived_fields_allowed: []
     risk_level: medium
     revalidate:
@@ -229,6 +234,8 @@ capabilities:
     param_schema:
       $ref: ./schemas/browser_goal_commit.json
     params_exact_match_required: true
+    # Browser executor — session trampoline required (see browser_goal.plan).
+    requires_session: true
     derived_fields_allowed: []
     risk_level: high
     revalidate:
