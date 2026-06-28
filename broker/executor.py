@@ -45,7 +45,7 @@ from typing import Any, Callable, Optional, Protocol
 
 
 # §9.2-style sandbox reused here for subprocess executors.
-DEFAULT_EXECUTOR_TIMEOUT_SECONDS = 120.0
+DEFAULT_EXECUTOR_TIMEOUT_SECONDS = 180.0
 MAX_EXECUTOR_STDOUT_BYTES = 256 * 1024
 
 # §3.4 creds payload hard cap — fits within macOS default pipe buffer

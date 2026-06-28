@@ -787,10 +787,13 @@ def main() -> None:
             f"{effective_goal}\n\n"
             "Work toward the goal PURPOSEFULLY. These are general rules, not "
             "site-specific hints — let the goal above tell you WHAT to look for.\n"
-            "MOVING AROUND: prefer CLICKING a link or button you can actually see "
-            "in the elements list (click its ref) and that is relevant to the goal. "
-            "Do NOT invent URL paths: only use 'navigate' with a path you have "
-            "actually seen on the page, never a guessed one.\n"
+            "MOVING AROUND: to go anywhere, CLICK a link or button you can see in "
+            "the elements list (by its ref) — clicking follows the page's REAL "
+            "link. You CANNOT see the actual URLs, so the 'navigate' action is "
+            "almost always a GUESS and will fail or hit a wrong page; do not use "
+            "it to type a path or URL. Move only by clicking a visible element. If "
+            "you don't see a useful link, scroll is automatic — pick the closest "
+            "relevant visible link, or read '_pagetext' to decide which to click.\n"
             "READING: the element with ref '_pagetext' holds the page's visible "
             "text — read it to find the information the goal needs and to notice "
             "dead ends. If a page says 'not found' / 'error' or has no useful "
@@ -809,7 +812,7 @@ def main() -> None:
 
         # Action cap: navigation needs room. Plan (read-only) gets a generous
         # budget; execute a bit more for the commit steps.
-        max_actions = 40 if phase == "execute" else 30
+        max_actions = 80 if phase == "execute" else 60
 
         result = browser_runner.run(
             browser=adapter,
