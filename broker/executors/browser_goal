@@ -414,30 +414,6 @@ class _PlaywrightBrowser:
 # Success indicator checking (login gate)
 # ---------------------------------------------------------------------------
 
-def _logged_in(page, profile) -> bool:
-    """Broker-side proof of login (design §7), generalised — in priority order:
-
-    1. Any EXPLICIT success_indicator in the profile holds (url_pattern / element
-       / cookie). Precise; use for sites that need a strict signal.
-    2. GENERAL fallback (no per-site success page needed): the browser navigated
-       AWAY from the login page onto an allowlisted, same-scheme URL. Uses only
-       login_url + allowlist, which every profile already declares — so a new
-       site works with zero success-page config. Still a broker-side proof (the
-       URL changed off the login page), not the agent's self-report.
-    """
-    if _check_success_indicators(page, profile.success_indicators):
-        return True
-    try:
-        from urllib.parse import urlparse  # noqa: PLC0415
-        cur = urlparse(page.url)
-        login = urlparse(profile.login_url)
-        on_allowlist = browser_nav.is_allowed(page.url, profile.allowlist)
-        left_login = cur.path.rstrip("/") != login.path.rstrip("/")
-        return bool(on_allowlist and left_login and cur.scheme in ("http", "https"))
-    except Exception:
-        return False
-
-
 def _check_success_indicators(page, indicators: tuple) -> bool:
     """Return True iff at least one success indicator from the profile holds."""
     for ind in indicators:
@@ -736,10 +712,9 @@ def main() -> None:
             commit_token=None,
         )
 
-        # Verify login regardless of the agent's self-report: an explicit
-        # success_indicator, else the general "left the login page onto an
-        # allowlisted page" signal (works for any site with no success page).
-        if not _logged_in(page, profile):
+        # Verify login regardless of the agent's self-report (§7, fail-closed):
+        # at least one explicit success_indicator from the profile must hold.
+        if not _check_success_indicators(page, profile.success_indicators):
             # Agent thinks it's done but indicators don't hold.
             login_status = login_result.get("status", "")
             if login_status not in ("done",):

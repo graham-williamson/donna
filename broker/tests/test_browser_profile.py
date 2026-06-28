@@ -48,18 +48,16 @@ def test_unknown_mfa_rule_rejected():
         bp.load(bad)
 
 
-def test_empty_success_indicators_allowed():
-    # Optional now: a recon-drafted profile may carry no explicit indicator; the
-    # live engine falls back to the general "left the login page" proof.
-    p = bp.load(_valid() | {"success_indicators": []})
-    assert p.success_indicators == ()
-
-
-def test_missing_success_indicators_allowed():
+def test_success_indicators_required():
+    # §7 fail-closed: login must be proven against an explicit signal. Empty or
+    # absent success_indicators is rejected — no generic "left login page"
+    # fallback (that would fail-open on a failed-login redirect).
+    with pytest.raises(bp.ProfileError, match="non-empty"):
+        bp.load(_valid() | {"success_indicators": []})
     raw = _valid()
     raw.pop("success_indicators", None)
-    p = bp.load(raw)
-    assert p.success_indicators == ()
+    with pytest.raises(bp.ProfileError, match="non-empty"):
+        bp.load(raw)
 
 
 def test_ftp_scheme_rejected():
@@ -82,7 +80,7 @@ def test_indicator_with_bad_type_rejected():
 
 def test_success_indicators_non_list_rejected():
     bad = _valid() | {"success_indicators": "notalist"}
-    with pytest.raises(bp.ProfileError, match="must be a list"):
+    with pytest.raises(bp.ProfileError, match="non-empty list"):
         bp.load(bad)
 
 
