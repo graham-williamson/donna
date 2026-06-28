@@ -124,18 +124,38 @@ def read_creds() -> dict:
     return json.loads(data)
 
 
-def _load_profile(site: str) -> browser_profile.SiteProfile:
-    """Load and validate the site profile JSON from manifests/profiles/<site>.json.
+def _profile_search_paths(site: str) -> list:
+    """Where to look for a site profile, in priority order:
+
+    1. The live CONFIG dir (~/.config/donna/profiles) — where the signed
+       promoter installs app-onboarded profiles (config_dir/profiles, per
+       promoter_fs). This is the canonical install location.
+    2. The CODE dir (manifests/profiles, beside the executor) — profiles shipped
+       with the broker itself (e.g. everyone_active), synced via the code rsync.
+
+    HOME is set to the donna-broker account by the broker's sanitised env, so
+    Path.home() resolves to /Users/donna-broker.
+    """
+    name = f"{site}.json"
+    return [
+        Path.home() / ".config" / "donna" / "profiles" / name,
+        Path(__file__).resolve().parents[1] / "manifests" / "profiles" / name,
+    ]
+
+
+def _load_profile(site: str) -> "browser_profile.SiteProfile":
+    """Load and validate the site profile JSON for <site>, searching the install
+    locations in priority order (see _profile_search_paths).
 
     Raises SystemExit (via fail()) if the file is missing or the profile is
     malformed (fail-closed).
     """
-    profiles_dir = Path(__file__).resolve().parents[1] / "manifests" / "profiles"
-    profile_path = profiles_dir / f"{site}.json"
-    if not profile_path.exists():
+    profile_path = next((p for p in _profile_search_paths(site) if p.exists()), None)
+    if profile_path is None:
         fail("profile_not_found",
-             f"no profile at manifests/profiles/{site}.json — "
-             f"add the site profile before running this executor")
+             f"no profile for {site!r} in the config dir "
+             f"(~/.config/donna/profiles) or the code dir (manifests/profiles) — "
+             f"install the site profile before running this executor")
     try:
         raw = json.loads(profile_path.read_text(encoding="utf-8"))
     except Exception as exc:

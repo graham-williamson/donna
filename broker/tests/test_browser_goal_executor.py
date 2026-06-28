@@ -128,6 +128,17 @@ def test_read_model_key_reads_fd(monkeypatch):
     assert mod.read_model_key() == "sk-ant-from-fd"
 
 
+def test_profile_search_paths_config_dir_before_code_dir(monkeypatch, tmp_path):
+    # A site profile installed by the promoter lands in the CONFIG dir
+    # (~/.config/donna/profiles); profiles shipped with the broker live in the
+    # CODE dir (manifests/profiles). The executor must search config dir FIRST,
+    # or app-onboarded profiles would never be found.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    paths = mod._profile_search_paths("tesco")
+    assert paths[0] == tmp_path / ".config" / "donna" / "profiles" / "tesco.json"
+    assert paths[1].name == "tesco.json" and "manifests" in str(paths[1])
+
+
 def test_fail_is_importable_without_playwright():
     # fail() must be importable; it should write JSON and call sys.exit(1)
     import io
