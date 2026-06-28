@@ -64,6 +64,60 @@ from broker import browser_token
 # is excluded from the mypy gate by convention (same as the other executors).
 # The pure helpers below are covered by tests/test_browser_goal_executor.py.
 
+# Diagnostic sink for new-tab following. Set to a file path in main() once the
+# run dir exists; _tablog() appends one line per click so we can see, post-run,
+# exactly what the tab-follow observed (target/href, popups seen, page switches).
+_TABFOLLOW_LOG: str | None = None
+
+# Playwright's TimeoutError, bound in main() once Playwright is imported (the
+# module must import WITHOUT Playwright for the pure-helper tests, so we can't
+# import it at top level). Until bound it falls back to Exception.
+PWTimeout: type = Exception
+
+
+def _tablog(msg: str) -> None:
+    if not _TABFOLLOW_LOG:
+        return
+    try:
+        with open(_TABFOLLOW_LOG, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+def _is_cross_host(cur: str, href: str) -> bool:
+    """True iff href is an absolute URL on a DIFFERENT host than cur. Such a link
+    opens a new tab/navigation we must follow; same-host or relative hrefs don't."""
+    if not href or not href.lower().startswith(("http://", "https://")):
+        return False
+    try:
+        from urllib.parse import urlparse
+        return urlparse(cur).netloc != urlparse(href).netloc
+    except Exception:
+        return False
+
+
+def _safe_dest(href: str, base_url: str) -> str:
+    """Where a link GOES, as 'host/path' — for the agent's link tree, so it picks
+    real links by destination instead of GUESSING navigate paths (the failure mode
+    behind every dead-end 404 so far). Resolves relative hrefs against base_url and
+    STRIPS the query string + fragment, so session tokens (e.g. the EA SSO
+    ?token=… landing url) never enter the agent's context. Returns '' for
+    javascript:/mailto:/#-only links the agent can't usefully target."""
+    if not href:
+        return ""
+    try:
+        from urllib.parse import urljoin, urlparse
+        absu = urljoin(base_url, href.strip())
+        p = urlparse(absu)
+        if p.scheme not in ("http", "https"):
+            return ""
+        path = p.path or "/"
+        return f"{p.netloc}{path}"
+    except Exception:
+        return ""
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers — importable and testable WITHOUT Playwright installed.
 # ---------------------------------------------------------------------------
@@ -87,13 +141,20 @@ def _accessibility_to_snapshot(url: str, raw_nodes: list) -> dict:
     nodes = []
     for i, node in enumerate(raw_nodes or []):
         ref = str(node.get("ref") or "").strip() or f"n{i}"
-        nodes.append({
+        out = {
             "ref": ref,
             "role": str(node.get("role") or "generic"),
             "name": str(node.get("name") or ""),
             "tag": str(node.get("tag") or ""),
             "editable": bool(node.get("editable")),
-        })
+        }
+        # Carry the link tree / dropdown options through, only when present, so
+        # snapshots without them are byte-identical to before.
+        if node.get("dest"):
+            out["dest"] = str(node.get("dest"))[:120]
+        if node.get("options"):
+            out["options"] = [str(o)[:80] for o in node.get("options")][:60]
+        nodes.append(out)
     return {"url": url, "nodes": nodes}
 
 
@@ -199,24 +260,76 @@ class _PlaywrightBrowser:
         # Install the network-layer allowlist filter.
         context.route("**/*", self._route_handler)
 
-    def _follow_new_tab(self, pages_before: set) -> None:
+    def _adopt_popup(self, popup) -> None:
+        """Switch the active page to a popup deterministically captured by
+        expect_page(), once it has settled on a real (non about:blank) url. SSO
+        booking flows (EA -> Legend) chain redirects, so wait a few seconds for
+        the popup to land before snapshotting it."""
+        try:
+            for _ in range(20):            # up to ~4s for redirect chains
+                try:
+                    popup.wait_for_load_state("domcontentloaded", timeout=4000)
+                except Exception:
+                    pass
+                if popup.url and not popup.url.startswith("about:"):
+                    break
+                try:
+                    popup.wait_for_timeout(200)
+                except Exception:
+                    break
+            if popup.is_closed():
+                _tablog("  popup closed before adopt")
+                return
+            self._page = popup
+            _tablog(f"  adopted popup url={popup.url[:90]!r}")
+        except Exception as e:               # noqa: BLE001
+            _tablog(f"  adopt error {type(e).__name__}: {e}")
+
+    def _follow_new_tab(self, pages_before: set, *, generous: bool = False) -> None:
         """If the last click opened a NEW tab/window, switch the adapter's active
         page to it. Called SYNCHRONOUSLY right after a click — not via an async
         context 'page' event, which would race the snapshot/execute boundary and
         could switch onto a transient about:blank mid-login. Many flows (a booking
         site on a different subdomain) open in a new tab; without following it,
         every click looks like a no-op and the agent loops. The context.route
-        allowlist still covers the new page, so it stays network-gated."""
+        allowlist still covers the new page, so it stays network-gated.
+
+        A target=_blank / window.open popup does NOT appear in context.pages
+        synchronously when click() returns — it registers a few hundred ms later.
+        So we POLL for it rather than checking once (the single-check version
+        silently missed every new-window link, e.g. EA's 'Make or Manage
+        bookings', and the agent clicked the dead link until timeout). ``generous``
+        is set when the clicked element declared target=_blank: we then wait
+        longer, since a new tab is expected. Otherwise we poll briefly to catch a
+        JS-opened popup without penalising the common in-page click."""
         try:
-            new_pages = [p for p in self._context.pages
-                         if p not in pages_before and not p.is_closed()]
-            if not new_pages:
+            target = None
+            polls = 20 if generous else 4   # ~2.0s vs ~0.4s at 100ms
+            for _ in range(polls):
+                new_pages = [p for p in self._context.pages
+                             if p not in pages_before and not p.is_closed()]
+                if new_pages:
+                    target = new_pages[-1]
+                    break
+                try:
+                    self._page.wait_for_timeout(100)
+                except Exception:
+                    break
+            if target is None:
                 return
-            target = new_pages[-1]
-            try:
-                target.wait_for_load_state("domcontentloaded", timeout=8000)
-            except Exception:
-                pass
+            # Wait for the popup to settle on its REAL url, not the transient
+            # about:blank a _blank tab starts on.
+            for _ in range(15):            # up to ~3s
+                try:
+                    target.wait_for_load_state("domcontentloaded", timeout=4000)
+                except Exception:
+                    pass
+                if target.url and not target.url.startswith("about:"):
+                    break
+                try:
+                    target.wait_for_timeout(200)
+                except Exception:
+                    break
             if target.url and not target.url.startswith("about:"):
                 self._page = target
         except Exception:
@@ -303,13 +416,34 @@ class _PlaywrightBrowser:
                     el.get_attribute("contenteditable"))
                 ref = f"el{i}"
                 if ref not in seen_refs:
-                    raw_nodes.append({
+                    node = {
                         "ref": ref,
                         "role": str(role),
                         "name": str(name).strip()[:200],
                         "tag": str(tag),
                         "editable": editable,
-                    })
+                    }
+                    # Link tree: show where each link GOES so the agent clicks the
+                    # right one instead of guessing a navigate path.
+                    if tag == "a":
+                        try:
+                            dest = _safe_dest(el.get_attribute("href") or "", url)
+                            if dest:
+                                node["dest"] = dest
+                        except Exception:
+                            pass
+                    # Dropdown: surface the selectable option labels so the agent
+                    # knows the exact text to pass to 'select'.
+                    if tag == "select":
+                        try:
+                            opts = el.evaluate(
+                                "s => Array.from(s.options).map(o => o.text.trim())"
+                                ".filter(Boolean).slice(0, 60)") or []
+                            if opts:
+                                node["options"] = [str(o)[:80] for o in opts]
+                        except Exception:
+                            pass
+                    raw_nodes.append(node)
                     seen_refs.add(ref)
         except Exception:
             pass
@@ -393,14 +527,47 @@ class _PlaywrightBrowser:
             except Exception:
                 pass
             pages_before = set(self._context.pages)
+            # Read the link's target/href BEFORE clicking. A target=_blank link —
+            # or an href to a different host than the current page — opens a NEW
+            # TAB rather than navigating in place (EA's 'Make or Manage bookings'
+            # is an <a target=_blank> to the Legend booking site). For those we
+            # capture the popup DETERMINISTICALLY with expect_page() instead of
+            # racing context.pages after the click returns.
+            tgt = href = ""
             try:
-                el.click(timeout=10000)
+                tgt = el.get_attribute("target") or ""
+            except Exception:
+                pass
+            try:
+                href = el.get_attribute("href") or ""
+            except Exception:
+                pass
+            cur = self._page.url
+            expect_popup = (tgt == "_blank") or _is_cross_host(cur, href)
+            _tablog(f"CLICK ref={ref!r} target={tgt!r} href={href[:80]!r} "
+                    f"cur={cur[:60]!r} expect_popup={expect_popup} "
+                    f"pages_before={len(pages_before)}")
+            popup = None
+            try:
+                if expect_popup:
+                    # Deterministic: wait for the page event the click triggers.
+                    with self._context.expect_page(timeout=10000) as pi:
+                        el.click(timeout=10000)
+                    popup = pi.value
+                else:
+                    el.click(timeout=10000)
+            except PWTimeout:
+                # expect_page timed out — no popup actually opened; the click
+                # still happened. Fall through to the poll as a backstop.
+                _tablog("  expect_page TIMEOUT (no popup) — falling back to poll")
             except Exception as exc:
                 fail("unexpected_dom", f"click {ref!r}: {type(exc).__name__}: {exc}")
-            # Follow a new tab/window the click may have opened. No networkidle
-            # wait here — the next snapshot's settle handles render, and
-            # networkidle stalls on live app pages.
-            self._follow_new_tab(pages_before)
+            if popup is not None:
+                self._adopt_popup(popup)
+            else:
+                # In-place click, or a popup we didn't predict — poll briefly.
+                self._follow_new_tab(pages_before, generous=expect_popup)
+            _tablog(f"  -> active page now {self._page.url[:80]!r}")
 
         elif kind == "type":
             ref = str(action.get("ref") or "")
@@ -416,10 +583,30 @@ class _PlaywrightBrowser:
                 el.scroll_into_view_if_needed(timeout=4000)
             except Exception:
                 pass
+            # A <select> dropdown can't be fill()ed — you choose an option. The
+            # agent uses 'type' with the option's visible label (e.g. 'Chesham
+            # Leisure Centre'); drive it with select_option, matching by label
+            # then by value as a fallback. This is how the agent picks a centre /
+            # activity / date on a booking app's native dropdowns.
+            is_select = False
             try:
-                el.fill(real_text, timeout=10000)
-            except Exception as exc:
-                fail("unexpected_dom", f"type {ref!r}: {type(exc).__name__}: {exc}")
+                is_select = (el.evaluate("e => e.tagName.toLowerCase()") == "select")
+            except Exception:
+                pass
+            if is_select:
+                try:
+                    el.select_option(label=real_text, timeout=10000)
+                except Exception:
+                    try:
+                        el.select_option(value=real_text, timeout=10000)
+                    except Exception as exc:
+                        fail("unexpected_dom",
+                             f"select {ref!r}={real_text!r}: {type(exc).__name__}: {exc}")
+            else:
+                try:
+                    el.fill(real_text, timeout=10000)
+                except Exception as exc:
+                    fail("unexpected_dom", f"type {ref!r}: {type(exc).__name__}: {exc}")
 
         # read / done / give_up — no browser action needed; runner handles them.
 
@@ -646,6 +833,8 @@ def main() -> None:
     commit_token = params.get("commit_token")    # optional str
     # plan_summary is available for context but the agent sees it via goal.
     plan_summary = params.get("plan_summary", "")
+    # Optional human-provided navigation hints to steer a hard-to-navigate site.
+    hints = str(params.get("hints") or "").strip()
 
     if not site:
         fail("bad_params", "params.site is required")
@@ -666,9 +855,16 @@ def main() -> None:
     # Import Playwright HERE — not at module top-level.
     from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout  # noqa: PLC0415
 
+    # Bind the module globals the adapter methods reference: the real Playwright
+    # TimeoutError (so expect_page timeouts are caught precisely) and the
+    # tab-follow diagnostic sink (written next to agent_debug.jsonl).
+    global PWTimeout, _TABFOLLOW_LOG
+    PWTimeout = PwTimeout
+
     run_id = str(uuid.uuid4())
     run_dir = Path(os.environ.get("DONNA_RUN_DIR", "/tmp")) / f"browser_goal_{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    _TABFOLLOW_LOG = str(run_dir / "tabfollow.log")
     ledger_path = run_dir / "ledger.jsonl"
 
     now = time.monotonic
@@ -783,17 +979,22 @@ def main() -> None:
             creds=creds,
             phase=phase,
         )
+        hint_block = (
+            "HUMAN NAVIGATION HINTS — follow these as authoritative directions to "
+            f"reach the goal (they override your own guesses about where to go):\n{hints}\n\n"
+        ) if hints else ""
         goal_instruction = (
             f"{effective_goal}\n\n"
+            f"{hint_block}"
             "Work toward the goal PURPOSEFULLY. These are general rules, not "
             "site-specific hints — let the goal above tell you WHAT to look for.\n"
             "MOVING AROUND: to go anywhere, CLICK a link or button you can see in "
             "the elements list (by its ref) — clicking follows the page's REAL "
-            "link. You CANNOT see the actual URLs, so the 'navigate' action is "
-            "almost always a GUESS and will fail or hit a wrong page; do not use "
-            "it to type a path or URL. Move only by clicking a visible element. If "
-            "you don't see a useful link, scroll is automatic — pick the closest "
-            "relevant visible link, or read '_pagetext' to decide which to click.\n"
+            "link. Do NOT 'navigate' to a path/URL you GUESSED — you can't see real "
+            "URLs, so a guess will fail or hit a wrong page. EXCEPTION: a relative "
+            "path given to you in the HUMAN NAVIGATION HINTS above is trusted — you "
+            "MAY navigate to it directly. Otherwise move only by clicking a visible "
+            "element; read '_pagetext' to decide which link is relevant.\n"
             "READING: the element with ref '_pagetext' holds the page's visible "
             "text — read it to find the information the goal needs and to notice "
             "dead ends. If a page says 'not found' / 'error' or has no useful "

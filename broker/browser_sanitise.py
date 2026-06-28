@@ -20,12 +20,24 @@ def sanitise(raw: dict[str, Any]) -> dict[str, Any]:
     for node in raw.get("nodes", []):
         if node.get("role") in _DROP_ROLES or node.get("tag") in _DROP_ROLES:
             continue
-        elements.append({
+        el: dict[str, Any] = {
             "ref": str(node.get("ref") or ""),
             "role": str(node.get("role") or "text"),
             "text": str(node.get("name") or ""),
             "editable": bool(node.get("editable")),
-        })
+        }
+        # Link destination ('host/path', tokens already stripped upstream) and
+        # dropdown option labels — both page-controlled DATA, surfaced so the
+        # agent can pick a real link/option instead of guessing. Added only when
+        # present, keeping token-free snapshots byte-identical. trust=untrusted
+        # still applies: these are data, never instructions.
+        dest = node.get("dest")
+        if dest:
+            el["dest"] = str(dest)
+        options = node.get("options")
+        if isinstance(options, list) and options:
+            el["options"] = [str(o) for o in options]
+        elements.append(el)
     return {"source": "webpage", "trust": "untrusted",
             "url": str(raw.get("url") or ""), "elements": elements}
 

@@ -34,7 +34,16 @@ _SYSTEM = (
     '  {"kind":"done","result":"..."}\n'
     '  {"kind":"give_up","reason":"..."}\n'
     "If a cookie/consent or other dialog covers the page (e.g. an Accept/Agree/"
-    "Allow button), dismiss it FIRST by clicking it — then continue toward the goal."
+    "Allow button), dismiss it FIRST by clicking it — then continue toward the goal.\n"
+    "LINK TREE — each element may carry a \"dest\" field showing where that link "
+    "GOES ('host/path'). USE IT: to reach a destination, CLICK the link whose "
+    "dest best matches where you want to go. Do NOT 'navigate' to a guessed path "
+    "— navigate only works for a path you were explicitly given, and a guessed "
+    "one hits a dead 404. When unsure which link, compare their dest values.\n"
+    "DROPDOWNS — a <select> element carries an \"options\" list of its choices. To "
+    "choose one, use 'type' on that element with the option's EXACT label as "
+    "text (e.g. type text=\"Chesham Leisure Centre\"); the system selects it for "
+    "you. Do not 'click' a <select> expecting a menu."
 )
 
 

@@ -260,3 +260,55 @@ class TestNonBrokerAllowlistIntact:
 
     def test_pipe_metachar_in_non_broker(self, hook, capsys):
         _denied(hook, "ls | grep foo", capsys)
+
+
+# ---- Trampoline fast-path (browser executors) --------------------------
+
+
+TRAMPOLINE_BIN = "/usr/local/bin/donna-broker-via-session"
+
+
+class TestTrampolineAllowed:
+    def test_execute_with_approval_code(self, hook, capsys):
+        cmd = f"sudo -n {TRAMPOLINE_BIN} execute '{{\"approval_code\":\"ABC123\"}}'"
+        _allowed(hook, cmd, capsys)
+
+    def test_execute_with_html_in_payload(self, hook, capsys):
+        """JSON payload containing angle brackets must not trip metachar scan."""
+        payload = json.dumps({"approval_code": "XY9Z01", "extra": "<b>hi</b>"})
+        cmd = f"sudo -n {TRAMPOLINE_BIN} execute '{payload}'"
+        _allowed(hook, cmd, capsys)
+
+
+class TestTrampolineRejected:
+    def test_non_execute_mode_denied(self, hook, capsys):
+        """Only execute is permitted through the trampoline."""
+        cmd = f"sudo -n {TRAMPOLINE_BIN} request '{{\"capability\":\"x.y\",\"params\":{{}}}}'"
+        _denied(hook, cmd, capsys)
+
+    def test_wrong_trampoline_binary(self, hook, capsys):
+        cmd = "sudo -n /tmp/evil-trampoline execute '{\"approval_code\":\"ABC123\"}'"
+        _denied(hook, cmd, capsys)
+
+    def test_invalid_json_payload(self, hook, capsys):
+        cmd = f"sudo -n {TRAMPOLINE_BIN} execute 'not-json'"
+        _denied(hook, cmd, capsys)
+
+    def test_unquoted_payload(self, hook, capsys):
+        """Unquoted payload is not matched by the structural regex."""
+        cmd = f"sudo -n {TRAMPOLINE_BIN} execute {{\"approval_code\":\"ABC123\"}}"
+        _denied(hook, cmd, capsys)
+
+    def test_command_injection_between_quoted_runs(self, hook, capsys):
+        """Classic injection: unquoted $(…) between single-quoted segments."""
+        cmd = f"sudo -n {TRAMPOLINE_BIN} execute '{{\"a\":\"'$(whoami)'\"}}'  "
+        _denied(hook, cmd, capsys)
+
+    def test_trailing_semicolon_command(self, hook, capsys):
+        cmd = f"sudo -n {TRAMPOLINE_BIN} execute '{{}}'; rm -rf /"
+        _denied(hook, cmd, capsys)
+
+    def test_sudo_u_form_not_matched(self, hook, capsys):
+        """The trampoline uses -n, not -u donna-broker. Reject -u form."""
+        cmd = f"sudo -u donna-broker {TRAMPOLINE_BIN} execute '{{\"approval_code\":\"X\"}}'"
+        _denied(hook, cmd, capsys)
