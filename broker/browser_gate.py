@@ -14,6 +14,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 from broker import browser_nav as nav
 from broker import browser_profile as bp
@@ -22,6 +23,32 @@ from broker import browser_token as bt
 
 _CRED = re.compile(r"\{\{cred:(username|password)\}\}")
 _VOCAB = frozenset({"read", "navigate", "click", "type", "propose_commit", "done", "give_up"})
+
+
+def _cred_origin_ok(page_url: str, login_url: str) -> bool:
+    """Invariant 1 (credential bound to its origin). A credential may be entered
+    ONLY on the login host. The allowlist may legitimately span multiple domains
+    (e.g. a site plus its third-party booking provider), but the secret must
+    never be typed into anything other than the host it belongs to — otherwise
+    widening the allowlist becomes a credential-exfiltration path. Fail-closed:
+    an unparseable or mismatched host refuses substitution."""
+    p_host = urlsplit(page_url).hostname
+    l_host = urlsplit(login_url).hostname
+    return bool(p_host) and bool(l_host) and p_host == l_host
+
+
+def _label_matches(want: str, live: str) -> bool:
+    """expected_text / expected_label staleness check (§6). Case-insensitive and
+    whitespace-trimmed — the agent copies a visible label that may differ only in
+    case or spacing. An EMPTY live label is un-validatable (many sites leave form
+    inputs unlabelled in the accessibility tree), so it is accepted: the hard
+    gates remain the element's existence + editability and, for commits, the
+    one-time token; the §8 network allowlist is the real off-domain exfil
+    backstop. A non-empty live label must match."""
+    live_n = live.strip().casefold()
+    if not live_n:
+        return True
+    return want.strip().casefold() == live_n
 
 
 @dataclass
@@ -71,9 +98,19 @@ class Gate:
             el = self._elem(snapshot, ref)
             if el is None or not el["editable"]:
                 return Decision("refuse", reason=f"type target {ref!r} is not an editable field")
-            if str(action.get("expected_label") or "") != el["text"]:
+            if not _label_matches(str(action.get("expected_label") or ""), el["text"]):
                 return Decision("refuse", reason="type expected_label does not match the live field")
             raw_text = str(action.get("text") or "")
+
+            # Invariant 1: a credential placeholder may only be filled on the
+            # login host. Refuse cred entry on any other allowlisted domain
+            # (e.g. a third-party booking provider) — never type the secret there.
+            if _CRED.search(raw_text):
+                page_url = str(san.sanitise(snapshot).get("url") or "")
+                if not _cred_origin_ok(page_url, self.profile.login_url):
+                    return Decision(
+                        "refuse",
+                        reason="credential entry is only permitted on the login host")
 
             def _sub(m: re.Match[str]) -> str:
                 return self._creds.get(m.group(1), "")
@@ -99,7 +136,7 @@ class Gate:
             el = self._elem(snapshot, ref)
             if el is None:
                 return Decision("refuse", reason=f"click target {ref!r} not on the page")
-            if str(action.get("expected_text") or "") != el["text"]:
+            if not _label_matches(str(action.get("expected_text") or ""), el["text"]):
                 return Decision("refuse", reason="click expected_text does not match the live element")
             if action.get("commit"):
                 token_id = str(action.get("commit_token") or "")

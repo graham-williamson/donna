@@ -49,9 +49,15 @@ def test_unknown_mfa_rule_rejected():
 
 
 def test_success_indicators_required():
-    bad = _valid() | {"success_indicators": []}
-    with pytest.raises(bp.ProfileError, match="success_indicators"):
-        bp.load(bad)
+    # §7 fail-closed: login must be proven against an explicit signal. Empty or
+    # absent success_indicators is rejected — no generic "left login page"
+    # fallback (that would fail-open on a failed-login redirect).
+    with pytest.raises(bp.ProfileError, match="non-empty"):
+        bp.load(_valid() | {"success_indicators": []})
+    raw = _valid()
+    raw.pop("success_indicators", None)
+    with pytest.raises(bp.ProfileError, match="non-empty"):
+        bp.load(raw)
 
 
 def test_ftp_scheme_rejected():
@@ -69,6 +75,12 @@ def test_https_without_host_rejected():
 def test_indicator_with_bad_type_rejected():
     bad = _valid() | {"success_indicators": [{"type": "evil"}]}
     with pytest.raises(bp.ProfileError, match="success_indicator"):
+        bp.load(bad)
+
+
+def test_success_indicators_non_list_rejected():
+    bad = _valid() | {"success_indicators": "notalist"}
+    with pytest.raises(bp.ProfileError, match="non-empty list"):
         bp.load(bad)
 
 

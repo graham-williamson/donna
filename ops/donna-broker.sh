@@ -72,6 +72,7 @@ if [[ $# -gt 0 ]]; then
     DONNA_BROKER_QUEUE_DIR="${BROKER_CONFIG_HOME}/approval-queue" \
     DONNA_BROKER_RESPONSES_DIR="${BROKER_CONFIG_HOME}/approval-responses" \
     PYTHONPATH="${BROKER_ROOT}/.." \
+    DONNA_VIA_SESSION="${DONNA_VIA_SESSION:-}" \
     "${VENV_PYTHON}" -m broker.main "${MODE}" <<<"$1"
 else
   exec env -i \
@@ -86,5 +87,6 @@ else
     DONNA_BROKER_QUEUE_DIR="${BROKER_CONFIG_HOME}/approval-queue" \
     DONNA_BROKER_RESPONSES_DIR="${BROKER_CONFIG_HOME}/approval-responses" \
     PYTHONPATH="${BROKER_ROOT}/.." \
+    DONNA_VIA_SESSION="${DONNA_VIA_SESSION:-}" \
     "${VENV_PYTHON}" -m broker.main "${MODE}"
 fi

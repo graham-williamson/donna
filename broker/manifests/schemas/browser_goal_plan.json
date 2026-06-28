@@ -22,6 +22,10 @@
     "max_actions": {
       "type": "integer",
       "description": "Optional cap on the number of browser actions the planner may take"
+    },
+    "hints": {
+      "type": "string",
+      "description": "Optional human-provided navigation hints to steer the agent when a site is hard to navigate, e.g. 'go to /book/ then click Make or Manage bookings'. The agent follows these as authoritative guidance toward the goal."
     }
   }
 }

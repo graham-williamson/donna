@@ -1,0 +1,11 @@
+{
+  "site": "tesco",
+  "login_url": "https://secure.tesco.com/account/en-GB/login",
+  "allowlist": ["tesco.com", "secure.tesco.com", "www.tesco.com"],
+  "success_indicators": [
+    {"type": "url_pattern", "value": "**/groceries/**"},
+    {"type": "element", "value": "a[href*='logout']"}
+  ],
+  "mfa_rule": "pause_and_ask",
+  "network_strictness": "monitor"
+}

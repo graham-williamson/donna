@@ -19,6 +19,7 @@ SNAP = {"url": "https://account.everyoneactive.com/x", "nodes": [
     {"ref": "r1", "role": "textbox", "name": "Password", "tag": "input", "editable": True},
     {"ref": "r2", "role": "button", "name": "Confirm booking", "tag": "button", "editable": False},
     {"ref": "r3", "role": "link", "name": "Help", "tag": "a", "editable": False},
+    {"ref": "r4", "role": "input", "name": "", "tag": "input", "editable": True},
 ]}
 
 
@@ -59,6 +60,55 @@ def test_type_into_noneditable_refused():
     d = g.check({"kind": "type", "ref": "r2", "expected_label": "Confirm booking",
                  "text": "x"}, SNAP)
     assert d.decision == "refuse"
+
+
+def test_credential_refused_off_login_host():
+    # Widening the allowlist to a third-party domain must NOT let the secret be
+    # typed there (invariant 1). Same editable field, but the page is on a
+    # different host than the login URL → cred entry refused.
+    g = _gate(phase="execute")
+    off_host = {"url": "https://better.legendonlineservices.co.uk/x", "nodes": [
+        {"ref": "r1", "role": "textbox", "name": "Password", "tag": "input", "editable": True},
+    ]}
+    d = g.check({"kind": "type", "ref": "r1", "expected_label": "Password",
+                 "text": "{{cred:password}}"}, off_host)
+    assert d.decision == "refuse"
+    assert "login host" in d.reason
+
+
+def test_noncred_type_allowed_off_login_host():
+    # A non-credential value may still be typed on any allowlisted page — only
+    # the credential placeholder is host-bound.
+    g = _gate(phase="execute")
+    off_host = {"url": "https://better.legendonlineservices.co.uk/x", "nodes": [
+        {"ref": "r1", "role": "textbox", "name": "Search", "tag": "input", "editable": True},
+    ]}
+    d = g.check({"kind": "type", "ref": "r1", "expected_label": "Search",
+                 "text": "yoga"}, off_host)
+    assert d.decision == "allow"
+
+
+def test_type_label_match_is_case_insensitive():
+    # r1 live label is "Password"; the agent supplies "password".
+    g = _gate(phase="execute")
+    d = g.check({"kind": "type", "ref": "r1", "expected_label": "password",
+                 "text": "x"}, SNAP)
+    assert d.decision == "allow"
+
+
+def test_type_empty_live_label_is_accepted():
+    # r4 is an editable input the site exposes with no accessible label. The
+    # ref-exists + editable gate still applies; the (unmatchable) label does not.
+    g = _gate(phase="execute")
+    d = g.check({"kind": "type", "ref": "r4", "expected_label": "Email",
+                 "text": "{{cred:username}}"}, SNAP)
+    assert d.decision == "allow"
+
+
+def test_click_text_match_is_case_insensitive():
+    g = _gate(phase="execute")
+    d = g.check({"kind": "click", "ref": "r2", "expected_text": "CONFIRM BOOKING"}, SNAP)
+    assert d.decision == "allow"
 
 
 def test_click_expected_text_mismatch_refused():

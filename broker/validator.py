@@ -73,9 +73,16 @@ class CredsBlock:
     """§4 creds-injection opt-in. Presence of a CredsBlock on a
     Capability is the declaration that the capability requires
     credentials at spawn time. See security-v1.1 §17 Phase 2 age vault
-    and Piece C design doc §3 for delivery semantics."""
+    and Piece C design doc §3 for delivery semantics.
+
+    `model_key` (optional, default False) opts the capability into a SECOND
+    inherited fd carrying the broker-level `anthropic_api` vault entry — for
+    capabilities whose executor runs a reasoning agent (browser_goal.*). The
+    key is delivered exactly like the site credential (vault -> pipe -> child),
+    never via env. See the browser-goal model-key-delivery plan."""
     delivery: str
     entry: str
+    model_key: bool = False
 
 
 @dataclass(frozen=True)
@@ -92,6 +99,12 @@ class Capability:
     approval_window_minutes: int
     execution_window_minutes: int
     creds: CredsBlock | None = None
+    # When true, the executor must be spawned through the session trampoline
+    # (donna-broker-via-session) — e.g. browser executors that SIGTRAP in a
+    # borrowed GUI-session Mach namespace. A standing grant may auto-APPROVE such
+    # a capability but must NOT inline-execute it (the broker can't trampoline
+    # itself); execute is left to a trampolined call. See _auto_execute_via_grant.
+    requires_session: bool = False
 
 
 # ---- capabilities.yaml --------------------------------------------------
@@ -135,13 +148,19 @@ def _validate_creds(creds_raw: Any, capability_name: str) -> CredsBlock | None:
             f"capability {capability_name!r}: creds.entry must match "
             f"{CREDS_ENTRY_RE.pattern!r}, got {entry!r}"
         )
-    unknown = set(creds_raw.keys()) - {"delivery", "entry"}
+    model_key_raw = creds_raw.get("model_key", False)
+    if not isinstance(model_key_raw, bool):
+        raise ManifestError(
+            f"capability {capability_name!r}: creds.model_key must be a "
+            f"boolean, got {type(model_key_raw).__name__}"
+        )
+    unknown = set(creds_raw.keys()) - {"delivery", "entry", "model_key"}
     if unknown:
         raise ManifestError(
             f"capability {capability_name!r}: unknown creds keys: "
             f"{sorted(unknown)}"
         )
-    return CredsBlock(delivery=delivery, entry=entry)
+    return CredsBlock(delivery=delivery, entry=entry, model_key=model_key_raw)
 
 
 def _validate_revalidate(reval: Any, capability_name: str, risk_level: str) -> None:
@@ -345,6 +364,7 @@ def _parse_one_capability(
         approval_window_minutes=raw["approval_window_minutes"],
         execution_window_minutes=raw["execution_window_minutes"],
         creds=creds_block,
+        requires_session=bool(raw.get("requires_session", False)),
     )
 
 

@@ -49,6 +49,12 @@ def load(raw: dict[str, object]) -> SiteProfile:
     if not allowlist:
         raise ProfileError("allowlist must contain at least one domain")
 
+    # success_indicators are REQUIRED and non-empty (design §7, fail-closed): the
+    # broker must PROVE login against an explicit signal, never infer it. A
+    # generic "left the login page" heuristic is fail-open — a failed login that
+    # redirects elsewhere on the same site would read as success. Generality
+    # comes from recon OBSERVING the real post-login signal during onboarding and
+    # writing it here, not from a runtime fallback.
     inds = raw.get("success_indicators") or []
     if not isinstance(inds, list) or not inds:
         raise ProfileError("success_indicators must be a non-empty list")

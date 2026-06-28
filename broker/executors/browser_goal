@@ -37,11 +37,18 @@ import json
 import os
 import re
 import secrets
-import subprocess
 import sys
 import time
 import uuid
 from pathlib import Path
+
+# The broker spawns executors with a sanitised env (no PYTHONPATH) and an ephemeral
+# cwd; Python only puts this script's own dir (executors/) on sys.path. Add the
+# broker package's PARENT (…/broker/executors/browser_goal -> parents[2]) so the
+# `from broker import ...` lines below resolve both in the deployed donna-broker
+# account and in the repo. Without this the executor dies at import (ModuleNotFound)
+# before its own fail() handler — see test_executor_self_bootstraps_broker_under_spawn_env.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 # Broker pure modules — no Playwright, no browser; safe to import at top level.
 from broker import browser_agent
@@ -56,6 +63,60 @@ from broker import browser_token
 # NOTE: mypy on this file (an executable without .py extension) is awkward; it
 # is excluded from the mypy gate by convention (same as the other executors).
 # The pure helpers below are covered by tests/test_browser_goal_executor.py.
+
+# Diagnostic sink for new-tab following. Set to a file path in main() once the
+# run dir exists; _tablog() appends one line per click so we can see, post-run,
+# exactly what the tab-follow observed (target/href, popups seen, page switches).
+_TABFOLLOW_LOG: str | None = None
+
+# Playwright's TimeoutError, bound in main() once Playwright is imported (the
+# module must import WITHOUT Playwright for the pure-helper tests, so we can't
+# import it at top level). Until bound it falls back to Exception.
+PWTimeout: type = Exception
+
+
+def _tablog(msg: str) -> None:
+    if not _TABFOLLOW_LOG:
+        return
+    try:
+        with open(_TABFOLLOW_LOG, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except Exception:
+        pass
+
+
+def _is_cross_host(cur: str, href: str) -> bool:
+    """True iff href is an absolute URL on a DIFFERENT host than cur. Such a link
+    opens a new tab/navigation we must follow; same-host or relative hrefs don't."""
+    if not href or not href.lower().startswith(("http://", "https://")):
+        return False
+    try:
+        from urllib.parse import urlparse
+        return urlparse(cur).netloc != urlparse(href).netloc
+    except Exception:
+        return False
+
+
+def _safe_dest(href: str, base_url: str) -> str:
+    """Where a link GOES, as 'host/path' — for the agent's link tree, so it picks
+    real links by destination instead of GUESSING navigate paths (the failure mode
+    behind every dead-end 404 so far). Resolves relative hrefs against base_url and
+    STRIPS the query string + fragment, so session tokens (e.g. the EA SSO
+    ?token=… landing url) never enter the agent's context. Returns '' for
+    javascript:/mailto:/#-only links the agent can't usefully target."""
+    if not href:
+        return ""
+    try:
+        from urllib.parse import urljoin, urlparse
+        absu = urljoin(base_url, href.strip())
+        p = urlparse(absu)
+        if p.scheme not in ("http", "https"):
+            return ""
+        path = p.path or "/"
+        return f"{p.netloc}{path}"
+    except Exception:
+        return ""
+
 
 # ---------------------------------------------------------------------------
 # Pure helpers — importable and testable WITHOUT Playwright installed.
@@ -80,13 +141,20 @@ def _accessibility_to_snapshot(url: str, raw_nodes: list) -> dict:
     nodes = []
     for i, node in enumerate(raw_nodes or []):
         ref = str(node.get("ref") or "").strip() or f"n{i}"
-        nodes.append({
+        out = {
             "ref": ref,
             "role": str(node.get("role") or "generic"),
             "name": str(node.get("name") or ""),
             "tag": str(node.get("tag") or ""),
             "editable": bool(node.get("editable")),
-        })
+        }
+        # Carry the link tree / dropdown options through, only when present, so
+        # snapshots without them are byte-identical to before.
+        if node.get("dest"):
+            out["dest"] = str(node.get("dest"))[:120]
+        if node.get("options"):
+            out["options"] = [str(o)[:80] for o in node.get("options")][:60]
+        nodes.append(out)
     return {"url": url, "nodes": nodes}
 
 
@@ -117,18 +185,38 @@ def read_creds() -> dict:
     return json.loads(data)
 
 
-def _load_profile(site: str) -> browser_profile.SiteProfile:
-    """Load and validate the site profile JSON from manifests/profiles/<site>.json.
+def _profile_search_paths(site: str) -> list:
+    """Where to look for a site profile, in priority order:
+
+    1. The live CONFIG dir (~/.config/donna/profiles) — where the signed
+       promoter installs app-onboarded profiles (config_dir/profiles, per
+       promoter_fs). This is the canonical install location.
+    2. The CODE dir (manifests/profiles, beside the executor) — profiles shipped
+       with the broker itself (e.g. everyone_active), synced via the code rsync.
+
+    HOME is set to the donna-broker account by the broker's sanitised env, so
+    Path.home() resolves to /Users/donna-broker.
+    """
+    name = f"{site}.json"
+    return [
+        Path.home() / ".config" / "donna" / "profiles" / name,
+        Path(__file__).resolve().parents[1] / "manifests" / "profiles" / name,
+    ]
+
+
+def _load_profile(site: str) -> "browser_profile.SiteProfile":
+    """Load and validate the site profile JSON for <site>, searching the install
+    locations in priority order (see _profile_search_paths).
 
     Raises SystemExit (via fail()) if the file is missing or the profile is
     malformed (fail-closed).
     """
-    profiles_dir = Path(__file__).resolve().parents[1] / "manifests" / "profiles"
-    profile_path = profiles_dir / f"{site}.json"
-    if not profile_path.exists():
+    profile_path = next((p for p in _profile_search_paths(site) if p.exists()), None)
+    if profile_path is None:
         fail("profile_not_found",
-             f"no profile at manifests/profiles/{site}.json — "
-             f"add the site profile before running this executor")
+             f"no profile for {site!r} in the config dir "
+             f"(~/.config/donna/profiles) or the code dir (manifests/profiles) — "
+             f"install the site profile before running this executor")
     try:
         raw = json.loads(profile_path.read_text(encoding="utf-8"))
     except Exception as exc:
@@ -172,6 +260,81 @@ class _PlaywrightBrowser:
         # Install the network-layer allowlist filter.
         context.route("**/*", self._route_handler)
 
+    def _adopt_popup(self, popup) -> None:
+        """Switch the active page to a popup deterministically captured by
+        expect_page(), once it has settled on a real (non about:blank) url. SSO
+        booking flows (EA -> Legend) chain redirects, so wait a few seconds for
+        the popup to land before snapshotting it."""
+        try:
+            for _ in range(20):            # up to ~4s for redirect chains
+                try:
+                    popup.wait_for_load_state("domcontentloaded", timeout=4000)
+                except Exception:
+                    pass
+                if popup.url and not popup.url.startswith("about:"):
+                    break
+                try:
+                    popup.wait_for_timeout(200)
+                except Exception:
+                    break
+            if popup.is_closed():
+                _tablog("  popup closed before adopt")
+                return
+            self._page = popup
+            _tablog(f"  adopted popup url={popup.url[:90]!r}")
+        except Exception as e:               # noqa: BLE001
+            _tablog(f"  adopt error {type(e).__name__}: {e}")
+
+    def _follow_new_tab(self, pages_before: set, *, generous: bool = False) -> None:
+        """If the last click opened a NEW tab/window, switch the adapter's active
+        page to it. Called SYNCHRONOUSLY right after a click — not via an async
+        context 'page' event, which would race the snapshot/execute boundary and
+        could switch onto a transient about:blank mid-login. Many flows (a booking
+        site on a different subdomain) open in a new tab; without following it,
+        every click looks like a no-op and the agent loops. The context.route
+        allowlist still covers the new page, so it stays network-gated.
+
+        A target=_blank / window.open popup does NOT appear in context.pages
+        synchronously when click() returns — it registers a few hundred ms later.
+        So we POLL for it rather than checking once (the single-check version
+        silently missed every new-window link, e.g. EA's 'Make or Manage
+        bookings', and the agent clicked the dead link until timeout). ``generous``
+        is set when the clicked element declared target=_blank: we then wait
+        longer, since a new tab is expected. Otherwise we poll briefly to catch a
+        JS-opened popup without penalising the common in-page click."""
+        try:
+            target = None
+            polls = 20 if generous else 4   # ~2.0s vs ~0.4s at 100ms
+            for _ in range(polls):
+                new_pages = [p for p in self._context.pages
+                             if p not in pages_before and not p.is_closed()]
+                if new_pages:
+                    target = new_pages[-1]
+                    break
+                try:
+                    self._page.wait_for_timeout(100)
+                except Exception:
+                    break
+            if target is None:
+                return
+            # Wait for the popup to settle on its REAL url, not the transient
+            # about:blank a _blank tab starts on.
+            for _ in range(15):            # up to ~3s
+                try:
+                    target.wait_for_load_state("domcontentloaded", timeout=4000)
+                except Exception:
+                    pass
+                if target.url and not target.url.startswith("about:"):
+                    break
+                try:
+                    target.wait_for_timeout(200)
+                except Exception:
+                    break
+            if target.url and not target.url.startswith("about:"):
+                self._page = target
+        except Exception:
+            pass
+
     def _route_handler(self, route) -> None:
         """Abort off-allowlist requests and (under hard_abort) unguarded mutations."""
         try:
@@ -202,6 +365,19 @@ class _PlaywrightBrowser:
 
     def snapshot(self) -> dict:
         """Return a normalised snapshot of the current page's accessibility tree."""
+        # Let the page settle so we snapshot the RENDERED DOM, not a still-loading
+        # state. domcontentloaded + a brief fixed pause — NOT networkidle, which
+        # never fires on live booking/app pages (persistent/polling connections)
+        # and would burn its full timeout on every snapshot, blowing the executor
+        # budget. The short pause lets late JS render.
+        try:
+            self._page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+        try:
+            self._page.wait_for_timeout(400)
+        except Exception:
+            pass
         url = self._page.url
         try:
             # Playwright's accessibility snapshot returns a tree; we flatten it.
@@ -218,6 +394,16 @@ class _PlaywrightBrowser:
             )
             seen_refs = {n.get("ref") for n in raw_nodes if n.get("ref")}
             for i, el in enumerate(interactable):
+                # Only surface elements the agent can actually act on. Hidden
+                # elements (display:none, behind an un-dismissed overlay, in a
+                # collapsed menu) stay in the DOM but produce "not visible"
+                # click/type timeouts. Skip them — the ref keeps the RAW index i
+                # so _find_element re-locates the SAME element by index.
+                try:
+                    if not el.is_visible():
+                        continue
+                except Exception:
+                    continue
                 role = (el.get_attribute("role") or el.evaluate(
                     "el => el.tagName.toLowerCase()") or "element")
                 name = (el.get_attribute("aria-label")
@@ -230,14 +416,52 @@ class _PlaywrightBrowser:
                     el.get_attribute("contenteditable"))
                 ref = f"el{i}"
                 if ref not in seen_refs:
-                    raw_nodes.append({
+                    node = {
                         "ref": ref,
                         "role": str(role),
                         "name": str(name).strip()[:200],
                         "tag": str(tag),
                         "editable": editable,
-                    })
+                    }
+                    # Link tree: show where each link GOES so the agent clicks the
+                    # right one instead of guessing a navigate path.
+                    if tag == "a":
+                        try:
+                            dest = _safe_dest(el.get_attribute("href") or "", url)
+                            if dest:
+                                node["dest"] = dest
+                        except Exception:
+                            pass
+                    # Dropdown: surface the selectable option labels so the agent
+                    # knows the exact text to pass to 'select'.
+                    if tag == "select":
+                        try:
+                            opts = el.evaluate(
+                                "s => Array.from(s.options).map(o => o.text.trim())"
+                                ".filter(Boolean).slice(0, 60)") or []
+                            if opts:
+                                node["options"] = [str(o)[:80] for o in opts]
+                        except Exception:
+                            pass
+                    raw_nodes.append(node)
                     seen_refs.add(ref)
+        except Exception:
+            pass
+
+        # Capture the page's visible TEXT as one element so the agent can READ
+        # content (a class timetable, an error/404 message) — the interactable
+        # elements above only let it click, not read. innerText strips scripts.
+        try:
+            body_text = self._page.evaluate(
+                "() => (document.body && document.body.innerText) || ''")
+            if body_text and body_text.strip():
+                raw_nodes.append({
+                    "ref": "_pagetext",
+                    "role": "page_text",
+                    "name": str(body_text).strip()[:8000],
+                    "tag": "text",
+                    "editable": False,
+                })
         except Exception:
             pass
 
@@ -287,8 +511,9 @@ class _PlaywrightBrowser:
         if kind == "navigate":
             url = str(action.get("url") or "")
             try:
-                self._page.goto(url, timeout=30000)
-                self._page.wait_for_load_state("networkidle", timeout=15000)
+                # domcontentloaded (not the default 'load'/networkidle) — fast and
+                # reliable; the next snapshot's settle handles late render.
+                self._page.goto(url, timeout=30000, wait_until="domcontentloaded")
             except Exception as exc:
                 fail("navigation_failed", f"navigate to {url!r}: {type(exc).__name__}: {exc}")
 
@@ -298,10 +523,51 @@ class _PlaywrightBrowser:
             if el is None:
                 fail("unexpected_dom", f"click target {ref!r} not found on page")
             try:
-                el.click(timeout=10000)
-                self._page.wait_for_load_state("networkidle", timeout=10000)
+                el.scroll_into_view_if_needed(timeout=4000)
+            except Exception:
+                pass
+            pages_before = set(self._context.pages)
+            # Read the link's target/href BEFORE clicking. A target=_blank link —
+            # or an href to a different host than the current page — opens a NEW
+            # TAB rather than navigating in place (EA's 'Make or Manage bookings'
+            # is an <a target=_blank> to the Legend booking site). For those we
+            # capture the popup DETERMINISTICALLY with expect_page() instead of
+            # racing context.pages after the click returns.
+            tgt = href = ""
+            try:
+                tgt = el.get_attribute("target") or ""
+            except Exception:
+                pass
+            try:
+                href = el.get_attribute("href") or ""
+            except Exception:
+                pass
+            cur = self._page.url
+            expect_popup = (tgt == "_blank") or _is_cross_host(cur, href)
+            _tablog(f"CLICK ref={ref!r} target={tgt!r} href={href[:80]!r} "
+                    f"cur={cur[:60]!r} expect_popup={expect_popup} "
+                    f"pages_before={len(pages_before)}")
+            popup = None
+            try:
+                if expect_popup:
+                    # Deterministic: wait for the page event the click triggers.
+                    with self._context.expect_page(timeout=10000) as pi:
+                        el.click(timeout=10000)
+                    popup = pi.value
+                else:
+                    el.click(timeout=10000)
+            except PWTimeout:
+                # expect_page timed out — no popup actually opened; the click
+                # still happened. Fall through to the poll as a backstop.
+                _tablog("  expect_page TIMEOUT (no popup) — falling back to poll")
             except Exception as exc:
                 fail("unexpected_dom", f"click {ref!r}: {type(exc).__name__}: {exc}")
+            if popup is not None:
+                self._adopt_popup(popup)
+            else:
+                # In-place click, or a popup we didn't predict — poll briefly.
+                self._follow_new_tab(pages_before, generous=expect_popup)
+            _tablog(f"  -> active page now {self._page.url[:80]!r}")
 
         elif kind == "type":
             ref = str(action.get("ref") or "")
@@ -314,9 +580,33 @@ class _PlaywrightBrowser:
             if el is None:
                 fail("unexpected_dom", f"type target {ref!r} not found on page")
             try:
-                el.fill(real_text, timeout=10000)
-            except Exception as exc:
-                fail("unexpected_dom", f"type {ref!r}: {type(exc).__name__}: {exc}")
+                el.scroll_into_view_if_needed(timeout=4000)
+            except Exception:
+                pass
+            # A <select> dropdown can't be fill()ed — you choose an option. The
+            # agent uses 'type' with the option's visible label (e.g. 'Chesham
+            # Leisure Centre'); drive it with select_option, matching by label
+            # then by value as a fallback. This is how the agent picks a centre /
+            # activity / date on a booking app's native dropdowns.
+            is_select = False
+            try:
+                is_select = (el.evaluate("e => e.tagName.toLowerCase()") == "select")
+            except Exception:
+                pass
+            if is_select:
+                try:
+                    el.select_option(label=real_text, timeout=10000)
+                except Exception:
+                    try:
+                        el.select_option(value=real_text, timeout=10000)
+                    except Exception as exc:
+                        fail("unexpected_dom",
+                             f"select {ref!r}={real_text!r}: {type(exc).__name__}: {exc}")
+            else:
+                try:
+                    el.fill(real_text, timeout=10000)
+                except Exception as exc:
+                    fail("unexpected_dom", f"type {ref!r}: {type(exc).__name__}: {exc}")
 
         # read / done / give_up — no browser action needed; runner handles them.
 
@@ -389,41 +679,141 @@ def _check_success_indicators(page, indicators: tuple) -> bool:
 # headless claude -p complete function (UNVERIFIED until deploy)
 # ---------------------------------------------------------------------------
 
-def _make_complete(run_id: str):
-    """Return a `complete(system, user) -> str` function backed by `claude -p`.
+# Model id for per-step browser action decisions. Sonnet tier: login is
+# mechanical (type/type/click) but open-ended navigation — finding a specific
+# class on a timetable — needs real multi-step reasoning, where haiku loops on
+# read. Sonnet 4.6 supports structured outputs (used below). Drop to
+# claude-haiku-4-5 for cheaper, simpler sites; raise to opus for the hardest.
+_MODEL = "claude-sonnet-4-6"
+_API_URL = "https://api.anthropic.com/v1/messages"
+_API_VERSION = "2023-06-01"
 
-    Uses haiku tier (fast/cheap for browser step decisions). Falls back to a
-    safe give_up action string on ANY failure — the agent handles malformed
-    output gracefully.
+# Structured-output schema: one action object from the agent vocabulary. Forces
+# the model to emit exactly one valid JSON action (no prose / markdown / native
+# tool-call XML), keyed by "kind". Per-kind fields are all optional here; the
+# browser_gate is the authority on which fields each kind needs.
+_ACTION_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["kind"],
+    "properties": {
+        "kind": {"type": "string", "enum": [
+            "read", "navigate", "click", "type", "propose_commit", "done", "give_up"]},
+        "ref": {"type": "string"},
+        "path": {"type": "string"},
+        "expected_text": {"type": "string"},
+        "expected_label": {"type": "string"},
+        "text": {"type": "string"},
+        "result": {"type": "string"},
+        "reason": {"type": "string"},
+        "summary": {"type": "string"},
+        "price": {"type": "number"},
+    },
+}
 
-    UNVERIFIED: requires `claude` binary on PATH in the donna-broker env and
-    a valid Anthropic API key. Not exercised in CI.
+
+def _http_post(url: str, headers: dict[str, str], body: bytes) -> bytes:
+    """POST `body` to `url` and return the raw response bytes. Raises on any
+    transport/HTTP error (urllib raises HTTPError for non-2xx). Kept tiny and
+    injectable so _make_complete is testable without a network call."""
+    import urllib.request  # noqa: PLC0415 — stdlib only; no new venv dependency
+
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310 — fixed Anthropic URL
+        return resp.read()
+
+
+def _make_complete(api_key: str, *, transport=_http_post):
+    """Return a `complete(system, user) -> str` backed by the Anthropic Messages
+    API (design §5.7). The API key is delivered to this executor by the broker
+    over DONNA_MODEL_KEY_FD — never via env, never via the CLI, never seen by
+    Donna. `transport(url, headers, body) -> bytes` is injected so this is
+    unit-testable without a network call.
+
+    On ANY failure (no key, transport error, non-200, malformed body, empty
+    text) it returns a `give_up` action string — the agent treats that as a
+    safe terminal action and never guesses. Fail-closed everywhere (§3 inv. 6).
     """
     def _complete(system: str, user: str) -> str:
-        prompt = f"{system}\n\n{user}"
+        if not api_key:
+            return json.dumps({"kind": "give_up", "reason": "no model key available"})
+        body = json.dumps({
+            "model": _MODEL,
+            "max_tokens": 1024,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+            # Force exactly one valid action object — no prose, no markdown, no
+            # native tool-call XML. Haiku 4.5 supports structured outputs; this
+            # makes the agent's output deterministic across any site/model.
+            "output_config": {"format": {"type": "json_schema",
+                                         "schema": _ACTION_SCHEMA}},
+        }).encode("utf-8")
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": _API_VERSION,
+            "content-type": "application/json",
+        }
         try:
-            result = subprocess.run(
-                ["claude", "-p", prompt,
-                 "--output-format", "json",
-                 "--model", "claude-haiku-4-5",
-                 "--allowedTools", ""],
-                capture_output=True,
-                text=True,
-                timeout=60,
-                cwd="/tmp",
-            )
-            if result.returncode != 0:
-                return json.dumps({"kind": "give_up",
-                                   "reason": f"claude exit {result.returncode}"})
-            outer = json.loads(result.stdout)
-            if not isinstance(outer, dict) or outer.get("is_error"):
-                return json.dumps({"kind": "give_up", "reason": "claude error response"})
-            return str(outer.get("result") or "").strip()
+            raw = transport(_API_URL, headers, body)
+            data = json.loads(raw)
+            blocks = data.get("content") if isinstance(data, dict) else None
+            if not isinstance(blocks, list):
+                return json.dumps({"kind": "give_up", "reason": "model: no content blocks"})
+            text = "".join(
+                str(b.get("text", "")) for b in blocks
+                if isinstance(b, dict) and b.get("type") == "text"
+            ).strip()
+            if not text:
+                return json.dumps({"kind": "give_up", "reason": "model: empty response"})
+            return text
         except Exception as exc:
             return json.dumps({"kind": "give_up",
-                                "reason": f"claude invocation failed: {type(exc).__name__}: {exc}"})
+                                "reason": f"model call failed: {type(exc).__name__}: {exc}"})
 
     return _complete
+
+
+def _debug_tee(fn, debug_path):
+    """Wrap a complete(system, user) callable so each call appends the page the
+    model saw (the user prompt — sanitised, untrusted, no secrets) and what it
+    returned to debug_path. Run dir is donna-broker-only ephemeral tmp; the
+    agent only ever sees {{cred:*}} placeholders, so no credential is logged.
+    Best-effort: a debug-write failure never affects the agent."""
+    if debug_path is None:
+        return fn
+
+    def wrapped(system: str, user: str) -> str:
+        out = fn(system, user)
+        try:
+            with open(debug_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({"user": user[:6000], "out": out[:6000]}) + "\n")
+        except Exception:
+            pass
+        return out
+
+    return wrapped
+
+
+def read_model_key() -> str:
+    """Read the Anthropic API key the broker delivers over DONNA_MODEL_KEY_FD.
+
+    Mirrors read_creds (a second inherited fd, same vault→pipe path). Returns
+    "" if the fd is absent so the executor degrades to a fail-closed give_up
+    rather than crashing — the broker only sets the fd for capabilities that
+    declare creds.model_key. The key lives only here, in this subprocess.
+    """
+    fd_str = os.environ.get("DONNA_MODEL_KEY_FD")
+    if fd_str is None:
+        return ""
+    fd = int(fd_str)
+    data = b""
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        data += chunk
+    os.close(fd)
+    return data.decode("utf-8").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +824,7 @@ def _make_complete(run_id: str):
 def main() -> None:
     params = read_params()
     creds = read_creds()
+    model_key = read_model_key()
 
     site = str(params.get("site") or "").strip()
     goal = str(params.get("goal") or "").strip()
@@ -442,6 +833,8 @@ def main() -> None:
     commit_token = params.get("commit_token")    # optional str
     # plan_summary is available for context but the agent sees it via goal.
     plan_summary = params.get("plan_summary", "")
+    # Optional human-provided navigation hints to steer a hard-to-navigate site.
+    hints = str(params.get("hints") or "").strip()
 
     if not site:
         fail("bad_params", "params.site is required")
@@ -462,9 +855,16 @@ def main() -> None:
     # Import Playwright HERE — not at module top-level.
     from playwright.sync_api import sync_playwright, TimeoutError as PwTimeout  # noqa: PLC0415
 
+    # Bind the module globals the adapter methods reference: the real Playwright
+    # TimeoutError (so expect_page timeouts are caught precisely) and the
+    # tab-follow diagnostic sink (written next to agent_debug.jsonl).
+    global PWTimeout, _TABFOLLOW_LOG
+    PWTimeout = PwTimeout
+
     run_id = str(uuid.uuid4())
     run_dir = Path(os.environ.get("DONNA_RUN_DIR", "/tmp")) / f"browser_goal_{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    _TABFOLLOW_LOG = str(run_dir / "tabfollow.log")
     ledger_path = run_dir / "ledger.jsonl"
 
     now = time.monotonic
@@ -506,8 +906,7 @@ def main() -> None:
 
         # --- Login ---
         try:
-            page.goto(profile.login_url, timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.goto(profile.login_url, timeout=30000, wait_until="domcontentloaded")
         except Exception as exc:
             fail("site_unavailable",
                  f"login page {profile.login_url!r} did not load: "
@@ -532,7 +931,8 @@ def main() -> None:
         login_agent = browser_agent.Agent(
             goal=login_goal,
             phase="execute",
-            complete=_make_complete(run_id),
+            complete=_debug_tee(_make_complete(model_key),
+                                 run_dir / "agent_debug.jsonl"),
         )
         login_tokens = browser_token.TokenStore(now=now)
         login_gate = browser_gate.Gate(
@@ -557,7 +957,8 @@ def main() -> None:
             commit_token=None,
         )
 
-        # Verify success indicators regardless of agent's self-report.
+        # Verify login regardless of the agent's self-report (§7, fail-closed):
+        # at least one explicit success_indicator from the profile must hold.
         if not _check_success_indicators(page, profile.success_indicators):
             # Agent thinks it's done but indicators don't hold.
             login_status = login_result.get("status", "")
@@ -578,14 +979,41 @@ def main() -> None:
             creds=creds,
             phase=phase,
         )
+        hint_block = (
+            "HUMAN NAVIGATION HINTS — follow these as authoritative directions to "
+            f"reach the goal (they override your own guesses about where to go):\n{hints}\n\n"
+        ) if hints else ""
+        goal_instruction = (
+            f"{effective_goal}\n\n"
+            f"{hint_block}"
+            "Work toward the goal PURPOSEFULLY. These are general rules, not "
+            "site-specific hints — let the goal above tell you WHAT to look for.\n"
+            "MOVING AROUND: to go anywhere, CLICK a link or button you can see in "
+            "the elements list (by its ref) — clicking follows the page's REAL "
+            "link. Do NOT 'navigate' to a path/URL you GUESSED — you can't see real "
+            "URLs, so a guess will fail or hit a wrong page. EXCEPTION: a relative "
+            "path given to you in the HUMAN NAVIGATION HINTS above is trusted — you "
+            "MAY navigate to it directly. Otherwise move only by clicking a visible "
+            "element; read '_pagetext' to decide which link is relevant.\n"
+            "READING: the element with ref '_pagetext' holds the page's visible "
+            "text — read it to find the information the goal needs and to notice "
+            "dead ends. If a page says 'not found' / 'error' or has no useful "
+            "content, go back and try a different real link instead of repeating "
+            "'read'.\n"
+            "FINISHING: when you have found what the goal asks for, return 'done' "
+            "with a concise result. If the goal would book, pay, or change "
+            "something, use 'propose_commit', never act directly."
+        )
         agent = browser_agent.Agent(
-            goal=effective_goal,
+            goal=goal_instruction,
             phase=phase,
-            complete=_make_complete(run_id),
+            complete=_debug_tee(_make_complete(model_key),
+                                 run_dir / "agent_debug.jsonl"),
         )
 
-        # Action cap: plan phase is read-only (lower), execute phase allows more.
-        max_actions = 30 if phase == "execute" else 20
+        # Action cap: navigation needs room. Plan (read-only) gets a generous
+        # budget; execute a bit more for the commit steps.
+        max_actions = 80 if phase == "execute" else 60
 
         result = browser_runner.run(
             browser=adapter,

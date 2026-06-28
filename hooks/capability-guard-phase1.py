@@ -34,6 +34,7 @@ from typing import Any, Optional
 
 
 BROKER_BIN = "/usr/local/bin/donna-broker"
+TRAMPOLINE_BIN = "/usr/local/bin/donna-broker-via-session"
 BROKER_TIMEOUT_SECONDS = 5.0  # §13.5
 
 # ---- Phase 0 Bash allowlist (kept for Bash, which is not broker-gated) -
@@ -74,6 +75,20 @@ BROKER_MODES = {
 BROKER_CMD_RE = re.compile(
     r"^sudo -u donna-broker " + re.escape(BROKER_BIN)
     + r" (?P<mode>[a-z-]+) '(?P<json>[^']*)'$"
+)
+
+# Structural fast-path for the session trampoline — browser executors need
+# the broker re-homed into donna-broker's own launchd session (Chromium ≥149
+# SIGTRAPs in a borrowed GUI-session Mach namespace, 2026-06-11).
+# Pins the command to exactly:
+#     sudo -n <TRAMPOLINE_BIN> execute '<json>'
+# Only `execute` is permitted — the trampoline is the broker CLI in disguise
+# so all other modes are served by BROKER_CMD_RE instead. `-n` (non-interactive)
+# is safe here because the binary path is pinned and single-quoting prevents
+# shell expansion of the JSON payload.
+TRAMPOLINE_CMD_RE = re.compile(
+    r"^sudo -n " + re.escape(TRAMPOLINE_BIN)
+    + r" execute '(?P<json>[^']*)'$"
 )
 
 # Structural fast-path for python3 syntax-check invocations.
@@ -128,6 +143,16 @@ def check_bash(command: str) -> None:
         except Exception as e:
             deny(f"broker payload is not valid JSON: {e}")
         allow("sudo donna-broker")
+
+    # Structural fast-path for the session trampoline (browser executors).
+    # Only `execute` is allowed — see TRAMPOLINE_CMD_RE docstring.
+    m_tramp = TRAMPOLINE_CMD_RE.match(command)
+    if m_tramp:
+        try:
+            json.loads(m_tramp.group("json"))
+        except Exception as e:
+            deny(f"trampoline payload is not valid JSON: {e}")
+        allow("sudo -n donna-broker-via-session execute")
 
     # Structural fast-path for python3 py_compile syntax checks — see
     # PYCOMPILE_CMD_RE docstring. Short-circuits before the raw-string

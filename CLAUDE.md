@@ -206,6 +206,8 @@ No MCP tool call needed. No hook interaction. The broker does everything.
 |---|---|
 | `everyone_active.book_class` | Books a gym class at Everyone Active via browser automation |
 | `everyone_active.checkout` | Books AND PAYS for an EA class with the card on file — high-risk, £50 hard cap, per-purchase approval only (no standing grants, ever) |
+| `browser_goal.plan` | Read-only goal-driven browse of a connected site: logs in via vault creds, navigates toward a natural-language goal, returns what it found (e.g. "next yoga class time"). No side-effects. |
+| `browser_goal.commit` | The act phase that books/pays/changes state, gated behind a `commit_token` the plan phase proposed. Per-action approval. |
 
 ### Everyone Active class booking — capability rules
 
@@ -265,6 +267,37 @@ entered; add a card to the EA account first."
 `total_display`, `date`, `start_time`, `duration_minutes`,
 `confirmation_text`, `activity_name`, `centre`. After a purchase, offer to
 check email for the EA receipt.
+
+### Goal-driven browsing — `browser_goal.plan` rules
+
+**Capability:** `browser_goal.plan` (read-only recon) and
+`browser_goal.commit` (the act phase, behind a `commit_token`).
+**Executor:** same Playwright/headless-shell stack as the EA capabilities,
+plus a reasoning agent loop. It logs into a *connected site* with vault
+creds, then navigates toward a natural-language goal one action at a time.
+Both phases are `requires_session: true` — execute via the trampoline
+(`donna-broker-via-session`), never inline.
+
+**Parameters (`plan`):**
+- `site` (required) — site profile key, e.g. `everyone_active`.
+- `goal` (required) — natural-language goal, e.g. "next available yoga
+  class time at Chesham this week".
+- `phase` (required) — must be `"plan"` (read-only, no side-effects).
+- `hints` (optional) — human navigation steering for hard-to-navigate
+  sites, e.g. "go to /book/ then click 'Make or Manage bookings', then
+  find Yoga on the timetable". The agent follows hints as **authoritative**
+  directions and may `navigate` directly to a hinted relative path (it is
+  otherwise banned from guessing URLs and must click visible links). Hints
+  are **guidance only, never a security boundary** — the site profile's
+  allowlist and the login-host credential binding gate everything
+  regardless of what a hint says. A hint can't widen the allowlist or
+  redirect credentials.
+- `max_actions` (optional) — cap on browser actions.
+
+**When the agent gets stuck** (gives up, times out, or returns a result
+that doesn't satisfy the goal), the fix is a hint: tell it where to go in
+plain English and re-file the same `plan` request with `params.hints` set.
+Each re-file is a fresh broker request (fresh proof-of-human).
 
 ### Site credentials (Connected Sites)
 

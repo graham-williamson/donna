@@ -1,0 +1,4 @@
+# Tesco is a data-only SITE-PROFILE pack: it adds a browser-goal site profile,
+# no new capability. The generic browser_goal.plan / browser_goal.commit
+# capabilities already handle it via the `site: "tesco"` param.
+capabilities: []

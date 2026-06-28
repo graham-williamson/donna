@@ -1,8 +1,14 @@
 {
   "site": "everyone_active",
   "login_url": "https://account.everyoneactive.com/login",
-  "allowlist": ["everyoneactive.com", "account.everyoneactive.com"],
-  "success_indicators": [{"type": "url_pattern", "value": "**/memberHomePage*"}],
+  "allowlist": ["everyoneactive.com", "account.everyoneactive.com", "legendonlineservices.co.uk"],
+  "success_indicators": [
+    {"type": "element", "value": "[href*='logout' i]"},
+    {"type": "url_pattern", "value": "*account.everyoneactive.com/"},
+    {"type": "url_pattern", "value": "*everyoneactive.com/memberships*"},
+    {"type": "url_pattern", "value": "*everyoneactive.com/memberHomePage*"},
+    {"type": "url_pattern", "value": "*everyoneactive.com/account*"}
+  ],
   "mfa_rule": "pause_and_ask",
   "network_strictness": "monitor"
 }

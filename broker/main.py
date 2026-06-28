@@ -823,6 +823,23 @@ def _auto_execute_via_grant(
     approved_row = db.get_request(conn, request_id)
     assert approved_row is not None
 
+    # Browser/session executors cannot be inline-executed here: they SIGTRAP
+    # outside the donna-broker launchd session, and the broker cannot trampoline
+    # itself. The grant has done its job (skipped the human approval); leave the
+    # row `approved` and hand back the code so the caller runs `execute` through
+    # donna-broker-via-session. (mcp_tool and other inline-safe caps fall through
+    # to direct execution below, unchanged.)
+    if cap.requires_session:
+        return {
+            "status": "approved",
+            "request_id": request_id,
+            "approval_code": approval_code,
+            "via": "standing_grant",
+            "grant_id": grant_id,
+            "next": "execute_via_session_trampoline",
+            "resolved_summary": resolved_summary,
+        }
+
     def audit_writer(evt: dict[str, Any]) -> None:
         audit_mod.write_event(audit_dir, evt)
 
@@ -897,34 +914,42 @@ def _handle_execute(payload: dict[str, Any], ctx: dict[str, Any]) -> dict[str, A
             status="not_found",
         )
 
-    # Must have a matching approval-response file before execute.
-    response_path = Path(ctx["responses_dir"]) / f"{row.request_id}.json"
-    if not response_path.exists():
-        return {
-            "status": "approval_required",
-            "request_id": row.request_id,
-            "code": code,
-            "reason": "no approval response seen yet",
-        }
+    # The approval-response file gates the pending_approval → approved
+    # transition (a Telegram/app human tap). A row that is ALREADY approved —
+    # e.g. a standing grant approved it without a human response file, or this is
+    # a re-entrant execute — skips this check and proceeds straight to dispatch.
+    # (The HMAC verify + transition below already handle the already-approved
+    # state; see the §7.3 note.) This is the trampolined second half of a
+    # grant-approved browser run: grant approves, execute-via-session dispatches.
+    if row.state == "pending_approval":
+        response_path = Path(ctx["responses_dir"]) / f"{row.request_id}.json"
+        if not response_path.exists():
+            return {
+                "status": "approval_required",
+                "request_id": row.request_id,
+                "code": code,
+                "reason": "no approval response seen yet",
+            }
 
-    try:
-        response_payload = json.loads(response_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        raise BrokerError(
-            "approval_response_malformed",
-            f"could not parse {response_path}: {e}",
-        ) from e
+        try:
+            response_payload = json.loads(response_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            raise BrokerError(
+                "approval_response_malformed",
+                f"could not parse {response_path}: {e}",
+            ) from e
 
-    # Queue file has served its purpose — delete it now so a daemon restart
-    # doesn't replay the approval prompt via the bridge's volatile seenRequestIds.
-    _delete_queue_file(ctx["queue_dir"], row.request_id)
+        # Queue file has served its purpose — delete it now so a daemon restart
+        # doesn't replay the approval prompt via the bridge's volatile
+        # seenRequestIds.
+        _delete_queue_file(ctx["queue_dir"], row.request_id)
 
-    decision = response_payload.get("decision")
-    if decision != "approve":
-        return {
-            "status": "denied" if decision == "deny" else "cancelled",
-            "request_id": row.request_id,
-        }
+        decision = response_payload.get("decision")
+        if decision != "approve":
+            return {
+                "status": "denied" if decision == "deny" else "cancelled",
+                "request_id": row.request_id,
+            }
 
     # Verify creation-time HMAC before any state change.
     params = json.loads(row.params_json)

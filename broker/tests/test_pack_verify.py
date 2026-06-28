@@ -528,7 +528,9 @@ def test_pack_with_good_cap_but_bad_profile_rejected(tmp_path: Path) -> None:
     """A pack with a valid capability but a malformed profile is still refused —
     profile validation applies even when capabilities are present."""
     bad = _ok_profile()
-    del bad["success_indicators"]
+    # Genuinely malformed: a non-https login_url. (Empty/absent success_indicators
+    # is now VALID — the engine has a general login-success fallback.)
+    bad["login_url"] = "ftp://tesco.com/login"
     pack, store = _signed_pack(
         tmp_path,
         manifest=_ok_manifest(),

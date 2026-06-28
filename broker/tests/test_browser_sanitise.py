@@ -37,6 +37,28 @@ def test_injection_text_is_data_not_stripped():
     assert out["trust"] == "untrusted"
 
 
+def test_link_dest_and_select_options_pass_through():
+    raw = {
+        "url": "https://book.everyoneactive.com/Connect/memberHomePage.aspx",
+        "nodes": [
+            {"ref": "l1", "role": "link", "name": "Make or Manage bookings",
+             "tag": "a", "editable": False,
+             "dest": "book.everyoneactive.com/connect/landing.aspx"},
+            {"ref": "s1", "role": "combobox", "name": "--Select Site--",
+             "tag": "select", "editable": True,
+             "options": ["--Select Site--", "Chesham Leisure Centre",
+                         "Chilterns Lifestyle Centre"]},
+        ],
+    }
+    out = san.sanitise(raw)
+    el = {e["ref"]: e for e in out["elements"]}
+    assert el["l1"]["dest"] == "book.everyoneactive.com/connect/landing.aspx"
+    assert "Chesham Leisure Centre" in el["s1"]["options"]
+    # Absent on elements that don't declare them — token-free snapshots stay lean.
+    assert "dest" not in el["s1"]
+    assert "options" not in el["l1"]
+
+
 def test_snapshot_hash_is_stable_and_changes_with_content():
     h1 = san.snapshot_hash(RAW)
     h2 = san.snapshot_hash(RAW)
