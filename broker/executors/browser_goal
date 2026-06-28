@@ -253,14 +253,18 @@ class _PlaywrightBrowser:
     def snapshot(self) -> dict:
         """Return a normalised snapshot of the current page's accessibility tree."""
         # Let the page settle so we snapshot the RENDERED DOM, not a still-loading
-        # state — async/SPA pages otherwise expose stale or empty content and the
-        # agent acts on elements that aren't ready (e.g. a login field that hasn't
-        # become visible yet). Best-effort, bounded.
-        for _state, _timeout in (("domcontentloaded", 8000), ("networkidle", 4000)):
-            try:
-                self._page.wait_for_load_state(_state, timeout=_timeout)
-            except Exception:
-                pass
+        # state. domcontentloaded + a brief fixed pause — NOT networkidle, which
+        # never fires on live booking/app pages (persistent/polling connections)
+        # and would burn its full timeout on every snapshot, blowing the executor
+        # budget. The short pause lets late JS render.
+        try:
+            self._page.wait_for_load_state("domcontentloaded", timeout=8000)
+        except Exception:
+            pass
+        try:
+            self._page.wait_for_timeout(400)
+        except Exception:
+            pass
         url = self._page.url
         try:
             # Playwright's accessibility snapshot returns a tree; we flatten it.
@@ -373,8 +377,9 @@ class _PlaywrightBrowser:
         if kind == "navigate":
             url = str(action.get("url") or "")
             try:
-                self._page.goto(url, timeout=30000)
-                self._page.wait_for_load_state("networkidle", timeout=15000)
+                # domcontentloaded (not the default 'load'/networkidle) — fast and
+                # reliable; the next snapshot's settle handles late render.
+                self._page.goto(url, timeout=30000, wait_until="domcontentloaded")
             except Exception as exc:
                 fail("navigation_failed", f"navigate to {url!r}: {type(exc).__name__}: {exc}")
 
@@ -392,12 +397,10 @@ class _PlaywrightBrowser:
                 el.click(timeout=10000)
             except Exception as exc:
                 fail("unexpected_dom", f"click {ref!r}: {type(exc).__name__}: {exc}")
-            # Follow a new tab/window the click may have opened, then settle.
+            # Follow a new tab/window the click may have opened. No networkidle
+            # wait here — the next snapshot's settle handles render, and
+            # networkidle stalls on live app pages.
             self._follow_new_tab(pages_before)
-            try:
-                self._page.wait_for_load_state("networkidle", timeout=10000)
-            except Exception:
-                pass
 
         elif kind == "type":
             ref = str(action.get("ref") or "")
@@ -707,8 +710,7 @@ def main() -> None:
 
         # --- Login ---
         try:
-            page.goto(profile.login_url, timeout=30000)
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.goto(profile.login_url, timeout=30000, wait_until="domcontentloaded")
         except Exception as exc:
             fail("site_unavailable",
                  f"login page {profile.login_url!r} did not load: "
