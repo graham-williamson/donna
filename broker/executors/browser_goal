@@ -252,6 +252,15 @@ class _PlaywrightBrowser:
 
     def snapshot(self) -> dict:
         """Return a normalised snapshot of the current page's accessibility tree."""
+        # Let the page settle so we snapshot the RENDERED DOM, not a still-loading
+        # state — async/SPA pages otherwise expose stale or empty content and the
+        # agent acts on elements that aren't ready (e.g. a login field that hasn't
+        # become visible yet). Best-effort, bounded.
+        for _state, _timeout in (("domcontentloaded", 8000), ("networkidle", 4000)):
+            try:
+                self._page.wait_for_load_state(_state, timeout=_timeout)
+            except Exception:
+                pass
         url = self._page.url
         try:
             # Playwright's accessibility snapshot returns a tree; we flatten it.
@@ -268,6 +277,16 @@ class _PlaywrightBrowser:
             )
             seen_refs = {n.get("ref") for n in raw_nodes if n.get("ref")}
             for i, el in enumerate(interactable):
+                # Only surface elements the agent can actually act on. Hidden
+                # elements (display:none, behind an un-dismissed overlay, in a
+                # collapsed menu) stay in the DOM but produce "not visible"
+                # click/type timeouts. Skip them — the ref keeps the RAW index i
+                # so _find_element re-locates the SAME element by index.
+                try:
+                    if not el.is_visible():
+                        continue
+                except Exception:
+                    continue
                 role = (el.get_attribute("role") or el.evaluate(
                     "el => el.tagName.toLowerCase()") or "element")
                 name = (el.get_attribute("aria-label")
@@ -364,6 +383,10 @@ class _PlaywrightBrowser:
             el = self._find_element(ref)
             if el is None:
                 fail("unexpected_dom", f"click target {ref!r} not found on page")
+            try:
+                el.scroll_into_view_if_needed(timeout=4000)
+            except Exception:
+                pass
             pages_before = set(self._context.pages)
             try:
                 el.click(timeout=10000)
@@ -386,6 +409,10 @@ class _PlaywrightBrowser:
             el = self._find_element(ref)
             if el is None:
                 fail("unexpected_dom", f"type target {ref!r} not found on page")
+            try:
+                el.scroll_into_view_if_needed(timeout=4000)
+            except Exception:
+                pass
             try:
                 el.fill(real_text, timeout=10000)
             except Exception as exc:

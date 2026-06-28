@@ -32,7 +32,9 @@ _SYSTEM = (
     '  {"kind":"propose_commit","summary":"...","price":<number>,"ref":"<ref>",'
     '"expected_text":"..."}  — REQUIRED for anything that books, pays, or changes state\n'
     '  {"kind":"done","result":"..."}\n'
-    '  {"kind":"give_up","reason":"..."}'
+    '  {"kind":"give_up","reason":"..."}\n'
+    "If a cookie/consent or other dialog covers the page (e.g. an Accept/Agree/"
+    "Allow button), dismiss it FIRST by clicking it — then continue toward the goal."
 )
 
 
